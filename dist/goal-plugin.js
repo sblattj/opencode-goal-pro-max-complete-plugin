@@ -14600,15 +14600,18 @@ function formatTurnBudget(used, max) {
 }
 function formatBudgetMinutes(minutes) {
   const parsed = Number(minutes);
-  const whole = Number.isFinite(parsed) && parsed > 0 ? Math.round(parsed) : 0;
+  const whole = Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 0;
   if (whole < 60)
     return `${whole}m`;
-  const hours = Math.round(whole / 60 * 10) / 10;
+  const hours = Math.floor(whole * 10 / 60) / 10;
   return Number.isInteger(hours) ? `${hours}h` : `${hours.toFixed(1)}h`;
 }
 function formatBudgetDuration(ms) {
   const parsed = Number(ms);
-  return formatBudgetMinutes(Number.isFinite(parsed) ? parsed / 60000 : 0);
+  const value = Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+  if (value < 60000)
+    return `${Math.floor(value / 1000)}s`;
+  return formatBudgetMinutes(value / 60000);
 }
 
 // src/persistence-lease.js
@@ -15146,7 +15149,7 @@ var DEFAULT_OPTIONS = {
   noContinueWhileChildrenActive: false,
   budgetWrapupRatio: 0.8,
   warnTurnsRemaining: 3,
-  warnDurationMsRemaining: 60 * 1000,
+  warnDurationMsRemaining: 10 * 60 * 1000,
   warnTokensRemaining: 25000,
   maxPromptFailures: 3,
   resultRetentionMs: 7 * 24 * 60 * 60 * 1000,
@@ -15431,7 +15434,7 @@ function isPlanAgent(agent) {
 }
 var SESSION_TITLE_OBJECTIVE_LIMIT = 48;
 var SESSION_TITLE_ICONS = ["▶", "⏸", "⛔", "✓"];
-var SIDEBAR_METADATA_VERSION = 1;
+var SIDEBAR_METADATA_VERSION = 2;
 var SIDEBAR_METADATA_TEXT_LIMIT = 400;
 var SIDEBAR_METADATA_MAX_ACTIONS = 20;
 function describeTurnLimit(max) {
@@ -15499,6 +15502,11 @@ function buildSessionTitle(goal, now = Date.now(), context = {}) {
     fields.push(`${progress.verified}/${progress.total}✓`);
   return fields.join(" · ");
 }
+function renderedElapsedMs(elapsedMs) {
+  if (elapsedMs < 60000)
+    return Math.floor(elapsedMs / 1000) * 1000;
+  return Math.floor(elapsedMs / 60000) * 60000;
+}
 function buildSidebarMetadata(goal, now = Date.now(), context = {}) {
   const elapsedMs = Math.max(0, (goal.pausedAt || now) - goal.startedAt);
   const progress = planProgress(goal.plan);
@@ -15509,9 +15517,10 @@ function buildSidebarMetadata(goal, now = Date.now(), context = {}) {
     state: sidebarGoalState(goal),
     objective: summarizeText(goalLabel(goal), SESSION_TITLE_OBJECTIVE_LIMIT * 4),
     turns: isUnlimitedTurnBudget(goal.options.maxTurns) ? { used: goal.turnCount, max: null, unlimited: true } : { used: goal.turnCount, max: goal.options.maxTurns },
+    durationMs: { used: renderedElapsedMs(elapsedMs), max: goal.options.maxDurationMs },
     minutes: {
-      used: Math.round(elapsedMs / 60000),
-      max: Math.round(goal.options.maxDurationMs / 60000)
+      used: Math.floor(elapsedMs / 60000),
+      max: Math.floor(goal.options.maxDurationMs / 60000)
     },
     tokens: { used: goal.totalTokens, max: goal.options.maxTokens },
     plan: {
@@ -17001,7 +17010,7 @@ function parseGoalArguments(args, defaults) {
       if (flagSpec.type === "turns") {
         const turns = parseTurnBudget(rawValue);
         if (turns === null) {
-          errors3.push(`Invalid positive integer for ${flagName}: ${value}`);
+          errors3.push(`Invalid turn budget for ${flagName}: ${value} (use a positive integer, or 0/unlimited/none/inf/infinite/infinity/∞ for no ceiling)`);
           continue;
         }
         options[flagSpec.optionKey] = turns;
@@ -17591,8 +17600,17 @@ function userInterventionDetected(messages, goal, ownedMessages = currentRuntime
 function outputTokensForMessage(message) {
   return toNonNegativeInteger(messageTokens(message).output);
 }
-function budgetWrapupNeeded(goal) {
-  return !goal.budgetWrapupSent && goal.totalTokens >= Math.floor(goal.options.maxTokens * goal.options.budgetWrapupRatio);
+function budgetWrapupNeeded(goal, now = Date.now()) {
+  if (goal.budgetWrapupSent)
+    return false;
+  const ratio = goal.options.budgetWrapupRatio;
+  const maxTokens = Number(goal.options.maxTokens);
+  if (Number.isFinite(maxTokens) && maxTokens > 0 && goal.totalTokens >= Math.floor(maxTokens * ratio)) {
+    return true;
+  }
+  const maxDurationMs = Number(goal.options.maxDurationMs);
+  const startedAt = Number(goal.startedAt);
+  return Number.isFinite(maxDurationMs) && maxDurationMs > 0 && Number.isFinite(startedAt) && Math.max(0, now - startedAt) >= Math.floor(maxDurationMs * ratio);
 }
 var PLAN_ACTION_STATUSES = ["pending", "in_progress", "done", "blocked"];
 var PLAN_ACTION_STATUS_SET = new Set(PLAN_ACTION_STATUSES);
@@ -20626,6 +20644,7 @@ var testInternals = {
   isPluginContinuationMessage,
   isPlanAgent,
   buildSessionTitle,
+  buildSidebarMetadata,
   formatCompactTokens,
   formatBudgetDuration,
   formatBudgetMinutes,

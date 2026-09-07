@@ -5,6 +5,10 @@ import { dirname, join } from "node:path"
 import test from "node:test"
 import pluginModule, { GoalPlugin, testInternals } from "../src/goal-plugin.js"
 import { acquirePersistenceLease } from "../src/persistence-lease.js"
+// The TUI half's payload reducer. It imports nothing but ./goal-format.js, so
+// the panel the terminal renders can be driven from the server half's own
+// payload here, which is the only way to prove the two agree byte for byte.
+import { goalPanelModel } from "../src/goal-sidebar-view.js"
 
 const {
   agentToolSessionID,
@@ -38,6 +42,7 @@ const {
   isPluginContinuationMessage,
   isPlanAgent,
   buildSessionTitle,
+  buildSidebarMetadata,
   formatCompactTokens,
   formatBudgetDuration,
   formatBudgetMinutes,
@@ -1163,7 +1168,7 @@ test("reports malformed known flags and leaves unknown flags in the objective", 
   // rejecting the whole command.
   assert.equal(parsed.condition, "fix tests --bogus 12")
   assert.deepEqual(parsed.errors, [
-    "Invalid positive integer for --max-turns: nope",
+    "Invalid turn budget for --max-turns: nope (use a positive integer, or 0/unlimited/none/inf/infinite/infinity/∞ for no ceiling)",
     "Missing value for --max-tokens",
   ])
 })
@@ -10308,7 +10313,7 @@ async function createTitleHooks(overrides = {}) {
 test("formatCompactTokens abbreviates for a narrow title", () => {
   // Durations are no longer formatted here: both halves of the plugin render
   // them through the shared formatter in src/goal-format.js, asserted by
-  // "the shared budget formatters round to one decimal and drop a trailing .0".
+  // "the shared budget formatters truncate to one decimal and drop a trailing .0".
   assert.equal(formatCompactTokens(0), "0")
   assert.equal(formatCompactTokens(999), "999")
   assert.equal(formatCompactTokens(1500), "1.5k")
@@ -10434,7 +10439,7 @@ test("sessionTitleStatus mirrors goal state into the title and restores it on cl
     { parts: [] },
   )
   assert.ok(updates.length >= 1, "setting a goal must publish a title")
-  assert.match(updates[0].body.title, /^▶ ship it · 0\/∞ · 0m\/8h · /)
+  assert.match(updates[0].body.title, /^▶ ship it · 0\/∞ · 0s\/8h · /)
 
   await hooks["command.execute.before"](
     { command: "goal", sessionID: "session-1", arguments: "pause" },
@@ -10520,14 +10525,17 @@ test("the sidebar payload carries state, budgets, plan progress, and criteria", 
   )
 
   const latest = updates.at(-1).body
-  assert.match(latest.title, /^▶ Ship v0\.10\.0 · 0\/10 · 0m\/30m · 0\/200k · 1\/3✓$/)
+  assert.match(latest.title, /^▶ Ship v0\.10\.0 · 0\/10 · 0s\/30m · 0\/200k · 1\/3✓$/)
 
   const status = latest.metadata.goal
-  assert.equal(status.v, 1)
+  assert.equal(status.v, 2, "the payload version tracks the shape: nullable turns.max, plus durationMs")
   assert.equal(status.state, "active")
   assert.equal(status.objective, "Ship v0.10.0")
   assert.deepEqual(status.turns, { used: 0, max: 10 })
   assert.equal(status.turns.unlimited, undefined, "a bounded turn budget carries no unlimited flag")
+  // v2 carries the duration in ms as well, so a sub-minute budget is not
+  // flattened to 0 the way `minutes` flattens it. Every v1 field survives.
+  assert.deepEqual(status.durationMs, { used: 0, max: 30 * 60_000 })
   assert.deepEqual(status.minutes, { used: 0, max: 30 })
   assert.deepEqual(status.tokens, { used: 0, max: 200000 })
   assert.equal(status.successCriteria, "tests green")
@@ -10955,9 +10963,12 @@ test("the shipped defaults are unlimited turns, an 8-hour window, and 100m token
   assert.equal(defaults.maxDurationMs, 8 * 60 * 60 * 1000)
   assert.equal(defaults.maxDurationMs, 28_800_000)
   assert.equal(defaults.maxTokens, 100_000_000)
+  // Rescaled with the window: 60 s of warning inside 8 h is 0.2 % of the run.
+  assert.equal(defaults.warnDurationMsRemaining, 600_000)
   // The rest of the block is untouched by this change.
   assert.equal(defaults.minDelayMs, 1500)
   assert.equal(defaults.warnTurnsRemaining, 3)
+  assert.equal(defaults.warnTokensRemaining, 25_000)
   assert.equal(defaults.budgetWrapupRatio, 0.8)
 })
 
@@ -10976,7 +10987,9 @@ test("--max-turns accepts every spelling of unlimited, and 0 as the plugin optio
   // leaves the configured default in place rather than silently unlimiting.
   assert.equal(parseGoalArguments("fix tests --max-turns 20", bounded).options.maxTurns, 20)
   const garbage = parseGoalArguments("fix tests --max-turns banana", bounded)
-  assert.deepEqual(garbage.errors, ["Invalid positive integer for --max-turns: banana"])
+  assert.deepEqual(garbage.errors, [
+    "Invalid turn budget for --max-turns: banana (use a positive integer, or 0/unlimited/none/inf/infinite/infinity/∞ for no ceiling)",
+  ])
   assert.equal(garbage.options.maxTurns, 10)
   const negative = parseGoalArguments("fix tests --max-turns -4", bounded)
   assert.equal(negative.options.maxTurns, 10)
@@ -10985,8 +10998,14 @@ test("--max-turns accepts every spelling of unlimited, and 0 as the plugin optio
   // read as "missing" and replaced by the default.
   assert.equal(normalizeOptions({ maxTurns: 0 }).maxTurns, 0)
   assert.equal(normalizeOptions({ maxTurns: 12 }).maxTurns, 12)
-  assert.equal(normalizeOptions({ maxTurns: -1 }).maxTurns, normalizeOptions().maxTurns)
-  assert.equal(normalizeOptions({ maxTurns: "banana" }).maxTurns, normalizeOptions().maxTurns)
+  // Pinned to the literal default, not to `normalizeOptions().maxTurns`:
+  // comparing the fallback against itself holds for ANY implementation now
+  // that the default IS the degenerate value, including one with no fallback
+  // at all. The bounded control below is what makes the fallback observable.
+  assert.equal(normalizeOptions({ maxTurns: -1 }).maxTurns, 0)
+  assert.equal(normalizeOptions({ maxTurns: "banana" }).maxTurns, 0)
+  // The configured (non-default) fallback is pinned above, through
+  // `parseGoalArguments(..., bounded)` returning 10 for the same garbage.
 
   // And the bare parser, so the accepted spellings are pinned in one place.
   assert.equal(parseTurnBudget("∞"), 0)
@@ -11044,6 +11063,11 @@ test("an unlimited turn budget never stops the goal and never warns about turns"
   assert.equal(stopReason({ ...base, turnCount: 10_000 }), null)
   // Control: the other two brakes still fire on the same goal shape.
   assert.match(stopReason({ ...base, turnCount: 10_000, startedAt: Date.now() - 9 * 3600_000 }), /max duration/)
+  // The token brake's BRANCH still works — but 100,000,000 is unreachable for a
+  // context-window counter, so this is a control on the branch, not evidence
+  // that the brake can fire on a default goal. "the budget wrap-up is reachable
+  // under the shipped defaults" pins that separately, and the README says the
+  // token brake is off by default.
   assert.match(stopReason({ ...base, turnCount: 10_000, totalTokens: 100_000_000 }), /max context tokens/)
   // Control: a bounded budget still trips.
   assert.match(
@@ -11136,7 +11160,7 @@ test("/goal status renders the unlimited turn budget and the 8-hour window", () 
   assert.match(bounded, /Elapsed: \d+s \(1\.5h\/45m\)/)
 })
 
-test("the shared budget formatters round to one decimal and drop a trailing .0", () => {
+test("the shared budget formatters truncate to one decimal and drop a trailing .0", () => {
   // The same table the sidebar panel asserts, driven through the server half's
   // own re-export so the two halves are provably the same function.
   assert.equal(formatBudgetMinutes(0), "0m")
@@ -11144,15 +11168,26 @@ test("the shared budget formatters round to one decimal and drop a trailing .0",
   assert.equal(formatBudgetMinutes(60), "1h")
   assert.equal(formatBudgetMinutes(90), "1.5h")
   assert.equal(formatBudgetMinutes(480), "8h")
-  // 481 min = 8.016 h -> rounds to 8.0 -> "8h", not "8.0h".
+  // 481 min = 8.016 h -> truncates to 8.0 -> "8h", not "8.0h".
   assert.equal(formatBudgetMinutes(481), "8h")
+  // TRUNCATED, never rounded up: 477 min is 7.95 h, and rounding it to "8h"
+  // made an 8-hour goal read "8h/8h" three minutes before it could stop.
+  assert.equal(formatBudgetMinutes(477), "7.9h")
+  assert.equal(formatBudgetMinutes(479), "7.9h")
+  assert.equal(formatBudgetMinutes(87), "1.4h", "a 90-minute window is not 'reached' at 87 minutes")
+  assert.equal(formatBudgetMinutes(500), "8.3h")
 
-  assert.equal(formatBudgetDuration(0), "0m")
+  // Sub-minute durations render in seconds; the minute scale can only say 0m.
+  assert.equal(formatBudgetDuration(0), "0s")
+  assert.equal(formatBudgetDuration(20_000), "20s")
+  assert.equal(formatBudgetDuration(59_999), "59s")
+  assert.equal(formatBudgetDuration(60_000), "1m")
+  assert.equal(formatBudgetDuration(90_000), "1m", "1.5 min truncates DOWN, never up to 2m")
   assert.equal(formatBudgetDuration(45 * 60_000), "45m")
   assert.equal(formatBudgetDuration(60 * 60_000), "1h")
   assert.equal(formatBudgetDuration(90 * 60_000), "1.5h")
   assert.equal(formatBudgetDuration(8 * 3600_000), "8h")
-  assert.equal(formatBudgetDuration(-1), "0m")
+  assert.equal(formatBudgetDuration(-1), "0s")
 
   assert.equal(formatTurnLimit(10), "10")
   assert.equal(formatTurnLimit(0), "∞")
@@ -11165,3 +11200,182 @@ test("the shared budget formatters round to one decimal and drop a trailing .0",
   assert.equal(describeTurnLimit(0), "unlimited")
   assert.equal(describeTurnLimit(10), "10")
 })
+
+test("the budget wrap-up is reachable under the shipped defaults, on the clock rather than on tokens", () => {
+  const options = normalizeOptions()
+  const now = Date.now()
+  const goal = (elapsedMs, totalTokens = 0, extra = {}) => ({
+    budgetWrapupSent: false,
+    startedAt: now - elapsedMs,
+    totalTokens,
+    options,
+    ...extra,
+  })
+
+  // 80 % of the 8-hour window is 6.4 h. Before this fix the gate watched ONLY
+  // the token budget, and `totalTokens` is the peak CONTEXT WINDOW size, which
+  // the model bounds at 200k-2M — so a 100,000,000-token budget put the whole
+  // `<budget_wrapup>` handoff permanently out of reach on a default goal.
+  assert.equal(budgetWrapupNeeded(goal(6 * 3600_000), now), false)
+  assert.equal(budgetWrapupNeeded(goal(6.4 * 3600_000), now), true)
+  assert.equal(budgetWrapupNeeded(goal(7.9 * 3600_000), now), true)
+
+  // The token dimension on that same default goal, at a saturated 200k context
+  // and again at a 2M one: still nothing. That is why the clock has to carry it.
+  assert.equal(budgetWrapupNeeded(goal(60_000, 199_000), now), false)
+  assert.equal(budgetWrapupNeeded(goal(60_000, 2_000_000), now), false)
+
+  // Control: a REACHABLE token budget still fires on tokens, well before the clock.
+  const boundedTokens = normalizeOptions({ maxTokens: 200_000 })
+  assert.equal(budgetWrapupNeeded({ ...goal(60_000, 159_999), options: boundedTokens }, now), false)
+  assert.equal(budgetWrapupNeeded({ ...goal(60_000, 160_000), options: boundedTokens }, now), true)
+
+  // Control: the duration threshold scales with a shorter window...
+  const shortWindow = normalizeOptions({ maxDurationMs: 30 * 60_000 })
+  assert.equal(budgetWrapupNeeded({ ...goal(23 * 60_000), options: shortWindow }, now), false)
+  assert.equal(budgetWrapupNeeded({ ...goal(24 * 60_000), options: shortWindow }, now), true)
+  // ...and the one-shot latch still wins over every dimension.
+  assert.equal(budgetWrapupNeeded(goal(8 * 3600_000, 0, { budgetWrapupSent: true }), now), false)
+})
+
+test("a tool-calling loop trips neither stall gate, so only the clock can stop it", async () => {
+  // The claim the new defaults rest on is narrower than "a stuck run is caught
+  // within two turns": both pauses are skipped for a turn that called a tool
+  // (`lowOutputLooksStalled` and `noToolCallContinuation` are each
+  // `&& !latestHasToolCall`). An agent re-running the same failing command
+  // emits a tool call and real output every turn, so it trips neither counter.
+  let sourceTurn = 0
+  const { calls, hooks } = await createHooks({
+    messages: async () => {
+      // Identical text every turn: the stuck loop, not a healthy one.
+      const next = toolMessage("Running the test suite again. Still 1 failure.")
+      next.info.id = `msg-stuck-${sourceTurn}`
+      return { data: [next] }
+    },
+    onPromptAsync: () => {
+      sourceTurn += 1
+    },
+    options: { minDelayMs: 1 },
+  })
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "fix the failing test" },
+    { parts: [] },
+  )
+  for (let i = 0; i < 8; i += 1) {
+    await hooks.event({
+      event: { type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
+    })
+  }
+
+  const goal = currentGoal("session-1")
+  assert.equal(calls.length, 8, "every turn was auto-continued; no pause intervened")
+  assert.equal(goal.stopped, false)
+  assert.equal(goal.turnCount, 8, "and the unlimited turn budget did not stop it either")
+  assert.equal(goal.noProgressTurns, 0, "a tool call resets the no-progress counter")
+  assert.equal(goal.noToolCallTurns, 0, "a tool call is not a talk-only turn")
+
+  // The brake that DOES bind on this run is the wall clock.
+  assert.equal(stopReason(goal), null)
+  assert.match(stopReason({ ...goal, startedAt: Date.now() - 9 * 3600_000 }), /max duration reached \(8h\)/)
+})
+
+test("a sub-minute duration budget is named in seconds everywhere, not flattened to 0m", async () => {
+  const { hooks } = await createHooks({ options: { minDelayMs: 1 } })
+  const created = { parts: [] }
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "short-window", arguments: "smoke it --max-duration-ms 20000" },
+    created,
+  )
+  // The same command reported `0m` before this fix — a budget the goal does not
+  // have — because the shared formatter had one-minute granularity.
+  assert.match(created.parts[0].text, /Limits: unlimited auto-continues, 20s, /)
+
+  const goal = currentGoal("short-window")
+  assert.equal(goal.options.maxDurationMs, 20_000)
+  assert.match(buildSessionTitle(goal, goal.startedAt + 5_000), /^▶ smoke it · 0\/∞ · 5s\/20s · /)
+  assert.match(stopReason({ ...goal, startedAt: Date.now() - 21_000 }), /max duration reached \(20s\)/)
+
+  // A 90-second budget truncates DOWN to 1m. It must never name 2m: that is a
+  // ceiling 30 seconds past the one that actually stops the goal.
+  const ninety = { ...goal, startedAt: Date.now() - 91_000, options: { ...goal.options, maxDurationMs: 90_000 } }
+  assert.match(stopReason(ninety), /max duration reached \(1m\)/)
+})
+
+test("the sidebar panel renders the session title's own duration string, and neither reaches the limit early", async () => {
+  const { hooks } = await createHooks({ options: { minDelayMs: 1 } })
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "render-parity", arguments: "ship the release" },
+    { parts: [] },
+  )
+  const goal = currentGoal("render-parity")
+  goal.totalTokens = 147_000
+  goal.turnCount = 1
+
+  const at = (elapsedMs) => {
+    const now = goal.startedAt + elapsedMs
+    // The payload crosses a process boundary as JSON before the panel sees it.
+    const payload = JSON.parse(JSON.stringify(buildSidebarMetadata(goal, now)))
+    return {
+      title: buildSessionTitle(goal, now),
+      duration: buildSessionTitle(goal, now).split(" · ")[2],
+      stats: goalPanelModel(payload).stats,
+      payload,
+    }
+  }
+
+  const rows = [
+    [0, "0s/8h"],
+    [45_000, "45s/8h"],
+    [59_999, "59s/8h"],
+    [60_000, "1m/8h"],
+    [90 * 60_000, "1.5h/8h"],
+    // TRUNCATED, not rounded: 7h57m of an 8-hour window is 7.95 h. Rounding it
+    // read `8h/8h` three minutes before the goal could actually stop.
+    [477 * 60_000, "7.9h/8h"],
+    [479 * 60_000, "7.9h/8h"],
+    [480 * 60_000, "8h/8h"],
+  ]
+  for (const [elapsedMs, expected] of rows) {
+    const rendered = at(elapsedMs)
+    assert.equal(rendered.duration, expected, `title at ${elapsedMs} ms`)
+    assert.equal(rendered.stats[1], expected, `panel at ${elapsedMs} ms must match the title`)
+  }
+
+  // `8h/8h` shows only once the goal can really stop, which is the whole point
+  // of truncating: at 479 minutes the brake has not fired yet.
+  assert.equal(stopReason({ ...goal, startedAt: Date.now() - 479 * 60_000 }), null)
+  assert.match(stopReason({ ...goal, startedAt: Date.now() - 480 * 60_000 }), /max duration reached \(8h\)/)
+
+  // And the payload the panel read is v2, with both duration fields.
+  const fresh = at(45_000)
+  assert.equal(fresh.payload.v, 2)
+  assert.deepEqual(fresh.payload.durationMs, { used: 45_000, max: 28_800_000 })
+  assert.deepEqual(fresh.payload.minutes, { used: 0, max: 480 })
+  assert.deepEqual(fresh.payload.turns, { used: 1, max: null, unlimited: true })
+  assert.deepEqual(fresh.stats, ["1/∞ turns", "45s/8h", "147k/100m tokens"])
+
+  // The metadata's elapsed field is quantized to what it RENDERS, so an
+  // unchanged render stays byte-identical and costs no `PATCH /session/{id}`.
+  assert.equal(at(45_400).payload.durationMs.used, 45_000)
+  assert.equal(at(90 * 60_000 + 59_999).payload.durationMs.used, 90 * 60_000)
+})
+
+test("the limits-are-near warning is scaled to the 8-hour window", () => {
+  const options = normalizeOptions()
+  const now = Date.now()
+  const goal = (remainingMs) => ({
+    startedAt: now - (options.maxDurationMs - remainingMs),
+    turnCount: 4,
+    totalTokens: 147_000,
+    options,
+  })
+  // The old 60-second threshold was 0.2 % of the window: a run warned itself
+  // with one minute left, having said nothing for eight hours.
+  assert.equal(buildLimitWarning(goal(15 * 60_000)), "")
+  assert.match(buildLimitWarning(goal(9 * 60_000)), /5\d\ds remaining/)
+  assert.match(buildLimitWarning(goal(30_000)), /30s remaining/)
+  // Neither of the other two warnings can fire on a default goal: turns are
+  // unlimited, and the 100,000,000-token budget is out of reach.
+  assert.doesNotMatch(buildLimitWarning(goal(30_000)), /auto-continue turn|context token/)
+})
+

@@ -88,11 +88,26 @@ const ACTIVE_PERSISTENCE_OWNED = Object.freeze({ kind: "active", persistence: "o
 const PLUGIN_DISPOSED = Object.freeze({ kind: "disposed" })
 
 const DEFAULT_OPTIONS = {
-  // `maxTurns: 0` means UNLIMITED, and is the default: with an 8-hour window
-  // and a 100m-token budget, the brakes that actually matter for an unattended
-  // run are the no-tool-call and no-progress pauses, not an arbitrary turn
-  // count. Zero rather than `Infinity` because these options round-trip
-  // through the persisted JSON state and `JSON.stringify(Infinity)` is `null`.
+  // `maxTurns: 0` means UNLIMITED, and is the default: an arbitrary turn count
+  // stops a healthy long run for no reason. Zero rather than `Infinity`
+  // because these options round-trip through the persisted JSON state and
+  // `JSON.stringify(Infinity)` is `null`.
+  //
+  // WHAT ACTUALLY BRAKES A DEFAULT RUN. The no-tool-call and no-progress
+  // pauses catch a loop that has stopped DOING anything — a talk-only turn, or
+  // a stalled turn under `noProgressTokenThreshold` output tokens — within two
+  // turns. Neither catches a loop that keeps CALLING TOOLS: both gates are
+  // skipped for any turn with a tool call (`latestHasToolCall`), so an agent
+  // re-running the same failing command forever is caught by neither. For that
+  // run the binding brake is the 8-hour clock, with the budget wrap-up handoff
+  // at `budgetWrapupRatio` of it.
+  //
+  // `maxTokens` is deliberately out of reach: `goal.totalTokens` is the peak
+  // CONTEXT WINDOW size (see the `Math.max` in the token tracker), which the
+  // model bounds at 200k-2M, so 100m disables the token brake instead of
+  // ending a long run at its first context saturation — which the host handles
+  // by compacting. Set `--max-tokens`/`--budget` to a reachable number to turn
+  // that brake back on.
   maxTurns: 0,
   maxDurationMs: 8 * 60 * 60 * 1000,
   maxTokens: 100000000,
@@ -105,7 +120,9 @@ const DEFAULT_OPTIONS = {
   noContinueWhileChildrenActive: false,
   budgetWrapupRatio: 0.8,
   warnTurnsRemaining: 3,
-  warnDurationMsRemaining: 60 * 1000,
+  // Scaled to the default window: a 60-second heads-up inside 8 hours is 0.2 %
+  // of the run, which is no warning at all for an unattended goal.
+  warnDurationMsRemaining: 10 * 60 * 1000,
   warnTokensRemaining: 25000,
   maxPromptFailures: 3,
   resultRetentionMs: 7 * 24 * 60 * 60 * 1000,
@@ -544,7 +561,12 @@ function isPlanAgent(agent) {
 const SESSION_TITLE_OBJECTIVE_LIMIT = 48
 const SESSION_TITLE_ICONS = ["▶", "⏸", "⛔", "✓"]
 // Bounds for the structured status mirrored into session metadata.
-const SIDEBAR_METADATA_VERSION = 1
+// v2 (0.11.0): `turns.max` became `number | null` for an unlimited budget, and
+// `durationMs` was added alongside `minutes`. A consumer pinned to v1 renders a
+// v2 payload on a best-effort basis rather than hiding it, but an older TUI
+// half does silently drop the turns stat from a v2 payload, so both halves are
+// meant to be upgraded together.
+const SIDEBAR_METADATA_VERSION = 2
 const SIDEBAR_METADATA_TEXT_LIMIT = 400
 const SIDEBAR_METADATA_MAX_ACTIONS = 20
 
@@ -633,6 +655,18 @@ function buildSessionTitle(goal, now = Date.now(), context = {}) {
   return fields.join(" · ")
 }
 
+// The elapsed clock at the granularity it is RENDERED at — whole seconds below
+// a minute, whole minutes above — rather than raw milliseconds. The sidebar
+// render is idempotent on a fingerprint of the whole payload, so a field that
+// ticked every millisecond would cost a `PATCH /session/{id}` on every event of
+// a multi-hour run for a string nobody sees change. Because every duration
+// string is truncated, quantizing here renders identically to the exact value
+// the session title formats, so the two halves still cannot disagree.
+function renderedElapsedMs(elapsedMs) {
+  if (elapsedMs < 60000) return Math.floor(elapsedMs / 1000) * 1000
+  return Math.floor(elapsedMs / 60000) * 60000
+}
+
 // The structured goal status mirrored into `session.metadata.goal`. The TUI
 // reconciles the whole Session record into its reactive store, so anything here
 // is readable by a sidebar panel without another round trip. Bounded hard: this
@@ -652,9 +686,15 @@ function buildSidebarMetadata(goal, now = Date.now(), context = {}) {
     turns: isUnlimitedTurnBudget(goal.options.maxTurns)
       ? { used: goal.turnCount, max: null, unlimited: true }
       : { used: goal.turnCount, max: goal.options.maxTurns },
+    // Milliseconds are the field the panel renders from, so the panel and the
+    // session title agree at every granularity — including a budget under a
+    // minute, which `minutes` can only render as 0 (and which made the panel
+    // drop the duration stat entirely). `minutes` stays for consumers written
+    // against v1; it truncates, like every rendered duration.
+    durationMs: { used: renderedElapsedMs(elapsedMs), max: goal.options.maxDurationMs },
     minutes: {
-      used: Math.round(elapsedMs / 60000),
-      max: Math.round(goal.options.maxDurationMs / 60000),
+      used: Math.floor(elapsedMs / 60000),
+      max: Math.floor(goal.options.maxDurationMs / 60000),
     },
     tokens: { used: goal.totalTokens, max: goal.options.maxTokens },
     plan: {
@@ -2529,7 +2569,12 @@ function parseGoalArguments(args, defaults) {
       if (flagSpec.type === "turns") {
         const turns = parseTurnBudget(rawValue)
         if (turns === null) {
-          errors.push(`Invalid positive integer for ${flagName}: ${value}`)
+          // Not "invalid positive integer": 0 is legal here, and the whole
+          // point of the flag is the unlimited spellings the agent-tool
+          // validator already names.
+          errors.push(
+            `Invalid turn budget for ${flagName}: ${value} (use a positive integer, or 0/unlimited/none/inf/infinite/infinity/∞ for no ceiling)`,
+          )
           continue
         }
         options[flagSpec.optionKey] = turns
@@ -3371,10 +3416,36 @@ function outputTokensForMessage(message) {
   return toNonNegativeInteger(messageTokens(message).output)
 }
 
-function budgetWrapupNeeded(goal) {
+// The early handoff: at `budgetWrapupRatio` of a budget the goal is asked to
+// land the plane while it still can. It rides every budget that can actually
+// be reached, not just tokens. `goal.totalTokens` is the peak context-window
+// size, so the shipped 100m-token budget is unreachable and a token-only gate
+// fires never on a default goal — the whole `<budget_wrapup>` path was dead
+// under the 0.11.0 defaults. The clock is reachable by construction, so the
+// duration budget is what carries the wrap-up now: 6.4 h into the 8-hour
+// window.
+//
+// The turn budget is deliberately NOT a dimension: it is unlimited by default,
+// and when it is bounded the hard-limit path already sends a final handoff
+// prompt at the ceiling.
+function budgetWrapupNeeded(goal, now = Date.now()) {
+  if (goal.budgetWrapupSent) return false
+  const ratio = goal.options.budgetWrapupRatio
+  const maxTokens = Number(goal.options.maxTokens)
+  if (
+    Number.isFinite(maxTokens) &&
+    maxTokens > 0 &&
+    goal.totalTokens >= Math.floor(maxTokens * ratio)
+  ) {
+    return true
+  }
+  const maxDurationMs = Number(goal.options.maxDurationMs)
+  const startedAt = Number(goal.startedAt)
   return (
-    !goal.budgetWrapupSent &&
-    goal.totalTokens >= Math.floor(goal.options.maxTokens * goal.options.budgetWrapupRatio)
+    Number.isFinite(maxDurationMs) &&
+    maxDurationMs > 0 &&
+    Number.isFinite(startedAt) &&
+    Math.max(0, now - startedAt) >= Math.floor(maxDurationMs * ratio)
   )
 }
 
@@ -7673,6 +7744,7 @@ export const testInternals = {
   isPluginContinuationMessage,
   isPlanAgent,
   buildSessionTitle,
+  buildSidebarMetadata,
   formatCompactTokens,
   formatBudgetDuration,
   formatBudgetMinutes,

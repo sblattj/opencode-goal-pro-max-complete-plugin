@@ -18,16 +18,23 @@ function formatTurnBudget(used, max) {
 }
 function formatBudgetMinutes(minutes) {
   const parsed = Number(minutes);
-  const whole = Number.isFinite(parsed) && parsed > 0 ? Math.round(parsed) : 0;
+  const whole = Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 0;
   if (whole < 60)
     return `${whole}m`;
-  const hours = Math.round(whole / 60 * 10) / 10;
+  const hours = Math.floor(whole * 10 / 60) / 10;
   return Number.isInteger(hours) ? `${hours}h` : `${hours.toFixed(1)}h`;
+}
+function formatBudgetDuration(ms) {
+  const parsed = Number(ms);
+  const value = Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+  if (value < 60000)
+    return `${Math.floor(value / 1000)}s`;
+  return formatBudgetMinutes(value / 60000);
 }
 
 // src/goal-sidebar-view.js
 var GOAL_PANEL_TITLE = "Goal";
-var GOAL_PANEL_PAYLOAD_VERSION = 1;
+var GOAL_PANEL_PAYLOAD_VERSION = 2;
 var STATE_ICONS = {
   active: "▶",
   paused: "⏸",
@@ -72,11 +79,12 @@ function turnsBudget(raw) {
   if (!isRecord(raw))
     return null;
   const used = wholeNumber(raw.used);
-  if (raw.unlimited === true || raw.max === null)
+  if (raw.unlimited === true || isUnlimitedTurnBudget(raw.max)) {
     return { used, max: null, unlimited: true };
+  }
   const max = wholeNumber(raw.max);
   if (!max)
-    return null;
+    return { used, max: null, unlimited: true };
   return { used, max, unlimited: false };
 }
 function formatPanelTokens(value) {
@@ -115,13 +123,17 @@ function goalPanelModel(raw) {
     return null;
   const state = STATE_ICONS[raw.state] ? raw.state : "active";
   const turns = turnsBudget(raw.turns);
+  const durationMs = budget(raw.durationMs);
   const minutes = budget(raw.minutes);
   const tokens = budget(raw.tokens);
   const stats = [];
   if (turns)
     stats.push(`${formatTurnBudget(turns.used, turns.max)} turns`);
-  if (minutes)
+  if (durationMs) {
+    stats.push(`${formatBudgetDuration(durationMs.used)}/${formatBudgetDuration(durationMs.max)}`);
+  } else if (minutes) {
     stats.push(`${formatBudgetMinutes(minutes.used)}/${formatBudgetMinutes(minutes.max)}`);
+  }
   if (tokens)
     stats.push(`${formatPanelTokens(tokens.used)}/${formatPanelTokens(tokens.max)} tokens`);
   const sequence = isRecord(raw.sequence) && wholeNumber(raw.sequence.total) > 0 ? `step ${wholeNumber(raw.sequence.position)}/${wholeNumber(raw.sequence.total)}` : "";
