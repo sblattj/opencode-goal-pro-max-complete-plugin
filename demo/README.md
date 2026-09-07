@@ -27,7 +27,14 @@ agent verifies the suite passes and reports evidence-backed completion.
 
 2. Launch OpenCode in this directory. `demo/opencode.json` already points
    the plugin at the source file (`file:../src/goal-plugin.js`) and
-   registers the `goal` command, so no install step is needed:
+   registers the `goal` command, so no install step is needed. That file
+   form is deliberate here and is **not** what a real install should use:
+   OpenCode reads `package.json` from the target file's own directory, so a
+   path naming a file can never resolve `exports["./tui"]` and loads the
+   server half only — which is all this demo needs, since it has no sidebar
+   panel. A real install names the package **directory** instead, per
+   [Local install from a copy](../README.md#local-install-from-a-copy).
+   Launch it with:
 
    ```sh
    opencode
@@ -70,7 +77,7 @@ agent verifies the suite passes and reports evidence-backed completion.
   in the session.
 - **Hook output display varies by OpenCode version and provider** — the
   plugin's own status text may or may not render directly in the TUI (see
-  the [compatibility table](../README.md#compatibility-snapshot)). Either
+  [Compatibility](../README.md#compatibility)). Either
   way, the goal's state (limits, turn count, completion) is tracked
   correctly; you can always verify it directly by inspecting the
   persisted state at `.opencode/goals/state.json` in this directory.

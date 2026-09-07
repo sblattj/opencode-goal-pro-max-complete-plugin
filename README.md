@@ -18,7 +18,7 @@ The fork continued at [sblattj/OpenCode-goal-plugin](https://github.com/sblattj/
 
 ### The verification ladder
 
-Every row was run against this tree on 2026-09-07 (Node v24.15.0, npm 11.12.1, bun 1.3.14, macOS 26.5.1). `npm run release:check` runs all of them in order, plus a bundle step, and takes roughly 8–12 minutes.
+Every row was run against this tree on 2026-09-07 (Node v24.15.0, npm 11.12.1, bun 1.3.14, macOS 26.5.1). `npm run release:check` runs all of them in order, plus a bundle step, and takes about **2.5–3 minutes** on that stack — around nine tenths of it the mutation rung, which re-runs the whole suite once per mutant. (Timed end to end on this tree: 150 s, 151 s, 155 s and 173 s.)
 
 | Rung | Command | What it proves | Measured |
 |---|---|---|---|
@@ -34,7 +34,7 @@ Every row was run against this tree on 2026-09-07 (Node v24.15.0, npm 11.12.1, b
 | Git-install contract | `npm run smoke:git-install` | None of the six manifest script names that make pacote's `GitFetcher` spawn a missing `npmBin` has reappeared, and the committed `dist/` byte-matches a fresh bundle | **passed**; `dist/goal-plugin.js` and `dist/goal-tui.js` match a fresh bun 1.3.14 bundle |
 | Hook-surface verify | `npm run verify` | The installed plugin loads, registers all 9 hooks, answers `/goal status` and `/goal set`, and makes zero model calls | **all 7 checks passed** |
 | Dependency audit | `npm audit --omit=dev --audit-level=high` | No known high-severity vulnerability in the runtime dependency (`zod` only) | **0 vulnerabilities** |
-| Pack check | `npm run pack:check` | The tarball contains what it should and nothing else | **31 files, ≈330 kB packed, 1.4 MB unpacked** — `README.md` ships inside the tarball, so the exact packed byte count moves whenever this file does |
+| Pack check | `npm run pack:check` | The tarball contains what it should and nothing else | **32 files, ≈330 kB packed, 1.4 MB unpacked** — `README.md` ships inside the tarball, so the exact packed byte count moves whenever this file does |
 
 ### The process behind 0.11.0
 
@@ -63,7 +63,7 @@ This is one session, on one host build, with one model. It is enough to prove th
 Read this section before running anything unattended.
 
 - **The measurement above is one session.** It refutes the old behaviour; it does not characterise your workload.
-- **One host line.** `engines.opencode` is `>=1.17.15 <2`. OpenCode 2 is unsupported and untested. Live-host verification exists for specific builds (1.17.15, 1.18.25, 1.18.29) and specific providers, not for the matrix you will actually run — see [`docs/providers.md`](docs/providers.md) and [`docs/compatibility.md`](docs/compatibility.md).
+- **One host line.** `engines.opencode` is `>=1.17.15 <2`. OpenCode 2 is unsupported and untested. Live-host verification exists for specific builds (1.17.15, 1.18.25, 1.18.29) and specific providers, not for the matrix you will actually run — the 1.17.15 provider matrix is in [`docs/providers.md`](docs/providers.md), and the 1.18.25 and 1.18.29 runs are recorded per release in [`CHANGELOG.md`](CHANGELOG.md).
 - **The plugin depends on experimental OpenCode hooks, and the host may not call them.** Real OpenCode 1.17.15 and 1.18.10 never invoke `experimental.chat.system.transform`; it is registered as defence in depth, and every command-control protection is deliberately self-contained so correctness does not depend on it.
 - **Completion quality is model-dependent.** The evidence gate is structural: it checks that a `[goal:complete]` is preceded by a non-empty `[goal:evidence]` line, not that the evidence is true. The independent completion auditor is **optional and off by default**, and when on it performs static inspection with `read`, `glob`, and `grep` only — it cannot execute a command.
 - **`src/goal-tui.js` is not in the coverage report.** The panel's render logic lives in `src/goal-sidebar-view.js` (100% line, 95.29% branch) and is covered; the thin `@opentui/solid` entrypoint is exercised by `smoke:packed-manifest` loading it the way the TUI runtime does, not by the unit suite.
@@ -78,7 +78,7 @@ A full install is **two entries in two different files**. `opencode.json`'s `plu
 
 Always write the spec in the **named form** `<package>@<source>`. A bare `github:owner/repo` or a bare tarball URL is accepted by the config and then silently never loads: OpenCode looks the installed package up by the name `npm-package-arg` parses out of the spec, a bare git or tarball spec has none, and the host falls back to the whole spec string as a directory name and throws *after* the files are on disk, with nothing logged.
 
-> **No tag has been cut under this name yet.** The first release under `opencode-goal-pro-max-complete-plugin` is pending, and the npm package name is reserved for the same artifact. Until then, use the local `file://` form below, or a tag from the [previous repository](https://github.com/sblattj/OpenCode-goal-plugin) with its old package name. Replace `<tag>` below once the tag exists.
+> **Nothing is published under this name yet.** The first release under `opencode-goal-pro-max-complete-plugin` is pending: no git tag has been cut, and the npm name is **unclaimed, not reserved** — `npm view opencode-goal-pro-max-complete-plugin` answers `E404` today, and npm has no reservation mechanism short of publishing, so anyone could take the name before this project does. Do not trust a future `<pkg>@npm` spec until a release exists to check against. Until then, use the local `file://` form below, or a tag from the [previous repository](https://github.com/sblattj/OpenCode-goal-plugin) with its old package name. Every `<tag>` below — including the ones in [`examples/`](examples/) — is a placeholder that resolves only once a tag exists.
 
 ```jsonc
 // opencode.json — the server half: commands, tools, hooks, sidebar payload
@@ -414,11 +414,11 @@ The original title is captured before the first overwrite and restored by `/goal
   "state": "active",
   "objective": "ship the release",
   "turns": { "used": 3, "max": null, "unlimited": true },
-  "durationMs": { "used": 147000, "max": 28800000 },
+  "durationMs": { "used": 120000, "max": 28800000 },
   "minutes": { "used": 2, "max": 480 },
   "tokens": { "used": 147000, "max": 100000000 },
   "context": { "used": 147000, "max": 200000 },
-  "plan": { "total": 7, "verified": 3, "blocked": 0, "actions": [ … ] },
+  "plan": { "total": 7, "verified": 3, "blocked": 1, "actions": [ … ] },
   "successCriteria": "tests pass and changelog updated",
   "constraints": "do not touch the public API",
   "sequence": { "ordered": true, "position": 2, "total": 4 },
@@ -426,7 +426,7 @@ The original title is captured before the first overwrite and restored by `/goal
 }
 ```
 
-`durationMs` and `minutes` are plain numbers for the same duration (milliseconds, and truncated whole minutes). `tokens` is cumulative **spend** against `maxTokens`; `context` is **peak context** against the learned or configured window, and is **omitted entirely** when no ceiling is known rather than written as `max: 0`. Only `context.used` can go down. The one budget with a "no ceiling" state is `turns`, carried as `"max": null` plus an explicit `"unlimited": true` — never `Infinity`, which JSON serialises to `null` and would be indistinguishable from a missing field. A bounded goal carries `{ "used": 3, "max": 10 }` with no `unlimited` key.
+`durationMs` and `minutes` are plain numbers for the same duration, and **both are quantized to the granularity they are rendered at** — `durationMs` to whole seconds below a minute and to whole minutes above, `minutes` to whole minutes. An elapsed 147,000 ms is written as `"durationMs": { "used": 120000 }`, not `147000`: a field that ticked every millisecond would cost a `PATCH /session/{id}` on every event of a multi-hour run, and quantizing here is what keeps the payload and the truncated session-title duration from disagreeing. `tokens` is cumulative **spend** against `maxTokens`; `context` is **peak context** against the learned or configured window, and is **omitted entirely** when no ceiling is known rather than written as `max: 0`. Within one budget window only `context.used` can go down — but `/goal resume` starts a new window, which resets `turns.used`, `durationMs.used`, `minutes.used` and `tokens.used` to zero as well, so none of them is a monotonic counter across a resume. The one budget with a "no ceiling" state is `turns`, carried as `"max": null` plus an explicit `"unlimited": true` — never `Infinity`, which JSON serialises to `null` and would be indistinguishable from a missing field. A bounded goal carries `{ "used": 3, "max": 10 }` with no `unlimited` key. The block above is an **active, unblocked** goal: `stopReason` is written only once the goal has stopped and `blockedReason` only once a blocker is recorded, so neither key appears here.
 
 **Upgrade both halves together.** `v: 2` landed in 0.11.0: `turns.max` became nullable, `durationMs` and `context` were added, and `tokens.used` was redefined from context size to cumulative spend. Every v1 field is still written, so a v1 consumer keeps working — with one exception. The panel is registered separately from the server half, so the two can skew, and a **0.10.x panel reading a 0.11.0 payload drops the turns stat** (it reads `"max": null` as a missing budget). The current panel reads either version.
 
@@ -443,10 +443,15 @@ step 2/4
 ● rebuild dist [pass]
 ◐ rerun the suite
 ⛔ waiting on the audit
-+4 more
+● update the changelog [pass]
+● re-time the ladder [pass]
+○ tag the release
+○ announce the release
 Success: tests pass and changelog updated
 Constraints: do not touch the public API
 ```
+
+That is the payload above, rendered: every action in the plan gets a row. The panel lists **at most 12** actions and appends a `+N more` line only past that (`MAX_PANEL_ACTIONS` in `src/goal-sidebar-view.js`), and the server caps the array it publishes at **20** (`SIDEBAR_METADATA_MAX_ACTIONS` in `src/goal-plugin.js`), so `N` counts what `plan.total` claims beyond the rows shown.
 
 The `ctx` stat is **dropped entirely** when no context ceiling is known, so a panel with three stats rather than four is a goal running without one, not a broken render. State drives the colour: blocked is an error, completed a success, paused a warning. An action is green only when it is `done` **and** its verdict is `pass` — a `done` action with no verdict is exactly the unsubstantiated completion the CEV gate exists to catch. The panel hides itself when the session has no goal.
 
@@ -495,7 +500,7 @@ Objective-bearing commands preserve file attachments. OpenCode may expand those 
 | Provider/backend quirks | Strict-template backends require the goal block to merge into the primary `system` message; covered by regression tests. See [`docs/providers.md`](docs/providers.md) |
 | Runtime dependencies | `zod` only, bundled into `dist/` |
 
-Live-host verification is recorded per release rather than claimed in general: OpenCode 1.17.15 and 1.18.25 across five provider/model combinations for the v0.6.6–v0.9.0 lifecycle matrix, and OpenCode 1.18.29 for the sidebar and TUI-config findings in 0.10.0. `/goal status` and auto-continue are graded on **state correctness** — verified directly against persisted state and file effects — not on terminal rendering, because OpenCode custom commands are prompts, not plugin-rendered TUI responses: after `command.execute.before` runs, the host sends its retained command-parts array through a normal model turn. The plugin mutates that array in place so the model receives the deterministic plugin-generated result rather than the raw `/goal` argument, but the model still produces the visible response and may paraphrase it. The full matrix and session evidence are in [`docs/providers.md`](docs/providers.md).
+Live-host verification is recorded per release rather than claimed in general: **four** provider/model combinations on OpenCode 1.17.15 for the v0.6.6–v0.9.0 lifecycle matrix ([`docs/providers.md`](docs/providers.md)), one live OpenCode **1.18.25** TUI run for the plan-mode hold and the status indicator in 0.9.0, and OpenCode **1.18.29** for the sidebar, TUI-config and git-install findings in 0.10.0 and 0.10.1 — those last two runs are recorded in [`CHANGELOG.md`](CHANGELOG.md), not in [`docs/providers.md`](docs/providers.md). `/goal status` and auto-continue are graded on **state correctness** — verified directly against persisted state and file effects — not on terminal rendering, because OpenCode custom commands are prompts, not plugin-rendered TUI responses: after `command.execute.before` runs, the host sends its retained command-parts array through a normal model turn. The plugin mutates that array in place so the model receives the deterministic plugin-generated result rather than the raw `/goal` argument, but the model still produces the visible response and may paraphrase it. The 1.17.15 matrix and its session evidence are in [`docs/providers.md`](docs/providers.md); the 1.18.x runs are in the changelog entries for the releases that made them.
 
 **Re-test against the exact OpenCode build and provider stack you plan to use for unattended work.** Nothing in this repository can do that for you.
 
@@ -516,7 +521,7 @@ If a goal does not continue:
 3. If a goal control reports that another process owns the session, close that owner and retry, or fork. If it reports an older, incomplete, tampered, or unsupported lease, close and upgrade every process that could own the session first; if it persists, remove only the affected shard's adjacent `.lock` file or legacy directory **and** its `.lock.claims-v2` directory. Keep the state and ledger. Never point two copies of one session at different state paths — that creates divergent histories.
 4. Check OpenCode's structured logs for persistence, SDK-shape, prompt, or auditor errors.
 5. Confirm the project directory and the state-path precedence above. A daemon started elsewhere makes a relative path surprising.
-6. Run `npm run verify`, `npm run smoke`, and `npm run smoke:packed-host` against the installed source when diagnosing registration or packaging problems.
+6. From an install, run the shipped verifier — `npx opencode-goal-pro-max-complete-plugin`, which is `npm run verify` — when diagnosing registration problems. The packaging contracts (`npm run smoke`, `npm run smoke:packed-host`, and the rest of the ladder) live in a git checkout only: `package.json` `files` ships `scripts/verify.mjs` and nothing else from `scripts/`, so running them inside `node_modules` fails with `MODULE_NOT_FOUND`.
 
 Do not paste `state.json`, its ledger, or verbose logs into a public issue without reviewing them: they can contain goal text, assistant checkpoints, blockers, local paths, and command evidence. Prefer the bounded status/history output. There is intentionally no broad "dump diagnostics" tool — exposing process-wide session state or persistence paths to the model would add more privacy risk than troubleshooting value.
 
@@ -526,7 +531,7 @@ Do not paste `state.json`, its ledger, or verbose logs into a public issue witho
 npm test                     # 508 unit tests
 npm run test:coverage        # tests with coverage
 npm run type:check           # compile installed-package consumers (NodeNext + Bundler)
-npm run test:mutation        # 80 critical mutants must all be killed (~4 min)
+npm run test:mutation        # 80 critical mutants must all be killed (~2.3 min)
 npm run benchmark:behavior   # 6 deterministic autonomy scenarios, no provider call
 npm run smoke                # package export + command hook, no model call
 npm run smoke:packed-host    # install the packed tarball, exercise the host contract
@@ -536,7 +541,7 @@ npm run smoke:git-install    # no install-time scripts; dist matches a fresh bun
 npm run verify               # installed hook surface
 npm run check                # syntax check + tests
 npm run pack:check           # package contents
-npm run release:check        # the complete gate, in order (~8-12 min)
+npm run release:check        # the complete gate, in order (~3 min)
 ```
 
 Point OpenCode at your checkout for local testing with the package **directory**, not a file inside it. Keep test files outside OpenCode's auto-loaded plugin directory — it will try to load plugin-like files it finds there. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full contribution checklist and [`SECURITY.md`](SECURITY.md) for vulnerability reporting.

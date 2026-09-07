@@ -1,5 +1,15 @@
 import assert from "node:assert/strict"
-import pluginModule, { GoalPlugin } from "opencode-goal-pro-max-complete-plugin"
+import { readFile } from "node:fs/promises"
+
+// The published package name comes from the manifest, never a literal: a
+// rename that missed this line would leave the contract probing a name
+// nothing publishes, and the failure would look like a broken host.
+const { name: packageName } = JSON.parse(
+  await readFile(new URL("../package.json", import.meta.url), "utf8"),
+)
+// Imported by name rather than by path, because resolving the package's own
+// name through its `exports` map is exactly what an OpenCode host does.
+const { default: pluginModule, GoalPlugin } = await import(packageName)
 
 const expectedTools = [
   "clear_goal",
@@ -100,4 +110,4 @@ assert.match(logCalls[0].body.message, /Goal (?:active|started)/i)
 assert.match(logCalls[1].body.message, /Goal cleared/i)
 assert.ok(logCalls.every((entry) => !entry.body.message.includes("ship a smoke test")))
 
-console.log("opencode-goal-pro-max-complete-plugin command hook smoke passed")
+console.log(`${packageName} command hook smoke passed`)

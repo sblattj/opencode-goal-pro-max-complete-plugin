@@ -1,13 +1,19 @@
 import assert from "node:assert/strict"
 import { execFileSync } from "node:child_process"
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises"
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 
 const repository = new URL("..", import.meta.url)
 const repositoryPath = fileURLToPath(repository)
-const root = await mkdtemp(join(tmpdir(), "opencode-goal-pro-max-complete-plugin-types-"))
+// The published package name comes from the manifest, never a literal: a
+// rename that missed this line would leave the contract probing a name
+// nothing publishes, and the failure would look like a broken host.
+const { name: packageName } = JSON.parse(
+  await readFile(new URL("package.json", repository), "utf8"),
+)
+const root = await mkdtemp(join(tmpdir(), `${packageName}-types-`))
 const packDirectory = join(root, "pack")
 const consumerDirectory = join(root, "consumer")
 const cacheDirectory = join(root, "npm-cache")
@@ -30,8 +36,8 @@ import goalPlugin, {
   type CompletionAuditContext,
   type GoalPluginHooks,
   type GoalPluginOptions,
-} from "opencode-goal-pro-max-complete-plugin"
-import serverPlugin from "opencode-goal-pro-max-complete-plugin/server"
+} from "${packageName}"
+import serverPlugin from "${packageName}/server"
 import tuiPlugin, {
   createGoalSidebar,
   formatPanelTokens,
@@ -40,7 +46,7 @@ import tuiPlugin, {
   type GoalPanelModel,
   type GoalSidebarRuntime,
   type GoalTuiPlugin,
-} from "opencode-goal-pro-max-complete-plugin/tui"
+} from "${packageName}/tui"
 
 const options = {
   sdkShape: "flat",

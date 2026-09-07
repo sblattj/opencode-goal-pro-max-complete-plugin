@@ -4,7 +4,8 @@
 
 The latest published release is the supported line. Public compatibility covers:
 
-- the package root and `opencode-goal-pro-max-complete-plugin/server` ESM exports
+- the package root, `opencode-goal-pro-max-complete-plugin/server`, and
+  `opencode-goal-pro-max-complete-plugin/tui` ESM exports
 - the declarations exported by `index.d.ts`
 - the documented `GoalPluginOptions` fields
 - the documented OpenCode hook names
@@ -120,16 +121,19 @@ OpenCode 2 build, not a mock:
 
 ### Configuration
 
-This plugin is **server-only**: `package.json` exports the root and
-`opencode-goal-pro-max-complete-plugin/server`, and there is no TUI plugin entrypoint. Its
-configuration therefore lives entirely in `opencode.json` (the `plugin` and
-`command` keys) on any OpenCode line.
+This package ships **both plugin halves**, and a full install is therefore
+**two entries in two different files**. `package.json` exports three paths: the
+root and `opencode-goal-pro-max-complete-plugin/server` (the server half —
+commands, tools, hooks, and the title and metadata writes) and
+`opencode-goal-pro-max-complete-plugin/tui` (the sidebar panel).
 
-Plugins that *do* ship a TUI component are registered in a second file whose
-location differs between OpenCode lines, and those formats must not be mixed.
-That distinction does not apply here — including for the
-[status indicator](../README.md#status-indicator), which reaches the TUI through
-the session title rather than through a TUI plugin.
+`opencode.json`'s `plugin` array only ever produces *server* plugins; OpenCode
+reads *TUI* plugins from a separate `tui.json`/`tui.jsonc`, whose location
+differs between OpenCode lines, and the two formats must not be mixed. Register
+the package in **both** files to get the panel. The server half works alone —
+you get the [status line](../README.md#status-line), which reaches every client
+through the session title rather than through a TUI plugin, and no panel. On a
+host without TUI plugin slots the `./tui` target is simply never loaded.
 
 ## Versioning
 

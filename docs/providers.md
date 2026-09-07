@@ -20,8 +20,8 @@ vary by provider and model:
    tool blocking and lifecycle suppression; the model may still summarize or
    paraphrase the supplied data.
    This is primarily host behavior, but it remains worth checking with each
-   provider/backend. See the [OpenCode version compatibility table](../README.md#opencode-version-compatibility)
-   for the historical v0.6.6 findings.
+   provider/backend. See [Compatibility](../README.md#compatibility) in the
+   README, and the changelog entry for v0.6.6, for the historical findings.
 
 All rows below were verified against real OpenCode processes with live
 provider credentials and no mocked plugin hooks on OpenCode 1.17.15 before the
@@ -82,7 +82,7 @@ No LLM call is required to verify the plugin loads correctly — run
 specific provider/model:
 
 1. Point an OpenCode config at the plugin (see
-   [Local development](../README.md#local-development) in the README) and
+   [Development](../README.md#development) in the README) and
    register the `goal` command.
 2. Launch OpenCode against the model you want to test:
    ```sh

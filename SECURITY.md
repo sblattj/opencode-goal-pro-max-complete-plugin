@@ -8,10 +8,15 @@ upgrade to the newest patch release before reporting a vulnerability.
 ## Reporting a Vulnerability
 
 Use [GitHub's private vulnerability report](https://github.com/sblattj/opencode-goal-pro-max-complete-plugin/security/advisories/new).
+**That link goes live with the first public release**: the repository under this
+name has not been published yet, so until it is, the link 404s and the fallback
+below is the only channel. Private vulnerability reporting must be enabled on the
+repository before the first tag is cut.
 Do **not** open a public issue with exploit details, credentials, local paths, or
-reproduction steps that could expose user data or local system access. If private
-reporting is temporarily unavailable, contact the maintainer through their GitHub
-profile and request a private handoff.
+reproduction steps that could expose user data or local system access. While
+private reporting is unavailable, contact the maintainer
+([@sblattj](https://github.com/sblattj)) through their GitHub profile and request
+a private handoff.
 
 ## Scope
 
