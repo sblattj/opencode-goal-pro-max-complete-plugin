@@ -33,7 +33,7 @@ agent verifies the suite passes and reports evidence-backed completion.
    path naming a file can never resolve `exports["./tui"]` and loads the
    server half only — which is all this demo needs, since it has no sidebar
    panel. A real install names the package **directory** instead, per
-   [Local install from a copy](../README.md#local-install-from-a-copy).
+   [Local install from a copy](../docs/reference.md#local-install-from-a-copy).
    Launch it with:
 
    ```sh
@@ -77,7 +77,7 @@ agent verifies the suite passes and reports evidence-backed completion.
   in the session.
 - **Hook output display varies by OpenCode version and provider** — the
   plugin's own status text may or may not render directly in the TUI (see
-  [Compatibility](../README.md#compatibility)). Either
+  [Compatibility](../docs/reference.md#compatibility)). Either
   way, the goal's state (limits, turn count, completion) is tracked
   correctly; you can always verify it directly by inspecting the
   persisted state at `.opencode/goals/state.json` in this directory.

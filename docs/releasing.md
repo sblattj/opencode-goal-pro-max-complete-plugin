@@ -15,6 +15,9 @@ artifact after all checks pass.
 `release:check` runs the unit and coverage suites, consumer type compilation,
 critical mutation contract, behavior benchmark, source and installed-artifact
 smoke tests, clean-install default tool registration, and package-content check.
+What each rung proves, and the measured result it is supposed to produce, is in
+[`verification.md`](verification.md) — re-measure that table when a rung's numbers
+move, since it is a record of an actual run rather than an aspiration.
 
 ## Publish
 
