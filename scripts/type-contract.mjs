@@ -148,9 +148,10 @@ try {
   await writeFile(join(consumerDirectory, "package.json"), JSON.stringify({ private: true, type: "module" }))
   await writeFile(join(consumerDirectory, "contract.ts"), fixture)
 
-  // `npm pack --json` prints the prepack lifecycle's own stdout (the Bun build's
-  // "Bundled N modules …") ahead of the JSON, so the whole stream is not valid
-  // JSON. Parse from the first `[` instead of the first byte.
+  // `npm pack --json` can print lifecycle or notice output ahead of the JSON
+  // (it printed the Bun build's "Bundled N modules …" until the `prepack` build
+  // was removed in 0.10.1), so the whole stream is not necessarily valid JSON.
+  // Parse from the first `[` instead of the first byte.
   const packOutput = execNpm(
     ["pack", "--json", "--pack-destination", packDirectory],
     { cwd: repository, encoding: "utf8", env: npmEnvironment },

@@ -58,15 +58,17 @@ Separately, the lifecycle-feedback implementation included in v0.7.0 passed a re
 
 ## Install
 
-```sh
-npm install opencode-goal-plugin
-```
+The 0.10.x line lives in this repository and is not on npm, so install it from a
+git tag. **Always write the spec in the named form
+`opencode-goal-plugin@<source>`.** A bare
+`github:owner/repo` or a bare tarball URL is accepted by the config and then
+silently never loads on OpenCode 1.18.x — see [Spec forms](#spec-forms) below.
 
-Add the plugin and command to your OpenCode config:
+Add the plugin and the command to `opencode.json`:
 
 ```json
 {
-  "plugin": ["opencode-goal-plugin"],
+  "plugin": ["opencode-goal-plugin@github:sblattj/OpenCode-goal-plugin#v0.10.1"],
   "command": {
     "goal": {
       "description": "Set a session-scoped goal and auto-continue until complete.",
@@ -77,13 +79,43 @@ Add the plugin and command to your OpenCode config:
 }
 ```
 
-For the sidebar **panel**, add one more line to a `tui.json` beside it — OpenCode
-loads TUI plugins from that file, not from `opencode.json` (see
-[Sidebar panel (TUI)](#sidebar-panel-tui)):
+Then add the **same spec** to a `tui.json` beside it, which is what loads the
+sidebar panel — OpenCode reads TUI plugins from that file and never from
+`opencode.json` (see [Sidebar panel (TUI)](#sidebar-panel-tui)):
 
 ```json
-{ "plugin": ["opencode-goal-plugin"] }
+{ "plugin": ["opencode-goal-plugin@github:sblattj/OpenCode-goal-plugin#v0.10.1"] }
 ```
+
+Or let OpenCode write both entries for you:
+
+```sh
+opencode plugin 'opencode-goal-plugin@github:sblattj/OpenCode-goal-plugin#v0.10.1' --global
+```
+
+### Spec forms
+
+Both of these work, and both name the package before the source:
+
+```
+opencode-goal-plugin@github:sblattj/OpenCode-goal-plugin#v0.10.1
+opencode-goal-plugin@https://github.com/sblattj/OpenCode-goal-plugin/archive/refs/tags/v0.10.1.tar.gz
+```
+
+These do **not** work on OpenCode 1.18.x, and fail *silently* — the package is
+downloaded and unpacked, but the plugin never loads and nothing is logged:
+
+```
+github:sblattj/OpenCode-goal-plugin#v0.10.1
+https://github.com/sblattj/OpenCode-goal-plugin/archive/refs/tags/v0.10.1.tar.gz
+```
+
+The reason is that OpenCode looks the installed package up by the name
+`npm-package-arg` parses out of the spec, and a bare git or tarball spec has no
+name: `packages/core/src/npm.ts:117-134` falls back to using the whole spec
+string as the directory name, finds no `node_modules/<that string>`, and throws
+after the files are already on disk. Pinning a tag is also recommended over
+tracking a branch, so an install is reproducible.
 
 ## Usage
 
@@ -521,16 +553,16 @@ State drives the colour: blocked is an error, completed a success, paused a warn
 
 **The TUI half needs its own config file.** This trips everyone: OpenCode does *not* load TUI plugins from `opencode.json`'s `plugin` array — that list only ever produces server plugins. TUI plugins come from a separate **`tui.json`** (or `tui.jsonc`), read from the global config directory, from `$OPENCODE_TUI_CONFIG`, and from each `.opencode/` directory between the project and your home directory. Verified against opencode 1.18.29: `packages/opencode/src/config/tui.ts:157-168` is the only place `plugin_origins` is populated, and it runs once per **tui** config file (`tui.ts:183-210`, `config/paths.ts:43-45`); the TUI runtime then loads exactly that list (`packages/opencode/src/plugin/tui/runtime.ts:1088`).
 
-So a full install is two entries:
+So a full install is two entries, both in the named spec form (see [Spec forms](#spec-forms)):
 
 ```jsonc
 // opencode.json — the server half (commands, tools, hooks, sidebar payload)
-{ "plugin": ["opencode-goal-plugin"] }
+{ "plugin": ["opencode-goal-plugin@github:sblattj/OpenCode-goal-plugin#v0.10.1"] }
 ```
 
 ```jsonc
 // tui.json, next to it — the TUI half (the sidebar panel)
-{ "plugin": ["opencode-goal-plugin"] }
+{ "plugin": ["opencode-goal-plugin@github:sblattj/OpenCode-goal-plugin#v0.10.1"] }
 ```
 
 The server half works on its own; without the `tui.json` entry you get the title line and no panel. **Point each entry at the package (or, for a local checkout, its directory) — never at a file inside it**: OpenCode reads `package.json` from the target file's own directory and does not walk upward, so a config naming `…/dist/goal-plugin.js` can never resolve `exports["./tui"]`.
@@ -631,13 +663,16 @@ Do not paste `state.json`, its ledger, or verbose logs into a public issue witho
 
 ## Local development
 
-Point OpenCode at the source file directly for local testing:
+Point OpenCode at your checkout for local testing. Use the package **directory**,
+not a file inside it, so both the `./server` and `./tui` targets resolve:
 
 ```json
 {
-  "plugin": ["file:///absolute/path/to/opencode-goal-plugin/src/goal-plugin.js"]
+  "plugin": ["/absolute/path/to/opencode-goal-plugin"]
 }
 ```
+
+The same path goes in `tui.json` if you want the sidebar panel while developing.
 
 Keep test files outside OpenCode's auto-loaded plugin directory — OpenCode will attempt to load plugin-like files it finds there.
 

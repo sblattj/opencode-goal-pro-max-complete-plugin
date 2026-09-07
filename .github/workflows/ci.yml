@@ -65,6 +65,14 @@ jobs:
         run: npm run smoke:packed-host
       - name: Verify installed tarball tool contract
         run: npm run smoke:packed-tools
+      - name: Verify both plugin targets in the packed manifest
+        run: npm run smoke:packed-manifest
+      - name: Set up Bun for the bundle-freshness check
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: latest
+      - name: Verify the package stays installable from a git spec
+        run: npm run smoke:git-install
       - name: Audit production dependencies
         run: npm audit --omit=dev --audit-level=high
       - name: Verify package contents
