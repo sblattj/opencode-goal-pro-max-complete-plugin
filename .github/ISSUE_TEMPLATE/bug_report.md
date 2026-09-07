@@ -1,6 +1,6 @@
 ---
 name: Bug report
-about: Report a problem with opencode-goal-plugin
+about: Report a problem with opencode-goal-pro-max-complete-plugin
 title: ""
 labels: bug
 assignees: ""
@@ -10,7 +10,7 @@ assignees: ""
 
 - OpenCode version: <!-- e.g. 1.17.15 (run `opencode --version`) -->
 - Provider / model: <!-- e.g. deepseek/deepseek-chat, opencode-go/qwen3.7-plus -->
-- opencode-goal-plugin version: <!-- e.g. 0.4.7, or "file:" local install -->
+- opencode-goal-pro-max-complete-plugin version: <!-- e.g. 0.4.7, or "file:" local install -->
 - Node.js version: <!-- run `node --version` -->
 - OS: <!-- e.g. macOS 15, Ubuntu 24.04 -->
 - Relevant plugin options: <!-- e.g. commandName, completionAudit, registerTools -->

@@ -1,6 +1,6 @@
 /**
- * Type declarations for the TUI half of opencode-goal-plugin
- * (`opencode-goal-plugin/tui`), which OpenCode loads as the package's `./tui`
+ * Type declarations for the TUI half of opencode-goal-pro-max-complete-plugin
+ * (`opencode-goal-pro-max-complete-plugin/tui`), which OpenCode loads as the package's `./tui`
  * target and which registers the goal panel in the session sidebar.
  *
  * These are declared structurally rather than by importing

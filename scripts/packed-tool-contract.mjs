@@ -6,7 +6,7 @@ import { join } from "node:path"
 import { pathToFileURL } from "node:url"
 
 const repository = new URL("..", import.meta.url)
-const root = await mkdtemp(join(tmpdir(), "opencode-goal-plugin-packed-tools-"))
+const root = await mkdtemp(join(tmpdir(), "opencode-goal-pro-max-complete-plugin-packed-tools-"))
 const packDirectory = join(root, "pack")
 const projectDirectory = join(root, "consumer")
 const cacheDirectory = join(root, "npm-cache")
@@ -65,7 +65,7 @@ try {
     { cwd: projectDirectory, stdio: "pipe", env: npmEnvironment },
   )
 
-  const installedRoot = join(projectDirectory, "node_modules", "opencode-goal-plugin")
+  const installedRoot = join(projectDirectory, "node_modules", "opencode-goal-pro-max-complete-plugin")
   const manifest = JSON.parse(await readFile(join(installedRoot, "package.json"), "utf8"))
   const installed = await import(pathToFileURL(join(installedRoot, manifest.main)).href)
   const hooks = await installed.GoalPlugin(

@@ -30,7 +30,7 @@ import { join } from "node:path"
 import { pathToFileURL } from "node:url"
 
 const repository = new URL("..", import.meta.url)
-const root = await mkdtemp(join(tmpdir(), "opencode-goal-plugin-packed-manifest-"))
+const root = await mkdtemp(join(tmpdir(), "opencode-goal-pro-max-complete-plugin-packed-manifest-"))
 const packDirectory = join(root, "pack")
 const projectDirectory = join(root, "consumer")
 const cacheDirectory = join(root, "npm-cache")
@@ -142,7 +142,7 @@ try {
     { cwd: projectDirectory, stdio: "pipe", env: npmEnvironment },
   )
 
-  const installedRoot = join(projectDirectory, "node_modules", "opencode-goal-plugin")
+  const installedRoot = join(projectDirectory, "node_modules", "opencode-goal-pro-max-complete-plugin")
   const manifest = JSON.parse(await readFile(join(installedRoot, "package.json"), "utf8"))
 
   // 1. The manifest exposes exactly the two plugin targets, in the order
@@ -206,9 +206,9 @@ try {
   // 4. The packed `./tui` subpath resolves through Node's own exports map and
   //    satisfies readV1Plugin for kind "tui".
   const probe = join(projectDirectory, "probe.mjs")
-  await writeFile(probe, 'export * from "opencode-goal-plugin/tui"\nexport { default } from "opencode-goal-plugin/tui"\n')
+  await writeFile(probe, 'export * from "opencode-goal-pro-max-complete-plugin/tui"\nexport { default } from "opencode-goal-pro-max-complete-plugin/tui"\n')
   const tuiModule = await import(pathToFileURL(probe).href)
-  const plugin = readV1Plugin(tuiModule, "opencode-goal-plugin", "tui")
+  const plugin = readV1Plugin(tuiModule, "opencode-goal-pro-max-complete-plugin", "tui")
   assert.equal(plugin.id, "opencode-goal-plugin")
   assert.equal(typeof tuiModule.goalPanelModel, "function", "the tui entry must re-export its pure model")
 
@@ -216,12 +216,12 @@ try {
   // versa: that asymmetry is the whole reason there are two targets.
   const serverModule = await import(pathToFileURL(join(installedRoot, entries.server)).href)
   assert.throws(
-    () => readV1Plugin(serverModule, "opencode-goal-plugin", "tui"),
+    () => readV1Plugin(serverModule, "opencode-goal-pro-max-complete-plugin", "tui"),
     /must default export an object with tui\(\)/,
     "the server entry must not satisfy the tui contract",
   )
   assert.throws(
-    () => readV1Plugin(tuiModule, "opencode-goal-plugin", "server"),
+    () => readV1Plugin(tuiModule, "opencode-goal-pro-max-complete-plugin", "server"),
     /must default export an object with server\(\)/,
     "the tui entry must not satisfy the server contract",
   )
@@ -255,7 +255,7 @@ try {
       },
     },
   }
-  await plugin.tui(api, {}, { spec: "opencode-goal-plugin" })
+  await plugin.tui(api, {}, { spec: "opencode-goal-pro-max-complete-plugin" })
 
   assert.equal(registrations.length, 1, "tui() must register exactly one slot view")
   const [registration] = registrations

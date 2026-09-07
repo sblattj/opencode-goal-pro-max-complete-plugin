@@ -263,7 +263,7 @@ const continuationCharacters = results.reduce(
 )
 const report = {
   schemaVersion: 1,
-  benchmark: "opencode-goal-plugin-behavior",
+  benchmark: "opencode-goal-pro-max-complete-plugin-behavior",
   score,
   possibleScore,
   passed: score === possibleScore,

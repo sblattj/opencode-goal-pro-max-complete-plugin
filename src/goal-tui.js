@@ -1,4 +1,4 @@
-// TUI half of opencode-goal-plugin: the sidebar goal panel.
+// TUI half of opencode-goal-pro-max-complete-plugin: the sidebar goal panel.
 //
 // Loaded by OpenCode as the package's `./tui` target
 // (packages/opencode/src/plugin/shared.ts:103-107 resolves

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Installation verification for opencode-goal-plugin.
+// Installation verification for opencode-goal-pro-max-complete-plugin.
 // Checks the plugin can be loaded and wired up correctly without ever
 // invoking a model — every check below uses the same mock-client approach
 // as scripts/smoke-command-hook.mjs.
@@ -51,7 +51,7 @@ function check(name, fn) {
     })
 }
 
-console.log("opencode-goal-plugin installation verification\n")
+console.log("opencode-goal-pro-max-complete-plugin installation verification\n")
 
 await check("Node.js >= 18", () => {
   const major = Number(process.versions.node.split(".")[0])
@@ -62,7 +62,7 @@ let pluginModule
 let GoalPlugin
 
 await check("plugin module resolves and exposes expected shape", async () => {
-  pluginModule = await import("opencode-goal-plugin")
+  pluginModule = await import("opencode-goal-pro-max-complete-plugin")
   GoalPlugin = pluginModule.GoalPlugin
   assert.equal(pluginModule.default.id, "opencode-goal-plugin")
   assert.equal(typeof pluginModule.default.server, "function")
@@ -175,4 +175,4 @@ if (failed.length > 0) {
   process.exit(1)
 }
 
-console.log(`All ${results.length} checks passed. opencode-goal-plugin is installed correctly.`)
+console.log(`All ${results.length} checks passed. opencode-goal-pro-max-complete-plugin is installed correctly.`)

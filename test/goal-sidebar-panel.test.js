@@ -306,7 +306,7 @@ test("the panel registers a sidebar_content view and logs that it did", async ()
   const { tui } = createGoalSidebar(runtime)
   const { api, registrations, logged } = fakeApi(new Map())
 
-  await tui(api, {}, { spec: "opencode-goal-plugin" })
+  await tui(api, {}, { spec: "opencode-goal-pro-max-complete-plugin" })
 
   assert.equal(registrations.length, 1)
   assert.equal(typeof registrations[0].order, "number")
@@ -324,7 +324,7 @@ test("a log that rejects does not take the TUI down with it", async () => {
     },
   })
 
-  await tui(api, {}, { spec: "opencode-goal-plugin" })
+  await tui(api, {}, { spec: "opencode-goal-pro-max-complete-plugin" })
   assert.equal(registrations.length, 1)
 })
 
@@ -356,7 +356,7 @@ test("the registered view renders the whole goal for its session", async () => {
     ],
   ])
   const { api, registrations } = fakeApi(sessions)
-  await tui(api, {}, { spec: "opencode-goal-plugin" })
+  await tui(api, {}, { spec: "opencode-goal-pro-max-complete-plugin" })
 
   const node = registrations[0].slots.sidebar_content({}, { session_id: "ses_goal" })
   const lines = renderLines(runtime, node)
@@ -387,7 +387,7 @@ test("the panel colours by state: blocked is an error, completed is a success", 
     ["ses_paused", { id: "ses_paused", metadata: { goal: payload({ state: "paused" }) } }],
   ])
   const { api, registrations } = fakeApi(sessions)
-  await tui(api, {}, { spec: "opencode-goal-plugin" })
+  await tui(api, {}, { spec: "opencode-goal-pro-max-complete-plugin" })
 
   const headline = (sessionID) => {
     const node = registrations[0].slots.sidebar_content({}, { session_id: sessionID })
@@ -428,7 +428,7 @@ test("a verified action reads as success and a failed verdict reads as an error"
     ],
   ])
   const { api, registrations } = fakeApi(sessions)
-  await tui(api, {}, { spec: "opencode-goal-plugin" })
+  await tui(api, {}, { spec: "opencode-goal-pro-max-complete-plugin" })
 
   const node = registrations[0].slots.sidebar_content({}, { session_id: "ses_plan" })
   const lines = renderLines(runtime, node)
@@ -449,7 +449,7 @@ test("the panel is hidden for a cleared goal, an unknown session, and a session 
     ["ses_other", { id: "ses_other", metadata: { somethingElse: true } }],
   ])
   const { api, registrations } = fakeApi(sessions)
-  await tui(api, {}, { spec: "opencode-goal-plugin" })
+  await tui(api, {}, { spec: "opencode-goal-pro-max-complete-plugin" })
 
   for (const sessionID of ["ses_cleared", "ses_bare", "ses_other", "ses_missing", "", undefined]) {
     const node = registrations[0].slots.sidebar_content({}, { session_id: sessionID })
@@ -463,7 +463,7 @@ test("the panel re-reads the session instead of freezing the values it first saw
   const session = { id: "ses_live", metadata: { goal: payload() } }
   const sessions = new Map([["ses_live", session]])
   const { api, registrations } = fakeApi(sessions)
-  await tui(api, {}, { spec: "opencode-goal-plugin" })
+  await tui(api, {}, { spec: "opencode-goal-pro-max-complete-plugin" })
 
   // Mount ONCE: the component body and every element in the tree are built a
   // single time, exactly as the host builds them. Everything the panel shows is

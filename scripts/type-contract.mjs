@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url"
 
 const repository = new URL("..", import.meta.url)
 const repositoryPath = fileURLToPath(repository)
-const root = await mkdtemp(join(tmpdir(), "opencode-goal-plugin-types-"))
+const root = await mkdtemp(join(tmpdir(), "opencode-goal-pro-max-complete-plugin-types-"))
 const packDirectory = join(root, "pack")
 const consumerDirectory = join(root, "consumer")
 const cacheDirectory = join(root, "npm-cache")
@@ -30,8 +30,8 @@ import goalPlugin, {
   type CompletionAuditContext,
   type GoalPluginHooks,
   type GoalPluginOptions,
-} from "opencode-goal-plugin"
-import serverPlugin from "opencode-goal-plugin/server"
+} from "opencode-goal-pro-max-complete-plugin"
+import serverPlugin from "opencode-goal-pro-max-complete-plugin/server"
 import tuiPlugin, {
   createGoalSidebar,
   formatPanelTokens,
@@ -40,7 +40,7 @@ import tuiPlugin, {
   type GoalPanelModel,
   type GoalSidebarRuntime,
   type GoalTuiPlugin,
-} from "opencode-goal-plugin/tui"
+} from "opencode-goal-pro-max-complete-plugin/tui"
 
 const options = {
   sdkShape: "flat",

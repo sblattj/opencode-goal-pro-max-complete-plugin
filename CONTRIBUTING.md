@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for helping improve `opencode-goal-plugin`.
+Thanks for helping improve `opencode-goal-pro-max-complete-plugin`.
 
 ## Development
 

@@ -4,7 +4,7 @@
 
 The latest published release is the supported line. Public compatibility covers:
 
-- the package root and `opencode-goal-plugin/server` ESM exports
+- the package root and `opencode-goal-pro-max-complete-plugin/server` ESM exports
 - the declarations exported by `index.d.ts`
 - the documented `GoalPluginOptions` fields
 - the documented OpenCode hook names
@@ -121,7 +121,7 @@ OpenCode 2 build, not a mock:
 ### Configuration
 
 This plugin is **server-only**: `package.json` exports the root and
-`opencode-goal-plugin/server`, and there is no TUI plugin entrypoint. Its
+`opencode-goal-pro-max-complete-plugin/server`, and there is no TUI plugin entrypoint. Its
 configuration therefore lives entirely in `opencode.json` (the `plugin` and
 `command` keys) on any OpenCode line.
 

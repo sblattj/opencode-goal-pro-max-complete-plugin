@@ -1,5 +1,5 @@
 {
-  "name": "opencode-goal-plugin-demo",
+  "name": "opencode-goal-pro-max-complete-plugin-demo",
   "private": true,
   "version": "1.0.0",
   "description": "Minimal reproducible demo: a failing test and a /goal that fixes it autonomously.",
