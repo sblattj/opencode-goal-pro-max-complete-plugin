@@ -79,8 +79,10 @@ export interface GoalPlan {
 export interface GoalSidebarStatus {
   /**
    * Schema version of this payload. v2 (0.11.0) made {@link
-   * GoalSidebarStatus.turns}`.max` nullable for an unlimited budget and added
-   * {@link GoalSidebarStatus.durationMs}; v1 fields are all still written.
+   * GoalSidebarStatus.turns}`.max` nullable for an unlimited budget, added
+   * {@link GoalSidebarStatus.durationMs} and {@link GoalSidebarStatus.context},
+   * and redefined {@link GoalSidebarStatus.tokens}`.used` as cumulative token
+   * spend rather than context size; v1 fields are all still written.
    */
   v: 2
   goalId: string
@@ -108,7 +110,20 @@ export interface GoalSidebarStatus {
   durationMs: { used: number; max: number }
   /** The same duration in whole minutes, truncated. Kept for v1 consumers. */
   minutes: { used: number; max: number }
+  /**
+   * Cumulative token SPEND and its budget — `used` is
+   * `input + output + reasoning + cacheRead + cacheWrite` summed over every
+   * message the goal produced, and `max` is `maxTokens`. As of v2 this is
+   * spend, not the size of the context; context has its own field.
+   */
   tokens: { used: number; max: number }
+  /**
+   * Context pressure, added in v2: `used` is the peak single-message context
+   * the goal has seen (reset to zero by a compaction) and `max` is
+   * `contextWindowTokens`. Unlike {@link GoalSidebarStatus.tokens}`.used`,
+   * this number can go down.
+   */
+  context: { used: number; max: number }
   plan: {
     total: number
     verified: number
@@ -139,7 +154,12 @@ export interface GoalAuditSnapshot {
   turnCount: number
   startedAt: number
   pausedAt: number
-  totalTokens: number
+  /**
+   * Peak single-message context size seen by this goal, reset to zero by a
+   * compaction. Named `totalTokens` before 0.11.0, where it was mistaken for
+   * cumulative spend; spend is `usage` (see {@link GoalUsage}).
+   */
+  peakContextTokens: number
   usage: Readonly<GoalUsage>
   options: Readonly<GoalPluginOptions>
   lastStatus: string
@@ -220,18 +240,35 @@ export interface GoalPluginOptions {
   maxDurationMs?: number
 
   /**
-   * Maximum context token budget a goal may consume before it is stopped
-   * for exceeding limits. Defaults to 100,000,000 — high enough that the
-   * duration window, not the token budget, ends a long unattended run.
-   * The counter is the peak CONTEXT WINDOW size, not cumulative API spend, so
-   * the default is unreachable by design: it disables the token brake and the
-   * token half of the budget wrap-up. Set a reachable number to re-enable
-   * both.
+   * Maximum cumulative token SPEND a goal may consume before it is stopped for
+   * exceeding limits — every token the goal has been billed for, summed over
+   * every message it produced:
+   * `usage.input + usage.output + usage.reasoning + usage.cacheRead + usage.cacheWrite`.
+   * Cache reads are in the sum because they are billed. Defaults to
+   * 100,000,000, a reachable ceiling for an 8-hour unattended run: the token
+   * brake, the token warning, and the token dimension of the budget wrap-up
+   * all fire against it.
+   * Context pressure is a different quantity with its own guard — see
+   * {@link GoalPluginOptions.contextWindowTokens}.
    * Overridable per-goal with `--max-tokens` or the `--budget` shorthand
    * (accepts a `k`/`m` suffix, e.g. `100k`, `1.5m`).
    * @default 100000000
    */
   maxTokens?: number
+
+  /**
+   * The model's context window, in tokens: the ceiling for the goal's PEAK
+   * single-message context (`input + output + reasoning + cache` on one
+   * message, kept as a high-water mark and reset by a compaction). Distinct
+   * from {@link GoalPluginOptions.maxTokens}, which bounds cumulative spend
+   * and only ever grows. At `budgetWrapupRatio` of this the goal is sent the
+   * wrap-up handoff, at `contextWindowTokens - warnTokensRemaining` it is
+   * warned, and at the ceiling it pauses with stop reason
+   * `context window reached`. Overridable per-goal with `--context-window`
+   * (accepts a `k`/`m` suffix, e.g. `400k`, `1m`).
+   * @default 200000
+   */
+  contextWindowTokens?: number
 
   /**
    * Minimum delay, in milliseconds, enforced between consecutive
@@ -302,9 +339,12 @@ export interface GoalPluginOptions {
   noContinueWhileChildrenActive?: boolean
 
   /**
-   * Fraction (between 0 and 1, exclusive) of any budget (turns, duration,
-   * or tokens) at which the plugin sends a one-time "wrap up" prompt
-   * nudging the model to finish before the hard limit is hit.
+   * Fraction (between 0 and 1, exclusive) of a budget at which the plugin
+   * sends a one-time "wrap up" prompt nudging the model to finish before the
+   * hard limit is hit. Applied to the three budgets that can actually be
+   * reached — cumulative token spend, peak context, and the wall clock —
+   * whichever arrives first. The turn budget is excluded: it is unlimited by
+   * default, and a bounded one already gets a final handoff at its ceiling.
    * @default 0.8
    */
   budgetWrapupRatio?: number
@@ -325,11 +365,11 @@ export interface GoalPluginOptions {
   warnDurationMsRemaining?: number
 
   /**
-   * Remaining context tokens at which a limit-approaching warning is
-   * included in status output. With the default 100,000,000-token budget it
-   * never fires — the counter is the peak context-window size, which the model
-   * bounds far below that — so it only takes effect on a goal that sets a
-   * reachable `--max-tokens`/`--budget`.
+   * Remaining tokens at which a limit-approaching warning is included in
+   * status output. Applied twice, to two different quantities: to the token
+   * budget (`maxTokens - spend`) and to the context window
+   * (`contextWindowTokens - peak context`), so a goal can be warned about
+   * either without setting a second threshold.
    * @default 25000
    */
   warnTokensRemaining?: number

@@ -71,7 +71,8 @@ export const GOAL_PANEL_TITLE = "Goal"
 // The payload version this panel understands. `metadata.goal.v` is written by
 // the server half; a future, larger version is rendered on a best-effort basis
 // rather than hidden, because a blank sidebar is worse than a stale one. v2
-// (0.11.0) made `turns.max` nullable and added `durationMs`.
+// (0.11.0) made `turns.max` nullable and added `durationMs` and `context`,
+// and redefined `tokens.used` as cumulative spend rather than context size.
 export const GOAL_PANEL_PAYLOAD_VERSION = 2
 
 const STATE_ICONS = {
@@ -186,7 +187,11 @@ export function goalPanelModel(raw) {
   // under a minute. Preferring `durationMs` keeps panel and title byte-equal.
   const durationMs = budget(raw.durationMs)
   const minutes = budget(raw.minutes)
+  // `tokens` is cumulative SPEND against the token budget; `context` is the
+  // peak context size against the model's window. They are different
+  // quantities and each has its own ceiling, so the panel shows both.
   const tokens = budget(raw.tokens)
+  const context = budget(raw.context)
 
   const stats = []
   if (turns) stats.push(`${formatTurnBudget(turns.used, turns.max)} turns`)
@@ -196,6 +201,7 @@ export function goalPanelModel(raw) {
     stats.push(`${formatBudgetMinutes(minutes.used)}/${formatBudgetMinutes(minutes.max)}`)
   }
   if (tokens) stats.push(`${formatPanelTokens(tokens.used)}/${formatPanelTokens(tokens.max)} tokens`)
+  if (context) stats.push(`${formatPanelTokens(context.used)}/${formatPanelTokens(context.max)} ctx`)
 
   const sequence =
     isRecord(raw.sequence) && wholeNumber(raw.sequence.total) > 0

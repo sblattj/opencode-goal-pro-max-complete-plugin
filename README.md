@@ -293,18 +293,27 @@ Markers must appear on their own final line. The bracketed form is canonical, bu
 |---|---|
 | Auto-continue turns | unlimited (`0`) |
 | Max duration | 8 hours |
-| Context tokens | 100,000,000 (effectively no brake — see below) |
+| Token spend | 100,000,000 cumulative tokens |
+| Context window | 200,000 tokens (peak context, guarded separately) |
 | Min delay between continues | 1.5 seconds |
 | No-progress pause | < 50 output tokens across a stalled turn (after a 2-turn grace window) |
 | No-tool-call pause | 10 consecutive continuation turns in which no assistant message called a tool |
-| Budget wrap-up threshold | 80% of the duration window or of the context-token budget, whichever comes first (6.4 h with the default 8-hour window) |
+| Budget wrap-up threshold | 80% of the token budget, the context window, or the duration window — whichever comes first (6.4 h with the default 8-hour window) |
 | Auto-continue failure pause | 3 consecutive prompt failures |
 
-**Effective turn count.** Turns are **unlimited by default** (`maxTurns: 0`), and the wall clock is 8 hours. With those defaults neither the turn counter nor the token budget is the brake that normally stops a run. Two cheaper pauses come first: the **no-tool-call pause** (ten consecutive talk-only continuation turns) and the **no-progress pause** (two consecutive stalled turns under 50 output tokens). Both judge the **whole turn** — every assistant message OpenCode produced in answer to one prompt — and both are deliberately skipped for any turn that **calls a tool** anywhere in it, so they catch a loop that has stopped *doing* anything — and they do **not** catch a loop that keeps working uselessly, e.g. an agent re-running the same failing command with real output every turn. For that run the binding brake is the **8-hour window**, with the budget wrap-up handoff at 80% of it (6.4 h) asking for a summary while there is still time to write one. Set `--max-turns <n>` when you want a hard ceiling on a single goal, and `--max-minutes` to shorten the window.
+**Effective turn count.** Turns are **unlimited by default** (`maxTurns: 0`), and the wall clock is 8 hours. With those defaults neither the turn counter nor the token budget is the brake that normally stops a run. Two cheaper pauses come first: the **no-tool-call pause** (ten consecutive talk-only continuation turns) and the **no-progress pause** (two consecutive stalled turns under 50 output tokens). Both judge the **whole turn** — every assistant message OpenCode produced in answer to one prompt — and both are deliberately skipped for any turn that **calls a tool** anywhere in it, so they catch a loop that has stopped *doing* anything — and they do **not** catch a loop that keeps working uselessly, e.g. an agent re-running the same failing command with real output every turn. For that run the binding brakes are the **8-hour window**, the **100,000,000-token spend budget** and the **200,000-token context window**, with the budget wrap-up handoff at 80% of whichever arrives first (6.4 h on the clock) asking for a summary while there is still time to write one. Set `--max-turns <n>` when you want a hard ceiling on a single goal, and `--max-minutes` to shorten the window.
 
-**Token budget.** The plugin tracks the session's **context window size** (`input + output + reasoning + cache` on the latest message, kept as the peak), not cumulative API spend. This matches the token count that OpenCode displays. When the context window reaches the `--max-tokens` limit, the plugin sends a wrap-up prompt and stops.
+**Token budget (`--max-tokens` / `--budget`) is cumulative SPEND.** It is every token the goal has been billed for, summed over every message it produced:
 
-**The default 100,000,000-token budget is deliberately unreachable**, because a context window is bounded by the model (200k–2M): the token brake, the token warning, and the token half of the budget wrap-up are all off by default, so a long run is no longer ended by its first context saturation — which the host handles by compacting. Pass `--max-tokens <n>` or `--budget 200k` to turn that brake back on for one goal, or set `maxTokens` in the plugin options for all of them; then the wrap-up fires at 80% of it, whichever of the token and duration budgets comes first.
+```
+spend = usage.input + usage.output + usage.reasoning + usage.cacheRead + usage.cacheWrite
+```
+
+Cache reads are in the sum because they are billed. The counter only grows, is deduplicated per message (a streaming update adds only its delta), and survives a restart because it lives in the persisted `usage` record. At 80% of `maxTokens` the goal gets the wrap-up handoff, at `maxTokens - warnTokensRemaining` it gets a "limits are near" warning, and at `maxTokens` it pauses with `max tokens reached`. The default 100,000,000 is a real ceiling for an 8-hour unattended run, not a disabled brake — lower it with `--budget 5m` to cap one goal's spend hard.
+
+**Context pressure (`--context-window`) is a separate guard on a separate number.** The plugin also tracks the session's **context window size** (`input + output + reasoning + cache` on a single message, kept as the peak) — the count OpenCode displays. That number is bounded by the model, and a compaction resets it, so it can never stand in for spend. It gets its own ceiling: `contextWindowTokens`, default `200000`. At 80% of it the goal gets the same wrap-up handoff, at `contextWindowTokens - warnTokensRemaining` a warning, and at the ceiling it pauses with `context window reached`. On a wider model, pass `--context-window 1m` (or set `contextWindowTokens` in the plugin options) so a healthy run is not stopped at 200k.
+
+The auto-continue prompt reports both, as `tokens_remaining` (spend headroom) and `context_remaining` (context headroom), and `/goal status` shows a `Token spend:` line and a `Peak context:` line.
 
 **No-progress heuristic.** A low-output turn does not pause immediately anymore. The plugin pauses only after `noProgressTurnsBeforePause` consecutive *stalled* low-output turns — repeated turns with very little output and no meaningful change in the latest assistant checkpoint. Output and reasoning tokens are **summed over the whole turn**, not read off its last message.
 
@@ -345,8 +354,9 @@ Override any limit for a single goal:
 | `--max-turns <n>` | Auto-continue turn limit. `0`, `unlimited`, `none`, `inf`, `infinite`, `infinity`, or `∞` (case-insensitive) means no ceiling, which is the default |
 | `--max-minutes <n>` | Duration limit in minutes |
 | `--max-duration-ms <n>` | Duration limit in milliseconds |
-| `--max-tokens <n>` | Context token limit |
-| `--budget <n>` | Context token limit shorthand; accepts a `k`/`m` suffix (e.g. `100k`, `1.5m`) |
+| `--max-tokens <n>` | Cumulative token **spend** limit |
+| `--budget <n>` | Token spend limit shorthand; accepts a `k`/`m` suffix (e.g. `100k`, `1.5m`) |
+| `--context-window <n>` | The model's context window: the ceiling for **peak context**, a different quantity from spend. Accepts a `k`/`m` suffix (e.g. `400k`, `1m`) |
 | `--cooldown-ms <n>` | Minimum delay between continues |
 | `--no-progress-threshold <n>` | Output token floor before pausing |
 | `--no-progress-turns <n>` | Consecutive stalled low-output turns before pausing |
@@ -364,6 +374,7 @@ Examples:
 /goal fix tests --max-turns unlimited --max-minutes 480
 /goal fix tests --no-progress-threshold 50 --no-progress-turns 2
 /goal fix tests --budget 100k
+/goal fix tests --budget 5m --context-window 1m
 ```
 
 ### Plugin-level defaults
@@ -379,6 +390,7 @@ Pass options when registering the plugin to change the defaults for all goals. T
         "maxTurns": 0,
         "maxDurationMs": 28800000,
         "maxTokens": 100000000,
+        "contextWindowTokens": 200000,
         "minDelayMs": 1500,
         "maxRecentMessages": 200,
         "noProgressTokenThreshold": 50,
@@ -403,7 +415,8 @@ Additional plugin-level options:
 - `noToolCallTurnsBeforePause` — grace window for tool-free continuation turns. The plugin pauses after this many consecutive continuation turns in which **no** assistant message of the turn called a tool (anti self-chat loop). Default `10`, because judging a completed goal purely on tool calls is blunt enough to deserve a long run of evidence; set the plugin option to `0` for legitimate tool-free writing/research workflows.
 - `noInterruptOnUserMessage` — when `true`, a new human message no longer pauses an active goal ("user intervention"); the goal loop keeps running and the message steers the next continuation. Because typing a message no longer stops the loop, `/goal pause` and `/goal stop` become the way to halt it. Default `false`, which pauses for `/goal resume` as before.
 - `noContinueWhileChildrenActive` — when `true`, auto-continue is deferred while the session has active child sessions (subagents, background tasks): the goal stays running but does not prompt the orchestrator until the children finish. A child counts as active only while the host reports a non-idle status for it, and each deferral is reported in `/goal status` and the lifecycle history so a waiting goal is never mistaken for a hung one. Default `false`. Enabling it adds a `children` and a `status` call to each idle the goal loop evaluates. The gate fails open — continuation proceeds — for hosts that cannot report children/status, for sessions with more concurrent children than the plugin can track, and for children that run goals of their own. Note that the gate relies on the child's own idle event to resume, so a host that never emits one leaves the goal waiting; `/goal status` reports the deferral in that case.
-- `warnTurnsRemaining` / `warnDurationMsRemaining` / `warnTokensRemaining` — thresholds at which the auto-continue prompt appends a "limits are near" warning (default `3` turns, `600000` ms = 10 minutes, `25000` context tokens). Lower them to warn closer to the limit, or raise them to warn earlier. The duration threshold is scaled to the 8-hour window; the old 60-second value was 0.2 % of it. **Two of the three are silent under the shipped defaults**: there is no turn warning when the turn budget is unlimited (nothing is running out), and no token warning while the 100,000,000-token budget is out of reach — so `warnTurnsRemaining` needs an explicit `--max-turns <n>` and `warnTokensRemaining` a reachable `--max-tokens`/`--budget`.
+- `contextWindowTokens` — the model's context window in tokens, the ceiling for the goal's **peak context** (default `200000`). Distinct from `maxTokens`, which bounds cumulative spend: peak context is bounded by the model and reset by a compaction, spend only grows. Raise it (`--context-window 1m`) on a model with a wider window.
+- `warnTurnsRemaining` / `warnDurationMsRemaining` / `warnTokensRemaining` — thresholds at which the auto-continue prompt appends a "limits are near" warning (default `3` turns, `600000` ms = 10 minutes, `25000` tokens). Lower them to warn closer to the limit, or raise them to warn earlier. The duration threshold is scaled to the 8-hour window; the old 60-second value was 0.2 % of it. `warnTokensRemaining` is applied twice, to two different quantities — `maxTokens - spend` and `contextWindowTokens - peak context` — so one threshold covers both token ceilings. Only the **turn** warning is silent under the shipped defaults, because an unlimited turn budget has nothing to run out of; it needs an explicit `--max-turns <n>`.
 - `commandName` — the slash command the plugin owns (default `goal`). Set it to e.g. `objective` to drive the workflow with `/objective` instead of `/goal`; a leading slash is tolerated. Remember to register the matching command name in your OpenCode `command` config. User-facing hints (`/goal status`, `/goal resume`, …) follow the configured name.
 - `registerCommand` — whether the plugin installs its `command.execute.before` hook at all (default `true`). Set it to `false` if you only want the auto-continue/persistence behavior driven programmatically and don't want the plugin to own a slash command.
 - `registerTools` — whether the plugin registers the agent-facing goal tools (default `true`). Set to `false` to omit the programmatic tool surface entirely. See [Agent tools](#agent-tools).
@@ -483,7 +496,7 @@ Unattended runs are easier to trust when you can see the goal is still alive. Th
 ▶ ship the release · 2/4 · 3/∞ · 2m/8h · 147k/100m · 3/7✓
 ```
 
-Status icon, objective label, sequence position (only for `/goal sequence`), auto-continues used / limit, elapsed / duration limit, context tokens / budget, and verified actions / total. An unlimited turn budget renders its ceiling as `∞`. Durations under a minute render in whole seconds (`45s`), then in minutes, then — from an hour — in hours with one decimal and no trailing `.0` (`45m`, `1h`, `1.5h`, `8h`). Every duration is **truncated, never rounded up**, so elapsed never reaches the limit's own rendering early and a limit never names a budget the goal does not have (7h57m of an 8-hour window reads `7.9h/8h`, and 481 minutes reads `8h`). Elapsed and limit are formatted independently, so a fresh 8-hour goal reads `0s/8h` and the same goal 90 minutes in reads `1.5h/8h`. The icon distinguishes running (`▶`), paused (`⏸`), blocked (`⛔`), and completed (`✓`) — blocked outranks paused because it needs you, not just a resume. A paused goal freezes its elapsed clock rather than running on.
+Status icon, objective label, sequence position (only for `/goal sequence`), auto-continues used / limit, elapsed / duration limit, cumulative token **spend** / token budget, and verified actions / total. Peak context is not in the title — it has its own guard, and `/goal status`, `metadata.goal.context` and the TUI panel report it. An unlimited turn budget renders its ceiling as `∞`. Durations under a minute render in whole seconds (`45s`), then in minutes, then — from an hour — in hours with one decimal and no trailing `.0` (`45m`, `1h`, `1.5h`, `8h`). Every duration is **truncated, never rounded up**, so elapsed never reaches the limit's own rendering early and a limit never names a budget the goal does not have (7h57m of an 8-hour window reads `7.9h/8h`, and 481 minutes reads `8h`). Elapsed and limit are formatted independently, so a fresh 8-hour goal reads `0s/8h` and the same goal 90 minutes in reads `1.5h/8h`. The icon distinguishes running (`▶`), paused (`⏸`), blocked (`⛔`), and completed (`✓`) — blocked outranks paused because it needs you, not just a resume. A paused goal freezes its elapsed clock rather than running on.
 
 When a goal ends, the sidebar switches to one terminal render (`✓ …`, state `completed`) instead of leaving the last running status up; `/goal clear` then hands the title back. A failure is not a separate state: it shows as `blocked` with a `blockedReason`, or `paused` with a `stopReason`, because a failed goal stays resumable.
 
@@ -499,6 +512,7 @@ Alongside the title, the plugin writes a structured payload to the session's `me
   "durationMs": { "used": 147000, "max": 28800000 },
   "minutes": { "used": 2, "max": 480 },
   "tokens": { "used": 147000, "max": 100000000 },
+  "context": { "used": 147000, "max": 200000 },
   "plan": { "total": 7, "verified": 3, "blocked": 0, "actions": [ … ] },
   "successCriteria": "tests pass and changelog updated",
   "constraints": "do not touch the public API",
@@ -507,9 +521,9 @@ Alongside the title, the plugin writes a structured payload to the session's `me
 }
 ```
 
-The payload stays machine-readable where the title is not: `durationMs` and `minutes` are plain numbers (milliseconds and truncated whole minutes for the same duration), and `tokens` is a plain token count. The one budget with a "no ceiling" state is `turns`, which carries `"max": null` plus an explicit `"unlimited": true` — never `Infinity`, which JSON serialises to `null` and would be indistinguishable from a missing field. A bounded goal carries `"turns": { "used": 3, "max": 10 }` with no `unlimited` key.
+The payload stays machine-readable where the title is not: `durationMs` and `minutes` are plain numbers (milliseconds and truncated whole minutes for the same duration), `tokens` is cumulative token **spend** against `maxTokens`, and `context` is the **peak context** against `contextWindowTokens` — two different quantities with two different ceilings, and only `context.used` can go down (a compaction resets it). The one budget with a "no ceiling" state is `turns`, which carries `"max": null` plus an explicit `"unlimited": true` — never `Infinity`, which JSON serialises to `null` and would be indistinguishable from a missing field. A bounded goal carries `"turns": { "used": 3, "max": 10 }` with no `unlimited` key.
 
-**Schema `v` is `2` as of 0.11.0**: `turns.max` became nullable and `durationMs` was added; every v1 field is still written, so a v1 consumer keeps working — with one exception worth knowing before you upgrade half of it. The [sidebar panel](#sidebar-panel-tui) ships in the same package but is registered separately (`opencode.json` for the server half, `tui.json` for the TUI half), so the two can skew. A **0.10.x panel reading a 0.11.0 payload drops the turns stat** (it reads the unlimited `"max": null` as a missing budget); the current panel reads either version. Upgrade both entries together.
+**Schema `v` is `2` as of 0.11.0**: `turns.max` became nullable, `durationMs` and `context` were added, and `tokens.used` was redefined from context size to cumulative spend; every v1 field is still written, so a v1 consumer keeps working — with one exception worth knowing before you upgrade half of it. The [sidebar panel](#sidebar-panel-tui) ships in the same package but is registered separately (`opencode.json` for the server half, `tui.json` for the TUI half), so the two can skew. A **0.10.x panel reading a 0.11.0 payload drops the turns stat** (it reads the unlimited `"max": null` as a missing budget); the current panel reads either version. Upgrade both entries together.
 
 **Mechanism.** Both halves are one `PATCH /session/{id}` call (`client.session.update`). The session title is what the OpenCode TUI sidebar renders for the current session, and `metadata` is reconciled into the TUI's reactive session store on the `session.updated` event. This half needs no TUI entrypoint and no `@opentui` dependency, so it works on every client that shows a session title — including `opencode run`, the desktop client, and any host reading the session record over HTTP. The [sidebar panel](#sidebar-panel-tui) below renders the same payload as a real panel when the host supports TUI plugins.
 
@@ -542,7 +556,7 @@ The title line is one row. When OpenCode's TUI supports plugin sidebar slots (1.
 ```
 Goal
 ▶ ship the release
-3/∞ turns · 2m/8h · 147k/100m tokens
+3/∞ turns · 2m/8h · 147k/100m tokens · 147k/200k ctx
 step 2/4
 3/7 actions verified, 1 blocked
 ● rebuild dist [pass]
