@@ -31,6 +31,10 @@ const {
   escapeGoalText,
   extractBlockedReason,
   extractCompletionEvidence,
+  assistantMessagesForTurn,
+  turnCallsTool,
+  sumTurnOutputTokens,
+  sumTurnReasoningTokens,
   formatGoalList,
   formatStatus,
   getSessionID,
@@ -3445,6 +3449,328 @@ test("--no-tool-turns flag overrides the no-tool-call grace window", () => {
 
 test("plugin option zero disables the no-tool-call heuristic", () => {
   assert.equal(normalizeOptions({ noToolCallTurnsBeforePause: 0 }).noToolCallTurnsBeforePause, 0)
+})
+
+// ---------------------------------------------------------------------------
+// ONE TURN IS N ASSISTANT MESSAGES.
+//
+// OpenCode 1.18.29 creates a new assistant message for every LLM step of a
+// single prompt (packages/opencode/src/session/prompt.ts: step loop at :1088,
+// message construction + updateMessage at :1187-1202), so the messages that
+// called tools and the closing text-only summary are SEPARATE assistant
+// messages sharing one parentID. These tests pin the brakes to the whole turn.
+// ---------------------------------------------------------------------------
+
+function turnStep(
+  id,
+  parentID,
+  {
+    text = "working",
+    tool = false,
+    output = 100,
+    reasoning = 0,
+    sessionID = "session-1",
+    compaction = false,
+  } = {},
+) {
+  const parts = []
+  if (typeof text === "string") parts.push(textPart(text))
+  if (tool) parts.push({ type: "tool", tool: "bash", state: { status: "completed" } })
+  return {
+    info: {
+      id,
+      role: "assistant",
+      sessionID,
+      tokens: { input: 1, output, reasoning },
+      ...(parentID ? { parentID } : {}),
+      ...(compaction ? { summary: true } : {}),
+    },
+    parts,
+  }
+}
+
+// Drive `count` idle events at a session whose message list is rebuilt from
+// `build(turn)` after every continuation the plugin sends.
+async function runIdleTurns(sessionID, options, build, count = 3) {
+  let sourceTurn = 0
+  const { calls, hooks } = await createHooks({
+    messages: async () => ({ data: build(sourceTurn) }),
+    onPromptAsync: () => {
+      sourceTurn += 1
+    },
+    options: { minDelayMs: 1, ...options },
+  })
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID, arguments: "ship it" },
+    { parts: [] },
+  )
+  for (let i = 0; i < count; i += 1) {
+    await hooks.event({
+      event: { type: "session.status", properties: { sessionID, status: { type: "idle" } } },
+    })
+  }
+  return { calls, goal: currentGoal(sessionID) }
+}
+
+test("assistantMessagesForTurn groups every assistant message sharing the latest one's parentID", () => {
+  const previous = turnStep("prev", "parent-0", { text: "older turn" })
+  const stepOne = turnStep("a1", "parent-1", { tool: true })
+  const stepTwo = turnStep("a2", "parent-1", { tool: true })
+  const summary = turnStep("a3", "parent-1", { text: "Here is what I did." })
+  const list = [previous, userMessage("go", "u1"), stepOne, stepTwo, summary]
+
+  assert.deepEqual(
+    assistantMessagesForTurn(list, summary).map((m) => m.info.id),
+    ["a1", "a2", "a3"],
+  )
+  // The control: the OLD single-message reading sees only the text-only tail.
+  assert.equal(messageHasToolCall(summary), false)
+  assert.equal(turnCallsTool(assistantMessagesForTurn(list, summary)), true)
+  // A turn from an earlier prompt is judged on its own parentID, not the tail.
+  assert.deepEqual(
+    assistantMessagesForTurn(list, previous).map((m) => m.info.id),
+    ["prev"],
+  )
+  assert.deepEqual(assistantMessagesForTurn(list, null), [])
+  assert.deepEqual(assistantMessagesForTurn(null, summary).map((m) => m.info.id), ["a3"])
+})
+
+test("assistantMessagesForTurn falls back to the trailing assistant run when no parentID exists", () => {
+  const stale = turnStep("old", "", { text: "previous turn" })
+  const stepOne = turnStep("b1", "", { tool: true })
+  const summary = turnStep("b2", "", { text: "Done." })
+  const list = [stale, userMessage("go", "u1"), stepOne, summary]
+
+  assert.deepEqual(
+    assistantMessagesForTurn(list, summary).map((m) => m.info.id),
+    ["b1", "b2"],
+    "the run stops at the user message, so the previous turn is not absorbed",
+  )
+  assert.equal(turnCallsTool(assistantMessagesForTurn(list, summary)), true)
+})
+
+test("assistantMessagesForTurn ignores compaction assistants inside the turn", () => {
+  const compacted = turnStep("c1", "parent-1", { tool: true, compaction: true })
+  const summary = turnStep("c2", "parent-1", { text: "Carrying on." })
+  const grouped = assistantMessagesForTurn([compacted, summary], summary)
+  assert.deepEqual(grouped.map((m) => m.info.id), ["c2"])
+  assert.equal(turnCallsTool(grouped), false, "a compaction message's parts are never the turn's work")
+
+  // Same exclusion on the parentID-less fallback path.
+  const compactedNoParent = turnStep("d1", "", { tool: true, compaction: true })
+  const summaryNoParent = turnStep("d2", "", { text: "Carrying on." })
+  assert.deepEqual(
+    assistantMessagesForTurn(
+      [userMessage("go", "u1"), compactedNoParent, summaryNoParent],
+      summaryNoParent,
+    ).map((m) => m.info.id),
+    ["d2"],
+  )
+})
+
+test("turn aggregates sum output and reasoning tokens across every step of the turn", () => {
+  const turn = [
+    turnStep("t1", "parent-1", { tool: true, output: 30, reasoning: 7 }),
+    turnStep("t2", "parent-1", { tool: true, output: 30, reasoning: 5 }),
+    turnStep("t3", "parent-1", { text: "Summary.", output: 20, reasoning: 0 }),
+  ]
+  assert.equal(sumTurnOutputTokens(turn), 80)
+  assert.equal(sumTurnReasoningTokens(turn), 12)
+  // The control: reading only the tail gives 20, which is BELOW the default
+  // noProgressTokenThreshold of 50 while the real turn total (80) is above it.
+  assert.equal(outputTokensForMessage(turn[2]), 20)
+  assert.ok(outputTokensForMessage(turn[2]) < normalizeOptions().noProgressTokenThreshold)
+  assert.ok(sumTurnOutputTokens(turn) >= normalizeOptions().noProgressTokenThreshold)
+  assert.equal(sumTurnOutputTokens([]), 0)
+  assert.equal(sumTurnReasoningTokens(null), 0)
+})
+
+test("a turn of three assistant messages whose last one is text-only does not charge the no-tool-call gate", async () => {
+  const { calls, goal } = await runIdleTurns(
+    "turn-tools-then-summary",
+    { noToolCallTurnsBeforePause: 2 },
+    (turn) => [
+      turnStep(`s1-${turn}`, `p-${turn}`, { tool: true, sessionID: "turn-tools-then-summary" }),
+      turnStep(`s2-${turn}`, `p-${turn}`, { tool: true, sessionID: "turn-tools-then-summary" }),
+      turnStep(`s3-${turn}`, `p-${turn}`, {
+        text: `Wrapped up step ${turn}.`,
+        sessionID: "turn-tools-then-summary",
+      }),
+    ],
+  )
+  // Under the old single-message reading this paused after the third idle.
+  assert.equal(calls.length, 3)
+  assert.equal(goal.stopped, false)
+  assert.equal(goal.noToolCallTurns, 0, "a tool anywhere in the turn resets the counter")
+})
+
+test("a turn whose only assistant message is text-only still charges the no-tool-call gate", async () => {
+  const { calls, goal } = await runIdleTurns(
+    "turn-prose-only-single",
+    { noToolCallTurnsBeforePause: 10 },
+    (turn) => [
+      turnStep(`only-${turn}`, `p-${turn}`, {
+        text: `Thinking out loud ${turn}.`,
+        sessionID: "turn-prose-only-single",
+      }),
+    ],
+  )
+  assert.equal(calls.length, 3)
+  assert.equal(goal.stopped, false)
+  // The first idle runs at turnCount 0 and is never charged; the two
+  // continuation turns after it are.
+  assert.equal(goal.noToolCallTurns, 2)
+})
+
+test("consecutive multi-message prose-only turns still pause with stopReason 'no tool calls'", async () => {
+  const { calls, goal } = await runIdleTurns(
+    "turn-prose-only-multi",
+    { noToolCallTurnsBeforePause: 2 },
+    (turn) => [
+      turnStep(`m1-${turn}`, `p-${turn}`, {
+        text: `Planning ${turn}.`,
+        sessionID: "turn-prose-only-multi",
+      }),
+      turnStep(`m2-${turn}`, `p-${turn}`, {
+        text: `Still planning ${turn}.`,
+        sessionID: "turn-prose-only-multi",
+      }),
+    ],
+  )
+  assert.equal(calls.length, 2)
+  assert.equal(goal.stopped, true)
+  assert.equal(goal.stopReason, "no tool calls")
+  assert.equal(goal.noToolCallTurns, 2)
+  assert.match(goal.lastStatus, /2 continuation turn\(s\) with no tool calls/)
+})
+
+test("the no-tool-call gate reads the whole trailing assistant run when the host sends no parentID", async () => {
+  const { calls, goal } = await runIdleTurns(
+    "turn-no-parent-id",
+    { noToolCallTurnsBeforePause: 2 },
+    (turn) => [
+      userMessage("go", `u-${turn}`),
+      turnStep(`n1-${turn}`, "", { tool: true, sessionID: "turn-no-parent-id" }),
+      turnStep(`n2-${turn}`, "", {
+        text: `Summary ${turn}.`,
+        sessionID: "turn-no-parent-id",
+      }),
+    ],
+  )
+  assert.equal(calls.length, 3)
+  assert.equal(goal.stopped, false)
+  assert.equal(goal.noToolCallTurns, 0)
+})
+
+test("the no-progress gate sums output tokens across the turn instead of reading the tail", async () => {
+  // 30 + 30 + 20 = 80 output tokens against a threshold of 50. The tail alone
+  // is 20, which the old single-message reading scored as a stalled turn — and
+  // the text never changes, so nothing else would have cleared the gate.
+  const { calls, goal } = await runIdleTurns(
+    "turn-output-sum",
+    {
+      noToolCallTurnsBeforePause: 0,
+      noProgressTurnsBeforePause: 2,
+      noProgressTokenThreshold: 50,
+    },
+    (turn) => [
+      turnStep(`o1-${turn}`, `p-${turn}`, {
+        text: "Same prose every turn.",
+        output: 30,
+        sessionID: "turn-output-sum",
+      }),
+      turnStep(`o2-${turn}`, `p-${turn}`, {
+        text: "Same prose every turn.",
+        output: 30,
+        sessionID: "turn-output-sum",
+      }),
+      turnStep(`o3-${turn}`, `p-${turn}`, {
+        text: "Same prose every turn.",
+        output: 20,
+        sessionID: "turn-output-sum",
+      }),
+    ],
+  )
+  assert.equal(calls.length, 3)
+  assert.equal(goal.stopped, false)
+  assert.equal(goal.noProgressTurns, 0)
+})
+
+test("a multi-message pure-thinking turn is still not a stall", async () => {
+  // The reasoning tokens are spent on the FIRST message of the turn and the
+  // tail carries none, which is what the single-message reading missed: it saw
+  // 0 output, 0 reasoning and no text, and charged the no-progress gate.
+  const { calls, goal } = await runIdleTurns(
+    "turn-thinking-multi",
+    {
+      noToolCallTurnsBeforePause: 0,
+      noProgressTurnsBeforePause: 2,
+      noProgressTokenThreshold: 50,
+    },
+    (turn) => [
+      turnStep(`k1-${turn}`, `p-${turn}`, {
+        text: null,
+        output: 0,
+        reasoning: 900,
+        sessionID: "turn-thinking-multi",
+      }),
+      turnStep(`k2-${turn}`, `p-${turn}`, {
+        text: null,
+        output: 0,
+        reasoning: 0,
+        sessionID: "turn-thinking-multi",
+      }),
+    ],
+  )
+  assert.equal(calls.length, 3)
+  assert.equal(goal.stopped, false)
+  assert.equal(goal.noProgressTurns, 0)
+})
+
+test("a re-delivered idle for the same multi-message turn charges the gate only once", async () => {
+  let prompts = 0
+  // The message list only advances for the FIRST continuation, so idles three
+  // and four observe exactly the same finished turn the second idle scored.
+  const frozen = () => Math.min(prompts, 1)
+  const { calls, hooks } = await createHooks({
+    messages: async () => ({
+      data: [
+        turnStep(`dd1-${frozen()}`, `dd-p-${frozen()}`, {
+          text: `Prose head ${frozen()}.`,
+          sessionID: "turn-idle-dedupe",
+        }),
+        turnStep(`dd2-${frozen()}`, `dd-p-${frozen()}`, {
+          text: `Prose tail ${frozen()}.`,
+          sessionID: "turn-idle-dedupe",
+        }),
+      ],
+    }),
+    onPromptAsync: () => {
+      prompts += 1
+    },
+    options: { minDelayMs: 1, noToolCallTurnsBeforePause: 10 },
+  })
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "turn-idle-dedupe", arguments: "ship it" },
+    { parts: [] },
+  )
+  for (let i = 0; i < 4; i += 1) {
+    await hooks.event({
+      event: {
+        type: "session.status",
+        properties: { sessionID: "turn-idle-dedupe", status: { type: "idle" } },
+      },
+    })
+  }
+  assert.equal(calls.length, 2, "the repeated idles must not send another continuation")
+  assert.equal(currentGoal("turn-idle-dedupe").noToolCallTurns, 1)
+})
+
+test("the shipped no-tool-call grace window is 10 turns and the visibility window is 200 messages", () => {
+  const defaults = normalizeOptions()
+  assert.equal(defaults.noToolCallTurnsBeforePause, 10)
+  assert.equal(defaults.noProgressTurnsBeforePause, 2)
+  assert.equal(defaults.maxRecentMessages, 200)
 })
 
 test("short assistant updates that change content do not immediately count as stalled", async () => {
