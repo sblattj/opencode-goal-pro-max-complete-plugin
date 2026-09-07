@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## 0.9.1 — 2026-09-06
+
+- Bundle dependencies into `dist/goal-plugin.js` via Bun so the plugin is self-contained and loads reliably in OpenCode without missing external runtime dependencies (such as `zod`).
+- Point `package.json` entrypoints (`main`, `exports`) to the bundled distribution.
 
 ## 0.9.0 — 2026-08-29
 
