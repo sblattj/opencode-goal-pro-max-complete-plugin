@@ -35,7 +35,12 @@ export interface GoalPanelModel {
   icon: string
   objective: string
   /**
-   * Budget summaries, e.g. `["3/∞ turns", "2m/8h", "147k/100m tokens"]`.
+   * Budget summaries, e.g.
+   * `["3/∞ turns", "2m/8h", "147k/100m tokens", "45k/200k ctx"]`.
+   * `… tokens` is cumulative token SPEND against the goal's token budget;
+   * `… ctx` is the peak context size against `contextWindowTokens`. The `ctx`
+   * stat is present only when the payload carries a `context` budget (v2 and
+   * later); a v1 payload renders the first three.
    * An unlimited turn budget (`turns.max === null`, `turns.max === 0`, or
    * `turns.unlimited`) renders its ceiling as `∞`. Durations render from the
    * v2 `durationMs` field when present and fall back to v1 `minutes`: under a

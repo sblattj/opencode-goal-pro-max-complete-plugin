@@ -132,6 +132,31 @@ test("a running goal reduces to its header, budgets, and nothing it was not give
   assert.deepEqual(model.notes, [])
 })
 
+test("the panel shows spend and peak context as separate stats, and survives a payload with neither", () => {
+  // `tokens` is cumulative SPEND against the token budget; `context` is the
+  // peak context against the model's window. Two quantities, two ceilings.
+  const model = goalPanelModel(
+    payload({
+      tokens: { used: 2_400_000, max: 100_000_000 },
+      context: { used: 147_000, max: 200_000 },
+    }),
+  )
+  assert.deepEqual(model.stats, ["3/10 turns", "2m/30m", "2.4m/100m tokens", "147k/200k ctx"])
+
+  // A payload written before `context` existed (any 0.10.x server half) simply
+  // renders the three stats it does carry, rather than an empty or `0/0` one.
+  assert.deepEqual(goalPanelModel(payload()).stats, ["3/10 turns", "2m/30m", "45k/200k tokens"])
+  // ...and an absent ceiling drops the ctx stat the same way every other budget
+  // is dropped.
+  for (const context of [{ used: 10, max: null }, { used: 10, max: 0 }, { used: 10 }, "nope"]) {
+    assert.deepEqual(
+      goalPanelModel(payload({ context })).stats,
+      ["3/10 turns", "2m/30m", "45k/200k tokens"],
+      `context ${JSON.stringify(context)} must not render a ceiling-less stat`,
+    )
+  }
+})
+
 test("each state carries its own icon and an unknown one degrades to active", () => {
   assert.equal(goalPanelModel(payload({ state: "paused" })).icon, "⏸")
   assert.equal(goalPanelModel(payload({ state: "blocked" })).icon, "⛔")

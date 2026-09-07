@@ -126,6 +126,7 @@ function goalPanelModel(raw) {
   const durationMs = budget(raw.durationMs);
   const minutes = budget(raw.minutes);
   const tokens = budget(raw.tokens);
+  const context = budget(raw.context);
   const stats = [];
   if (turns)
     stats.push(`${formatTurnBudget(turns.used, turns.max)} turns`);
@@ -136,6 +137,8 @@ function goalPanelModel(raw) {
   }
   if (tokens)
     stats.push(`${formatPanelTokens(tokens.used)}/${formatPanelTokens(tokens.max)} tokens`);
+  if (context)
+    stats.push(`${formatPanelTokens(context.used)}/${formatPanelTokens(context.max)} ctx`);
   const sequence = isRecord(raw.sequence) && wholeNumber(raw.sequence.total) > 0 ? `step ${wholeNumber(raw.sequence.position)}/${wholeNumber(raw.sequence.total)}` : "";
   const plan = isRecord(raw.plan) ? raw.plan : {};
   const planTotal = wholeNumber(plan.total);
