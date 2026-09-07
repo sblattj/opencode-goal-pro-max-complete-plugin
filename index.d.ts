@@ -650,9 +650,14 @@ export function GoalPlugin(
 export const testInternals: Readonly<Record<string, unknown>>
 
 /**
- * Default export consumed by OpenCode's plugin loader:
- * `{ "opencode-goal-pro-max-complete-plugin": { ... } }` in `opencode.json` resolves `id`
- * and calls `server` to obtain the plugin's hooks.
+ * Default export consumed by OpenCode's plugin loader. An install spec names the
+ * PACKAGE (`opencode-goal-pro-max-complete-plugin@<source>` in `opencode.json`);
+ * OpenCode resolves that package's entrypoint and calls `server` to obtain the
+ * plugin's hooks. `id` below is the plugin's WIRE identifier and is deliberately
+ * held at the historical `"opencode-goal-plugin"` so a session, its persisted
+ * state and its part metadata survive the package rename — see the "Identifier
+ * policy" section of `README.md` and the "WIRE IDENTIFIER, NOT THE PACKAGE NAME"
+ * comment in `src/goal-plugin.js`.
  */
 declare const goalPlugin: {
   id: "opencode-goal-plugin"

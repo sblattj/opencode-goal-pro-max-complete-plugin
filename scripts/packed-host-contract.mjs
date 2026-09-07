@@ -7,7 +7,13 @@ import { join } from "node:path"
 import { pathToFileURL } from "node:url"
 
 const repository = new URL("..", import.meta.url)
-const root = await mkdtemp(join(tmpdir(), "opencode-goal-pro-max-complete-plugin-packed-host-"))
+// The published package name comes from the manifest, never a literal: a
+// rename that missed this line would leave the contract probing a name
+// nothing publishes, and the failure would look like a broken host.
+const { name: packageName } = JSON.parse(
+  await readFile(new URL("package.json", repository), "utf8"),
+)
+const root = await mkdtemp(join(tmpdir(), `${packageName}-packed-host-`))
 const packDirectory = join(root, "pack")
 const projectDirectory = join(root, "host-project")
 const cacheDirectory = join(root, "npm-cache")
@@ -81,19 +87,9 @@ try {
     { cwd: projectDirectory, encoding: "utf8", env: npmEnvironment },
   )
 
-  const installedManifestPath = join(
-    projectDirectory,
-    "node_modules",
-    "opencode-goal-pro-max-complete-plugin",
-    "package.json",
-  )
+  const installedManifestPath = join(projectDirectory, "node_modules", packageName, "package.json")
   const installedManifest = JSON.parse(await readFile(installedManifestPath, "utf8"))
-  const installedEntry = join(
-    projectDirectory,
-    "node_modules",
-    "opencode-goal-pro-max-complete-plugin",
-    installedManifest.main,
-  )
+  const installedEntry = join(projectDirectory, "node_modules", packageName, installedManifest.main)
   const installed = await import(pathToFileURL(installedEntry).href)
 
   assert.equal(installed.default.id, "opencode-goal-plugin")

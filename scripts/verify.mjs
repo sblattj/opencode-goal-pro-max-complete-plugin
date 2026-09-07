@@ -5,6 +5,14 @@
 // as scripts/smoke-command-hook.mjs.
 
 import assert from "node:assert/strict"
+import { readFile } from "node:fs/promises"
+
+// The package name is read from the manifest beside this script — the
+// installed package's own — so a rename cannot leave the verifier importing
+// a name that nothing publishes.
+const { name: packageName } = JSON.parse(
+  await readFile(new URL("../package.json", import.meta.url), "utf8"),
+)
 
 const REQUIRED_HOOKS = [
   "config",
@@ -51,7 +59,7 @@ function check(name, fn) {
     })
 }
 
-console.log("opencode-goal-pro-max-complete-plugin installation verification\n")
+console.log(`${packageName} installation verification\n`)
 
 await check("Node.js >= 18", () => {
   const major = Number(process.versions.node.split(".")[0])
@@ -62,7 +70,7 @@ let pluginModule
 let GoalPlugin
 
 await check("plugin module resolves and exposes expected shape", async () => {
-  pluginModule = await import("opencode-goal-pro-max-complete-plugin")
+  pluginModule = await import(packageName)
   GoalPlugin = pluginModule.GoalPlugin
   assert.equal(pluginModule.default.id, "opencode-goal-plugin")
   assert.equal(typeof pluginModule.default.server, "function")
@@ -175,4 +183,4 @@ if (failed.length > 0) {
   process.exit(1)
 }
 
-console.log(`All ${results.length} checks passed. opencode-goal-pro-max-complete-plugin is installed correctly.`)
+console.log(`All ${results.length} checks passed. ${packageName} is installed correctly.`)
