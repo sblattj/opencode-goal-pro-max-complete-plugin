@@ -1,0 +1,3 @@
+{
+  "plugin": ["opencode-goal-plugin@github:sblattj/OpenCode-goal-plugin#v0.10.1"]
+}

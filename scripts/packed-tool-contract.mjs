@@ -47,8 +47,9 @@ try {
   ])
   await writeFile(join(projectDirectory, "package.json"), JSON.stringify({ private: true, type: "module" }))
 
-  // `npm pack --json` prints the prepack lifecycle's own stdout (the bundler's
-  // build log) before its JSON array, so the payload starts at the first `[`.
+  // `npm pack --json` can print lifecycle or notice output ahead of its JSON
+  // array (it did, until the `prepack` build was removed in 0.10.1 to keep the
+  // package installable from a git spec), so the payload starts at the first `[`.
   const packOutput = execNpm(
     ["pack", "--json", "--pack-destination", packDirectory],
     { cwd: repository, encoding: "utf8", env: npmEnvironment },
