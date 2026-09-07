@@ -41,11 +41,79 @@ export interface GoalUsage {
   costKnown: boolean
 }
 
+/** Lifecycle state of a single action in a goal's verified action plan. */
+export type GoalPlanActionStatus = "pending" | "in_progress" | "done" | "blocked"
+
+/** Verdict recorded against an action's evidence. */
+export type GoalPlanVerdict = "pass" | "fail"
+
+/**
+ * One action in the goal's plan, carrying its own Claim → Evidence → Verdict
+ * ledger. An action only counts as verified when `status` is `"done"`, `claim`
+ * and `evidence` are both non-empty, and `verdict` is `"pass"`.
+ */
+export interface GoalPlanAction {
+  /** Stable identifier used by `goal_action_update`. Unique within the plan. */
+  id: string
+  title: string
+  status: GoalPlanActionStatus
+  /** What the work asserts is true. Doubles as the reason when `status` is `"blocked"`. */
+  claim: string
+  /** The observation that could have falsified the claim (command output, file content, HTTP response). */
+  evidence: string
+  verdict: GoalPlanVerdict | null
+}
+
+/** The ordered action plan stored alongside the goal in the plugin's JSON state. */
+export interface GoalPlan {
+  actions: GoalPlanAction[]
+  /** Epoch milliseconds of the last plan mutation; `0` when never written. */
+  updatedAt: number
+}
+
+/**
+ * Structured goal status written to the OpenCode session's `metadata.goal` by
+ * `PATCH /session/{id}`, so the sidebar carries more than the title string can.
+ * See {@link GoalPluginOptions.sidebarStatus}.
+ */
+export interface GoalSidebarStatus {
+  /** Schema version of this payload. */
+  v: 1
+  goalId: string
+  /**
+   * `completed` is the terminal state of an archived goal. A failure surfaces as
+   * `blocked` (with `blockedReason`) or `paused` (with `stopReason`) rather than
+   * as a distinct state, because a failed goal stays resumable.
+   */
+  state: "active" | "paused" | "blocked" | "completed"
+  /** Short label derived from the objective's first line (or `--objective`). */
+  objective: string
+  turns: { used: number; max: number }
+  minutes: { used: number; max: number }
+  tokens: { used: number; max: number }
+  plan: {
+    total: number
+    verified: number
+    blocked: number
+    actions: Array<Pick<GoalPlanAction, "id" | "title" | "status" | "verdict">>
+  }
+  successCriteria?: string
+  constraints?: string
+  /** Present only for an ordered `/goal sequence` run. */
+  sequence?: { ordered: true; position: number; total: number }
+  stopReason?: string
+  blockedReason?: string
+  updatedAt: number
+}
+
 /** Read-only goal snapshot passed to custom completion auditors. */
 export interface GoalAuditSnapshot {
   goalId: string
   runId: string
+  /** The full objective text, including any multi-line handoff body. */
   condition: string
+  /** Short label derived from the objective's first line (or `--objective`). */
+  objectiveLabel: string
   successCriteria: string
   constraints: string
   mode: "normal" | "ordered"
@@ -63,6 +131,8 @@ export interface GoalAuditSnapshot {
   history: readonly Readonly<GoalHistoryEntry>[]
   checkpoints: readonly Readonly<GoalCheckpoint>[]
   lastCheckpoint: Readonly<GoalCheckpoint> | null
+  /** The verified action plan; `actions` is empty until `goal_plan_set` runs. */
+  plan: Readonly<GoalPlan>
 }
 
 /** Arguments passed to a custom {@link GoalPluginOptions.auditor} function. */
@@ -299,7 +369,8 @@ export interface GoalPluginOptions {
   /**
    * Whether the plugin registers the agent-facing goal tools
    * (canonical `goal_status`, `goal_set`, `goal_pause`, `goal_resume`,
-   * `goal_block`, `goal_complete`, plus legacy `get_goal`,
+   * `goal_block`, `goal_complete`, the plan tools `goal_plan_get`,
+   * `goal_plan_set`, `goal_action_update`, plus legacy `get_goal`,
    * `get_goal_history`, `set_goal`, `update_goal`, `clear_goal`).
    * Canonical tools return versioned JSON envelopes. The tools are registered
    * by default from dependencies included with this package; set this to
@@ -312,14 +383,26 @@ export interface GoalPluginOptions {
   registerAgents?: boolean
 
   /**
-   * Mirror live goal status into the OpenCode session title, which the TUI
-   * renders persistently (e.g. `▶ ship the release · 3/10 · 2m · 45k/200k`),
-   * giving unattended runs a continuous heartbeat without a TUI plugin.
+   * Mirror live goal status into the OpenCode sidebar. The plugin writes the
+   * session title, which the TUI's sidebar renders
+   * (e.g. `▶ ship the release · 3/10 · 2m · 45k/200k · 3/7✓`), plus a
+   * structured {@link GoalSidebarStatus} payload under the session's
+   * `metadata.goal`. Both go through `PATCH /session/{id}`.
    *
    * The session's original title is captured before the first overwrite and
-   * restored by `/goal clear`. Title updates are cosmetic: a failure is logged
-   * at debug level and never interrupts the goal loop.
-   * @default false
+   * restored by `/goal clear`, which also clears `metadata.goal`. Sidebar
+   * updates are cosmetic and idempotent: an unchanged render costs no request,
+   * and a failure is logged at debug level without interrupting the goal loop.
+   * Set `false`, or set `OPENCODE_GOAL_SIDEBAR=0` in the environment, to
+   * disable.
+   * @default true
+   */
+  sidebarStatus?: boolean
+
+  /**
+   * Pre-0.10.0 spelling of {@link sidebarStatus}. Still honored when
+   * `sidebarStatus` is unset.
+   * @deprecated Use {@link sidebarStatus}.
    */
   sessionTitleStatus?: boolean
 
