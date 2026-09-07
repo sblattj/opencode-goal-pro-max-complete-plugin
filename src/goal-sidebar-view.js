@@ -46,7 +46,11 @@
 // This file holds everything except the two runtime imports, so the panel can
 // be unit-tested without a terminal: the module that OpenCode actually loads
 // (`src/goal-tui.js`) is a six-line adapter that hands the real `solid-js` and
-// `@opentui/solid/jsx-runtime` to `createGoalSidebar`. Those specifiers are
+// `@opentui/solid/jsx-runtime` to `createGoalSidebar`. Its only import is the
+// relative `./goal-format.js`, which carries the budget strings the server
+// half renders too; a relative import is inlined by the bundler even under
+// `--packages external`, so it stays a pure, terminal-free module. Those
+// specifiers are
 // provided to plugins by the host at runtime — `@opentui/solid`'s
 // `ensureRuntimePluginSupport` (called at tui/runtime.ts:47) registers
 // `solid-js`, `solid-js/store`, `@opentui/solid`, `@opentui/solid/components`,
@@ -54,6 +58,8 @@
 // modules — so they must NOT be bundled: a second copy of Solid would have its
 // own reactive graph and never update.
 // ---------------------------------------------------------------------------
+
+import { formatBudgetMinutes, formatTurnBudget } from "./goal-format.js"
 
 export const GOAL_PANEL_TITLE = "Goal"
 
@@ -104,6 +110,18 @@ function budget(raw) {
   return { used: wholeNumber(raw.used), max }
 }
 
+// The turn budget is the one budget that has a legitimate "no ceiling" state,
+// carried as `{ used, max: null, unlimited: true }`. It must survive the
+// no-ceiling drop above and render `used/∞` instead of disappearing.
+function turnsBudget(raw) {
+  if (!isRecord(raw)) return null
+  const used = wholeNumber(raw.used)
+  if (raw.unlimited === true || raw.max === null) return { used, max: null, unlimited: true }
+  const max = wholeNumber(raw.max)
+  if (!max) return null
+  return { used, max, unlimited: false }
+}
+
 // Matches the abbreviation the session title uses, so the panel and the title
 // never disagree about the same number.
 export function formatPanelTokens(value) {
@@ -149,13 +167,13 @@ export function goalPanelModel(raw) {
   if (!objective) return null
 
   const state = STATE_ICONS[raw.state] ? raw.state : "active"
-  const turns = budget(raw.turns)
+  const turns = turnsBudget(raw.turns)
   const minutes = budget(raw.minutes)
   const tokens = budget(raw.tokens)
 
   const stats = []
-  if (turns) stats.push(`${turns.used}/${turns.max} turns`)
-  if (minutes) stats.push(`${minutes.used}/${minutes.max}m`)
+  if (turns) stats.push(`${formatTurnBudget(turns.used, turns.max)} turns`)
+  if (minutes) stats.push(`${formatBudgetMinutes(minutes.used)}/${formatBudgetMinutes(minutes.max)}`)
   if (tokens) stats.push(`${formatPanelTokens(tokens.used)}/${formatPanelTokens(tokens.max)} tokens`)
 
   const sequence =

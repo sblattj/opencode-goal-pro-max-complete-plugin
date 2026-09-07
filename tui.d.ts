@@ -34,7 +34,12 @@ export interface GoalPanelModel {
   /** Status glyph for {@link state}: `▶`, `⏸`, `⛔`, or `✓`. */
   icon: string
   objective: string
-  /** Budget summaries, e.g. `["3/10 turns", "2/30m", "45k/200k tokens"]`. */
+  /**
+   * Budget summaries, e.g. `["3/∞ turns", "2m/8h", "147k/100m tokens"]`.
+   * An unlimited turn budget (`turns.max === null`, or `turns.unlimited`)
+   * renders its ceiling as `∞`; a duration of an hour or more renders in
+   * hours with one decimal and no trailing `.0`.
+   */
   stats: string[]
   /** `step 2/4` for an ordered `/goal sequence`, otherwise empty. */
   sequence: string

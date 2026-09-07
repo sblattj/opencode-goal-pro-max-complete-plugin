@@ -38,8 +38,14 @@ const {
   isPluginContinuationMessage,
   isPlanAgent,
   buildSessionTitle,
-  formatCompactDuration,
   formatCompactTokens,
+  formatBudgetDuration,
+  formatBudgetMinutes,
+  formatTurnBudget,
+  formatTurnLimit,
+  isUnlimitedTurnBudget,
+  describeTurnLimit,
+  parseTurnBudget,
   goalStatusIcon,
   looksLikePluginSessionTitle,
   isRestrictedAgent,
@@ -6765,7 +6771,8 @@ test("stopReason returns correct string for each limit type", () => {
 test("normalizeOptions falls back to defaults for zero, negative, and non-numeric values", () => {
   const defaults = normalizeOptions()
   const result = normalizeOptions({
-    maxTurns: 0,
+    // NOT maxTurns: 0 — that is the unlimited value, covered by its own test.
+    maxTurns: -3,
     maxDurationMs: -5,
     maxTokens: "banana",
     minDelayMs: NaN,
@@ -9724,10 +9731,11 @@ test("set_goal rejects non-positive budget arguments and unrecognized modes", as
   })
   const sid = "budget-validation-s1"
 
-  // Non-positive maxTurns.
-  assert.match(await handlers.setGoal(sid, { objective: "x", maxTurns: 0 }), /Invalid maxTurns/)
-  assert.equal(currentGoal(sid), null)
+  // Negative maxTurns. (0 is the explicit unlimited value and is accepted;
+  // see "set_goal accepts maxTurns 0 as unlimited".)
   assert.match(await handlers.setGoal(sid, { objective: "x", maxTurns: -5 }), /Invalid maxTurns/)
+  assert.equal(currentGoal(sid), null)
+  assert.match(await handlers.setGoal(sid, { objective: "x", maxTurns: 1.5 }), /Invalid maxTurns/)
 
   // Non-positive maxTokens.
   assert.match(await handlers.setGoal(sid, { objective: "x", maxTokens: 0 }), /Invalid maxTokens/)
@@ -10297,17 +10305,10 @@ async function createTitleHooks(overrides = {}) {
   return { hooks, updates }
 }
 
-test("formatCompactDuration and formatCompactTokens abbreviate for a narrow title", () => {
-  assert.equal(formatCompactDuration(0), "0s")
-  assert.equal(formatCompactDuration(45_000), "45s")
-  assert.equal(formatCompactDuration(60_000), "1m")
-  // Elapsed time floors rather than rounds: 90s is "1m so far", not "2m".
-  assert.equal(formatCompactDuration(90_000), "1m")
-  assert.equal(formatCompactDuration(60 * 60_000), "1h")
-  assert.equal(formatCompactDuration(95 * 60_000), "1h35m")
-  // Clock skew must not render as garbage.
-  assert.equal(formatCompactDuration(-5000), "0s")
-
+test("formatCompactTokens abbreviates for a narrow title", () => {
+  // Durations are no longer formatted here: both halves of the plugin render
+  // them through the shared formatter in src/goal-format.js, asserted by
+  // "the shared budget formatters round to one decimal and drop a trailing .0".
   assert.equal(formatCompactTokens(0), "0")
   assert.equal(formatCompactTokens(999), "999")
   assert.equal(formatCompactTokens(1500), "1.5k")
@@ -10332,14 +10333,25 @@ test("buildSessionTitle renders a compact one-line status", () => {
     totalTokens: 45_000,
     startedAt: now - 120_000,
     pausedAt: 0,
-    options: { maxTurns: 10, maxTokens: 200_000 },
+    options: { maxTurns: 10, maxTokens: 200_000, maxDurationMs: 30 * 60_000 },
   }
-  assert.equal(buildSessionTitle(goal, now), "▶ ship the release · 3/10 · 2m · 45k/200k")
+  assert.equal(buildSessionTitle(goal, now), "▶ ship the release · 3/10 · 2m/30m · 45k/200k")
 
   // A paused goal freezes its elapsed clock instead of running on.
   assert.equal(
     buildSessionTitle({ ...goal, stopped: true, pausedAt: now - 60_000 }, now),
-    "⏸ ship the release · 3/10 · 1m · 45k/200k",
+    "⏸ ship the release · 3/10 · 1m/30m · 45k/200k",
+  )
+
+  // The shipped defaults: unlimited turns and an 8-hour window.
+  assert.equal(
+    buildSessionTitle({ ...goal, options: normalizeOptions() }, now),
+    "▶ ship the release · 3/∞ · 2m/8h · 45k/100m",
+  )
+  // 90 minutes in, the elapsed clock crosses into hours on its own.
+  assert.equal(
+    buildSessionTitle({ ...goal, startedAt: now - 90 * 60_000, options: normalizeOptions() }, now),
+    "▶ ship the release · 3/∞ · 1.5h/8h · 45k/100m",
   )
 
   const title = buildSessionTitle({ ...goal, condition: "x".repeat(200) }, now)
@@ -10348,9 +10360,9 @@ test("buildSessionTitle renders a compact one-line status", () => {
 })
 
 test("looksLikePluginSessionTitle recognizes titles this plugin wrote", () => {
-  assert.equal(looksLikePluginSessionTitle("▶ ship it · 3/10 · 2m · 45k/200k"), true)
-  assert.equal(looksLikePluginSessionTitle("⏸ ship it · 3/10 · 2m · 45k/200k"), true)
-  assert.equal(looksLikePluginSessionTitle("⛔ ship it · 3/10 · 2m · 45k/200k"), true)
+  assert.equal(looksLikePluginSessionTitle("▶ ship it · 3/∞ · 2m/8h · 45k/100m"), true)
+  assert.equal(looksLikePluginSessionTitle("⏸ ship it · 3/∞ · 2m/8h · 45k/100m"), true)
+  assert.equal(looksLikePluginSessionTitle("⛔ ship it · 3/10 · 2m/30m · 45k/200k"), true)
   assert.equal(looksLikePluginSessionTitle("my own session title"), false)
   assert.equal(looksLikePluginSessionTitle(""), false)
   assert.equal(looksLikePluginSessionTitle(undefined), false)
@@ -10422,7 +10434,7 @@ test("sessionTitleStatus mirrors goal state into the title and restores it on cl
     { parts: [] },
   )
   assert.ok(updates.length >= 1, "setting a goal must publish a title")
-  assert.match(updates[0].body.title, /^▶ ship it · 0\/\d+ · /)
+  assert.match(updates[0].body.title, /^▶ ship it · 0\/∞ · 0m\/8h · /)
 
   await hooks["command.execute.before"](
     { command: "goal", sessionID: "session-1", arguments: "pause" },
@@ -10508,13 +10520,14 @@ test("the sidebar payload carries state, budgets, plan progress, and criteria", 
   )
 
   const latest = updates.at(-1).body
-  assert.match(latest.title, /^▶ Ship v0\.10\.0 · 0\/10 · \d+s · 0\/200k · 1\/3✓$/)
+  assert.match(latest.title, /^▶ Ship v0\.10\.0 · 0\/10 · 0m\/30m · 0\/200k · 1\/3✓$/)
 
   const status = latest.metadata.goal
   assert.equal(status.v, 1)
   assert.equal(status.state, "active")
   assert.equal(status.objective, "Ship v0.10.0")
   assert.deepEqual(status.turns, { used: 0, max: 10 })
+  assert.equal(status.turns.unlimited, undefined, "a bounded turn budget carries no unlimited flag")
   assert.deepEqual(status.minutes, { used: 0, max: 30 })
   assert.deepEqual(status.tokens, { used: 0, max: 200000 })
   assert.equal(status.successCriteria, "tests green")
@@ -10669,7 +10682,10 @@ test("a finished goal shows a terminal status instead of a stale running one", a
   assert.match(finished.title, /^✓ ship it/)
   assert.equal(finished.metadata.goal.state, "completed")
   assert.equal(finished.metadata.goal.blockedReason, undefined)
-  assert.equal(finished.metadata.goal.turns.max, 10)
+  // The shipped default is unlimited turns, which the payload spells as a null
+  // ceiling plus an explicit flag — never Infinity, which JSON cannot carry.
+  assert.equal(finished.metadata.goal.turns.max, null)
+  assert.equal(finished.metadata.goal.turns.unlimited, true)
 
   // The terminal render is itself idempotent: an idle after the goal is gone
   // must not re-write the same status.
@@ -10926,4 +10942,226 @@ test("a cached execution context is preferred over refetching the session", asyn
   )
   assert.equal(currentGoal("session-1").stopped, false, "the cached build context must win")
   assert.equal(getCalls, 0, "a known agent must not cost a session fetch")
+})
+
+// ---------------------------------------------------------------------------
+// 0.11.0 defaults: unlimited turns, an 8-hour window, a 100m-token budget.
+// ---------------------------------------------------------------------------
+
+test("the shipped defaults are unlimited turns, an 8-hour window, and 100m tokens", () => {
+  const defaults = normalizeOptions()
+  assert.equal(defaults.maxTurns, 0, "0 is the unlimited-turns value")
+  assert.equal(isUnlimitedTurnBudget(defaults.maxTurns), true)
+  assert.equal(defaults.maxDurationMs, 8 * 60 * 60 * 1000)
+  assert.equal(defaults.maxDurationMs, 28_800_000)
+  assert.equal(defaults.maxTokens, 100_000_000)
+  // The rest of the block is untouched by this change.
+  assert.equal(defaults.minDelayMs, 1500)
+  assert.equal(defaults.warnTurnsRemaining, 3)
+  assert.equal(defaults.budgetWrapupRatio, 0.8)
+})
+
+test("--max-turns accepts every spelling of unlimited, and 0 as the plugin option", () => {
+  const bounded = normalizeOptions({ maxTurns: 10 })
+  for (const spelling of ["0", "unlimited", "none", "inf", "infinite", "infinity", "∞", "UNLIMITED", "Inf"]) {
+    const parsed = parseGoalArguments(`fix tests --max-turns ${spelling}`, bounded)
+    assert.deepEqual(parsed.errors, [], `--max-turns ${spelling} must parse cleanly`)
+    assert.equal(parsed.options.maxTurns, 0, `--max-turns ${spelling} must mean unlimited`)
+    assert.equal(parsed.condition, "fix tests", `--max-turns ${spelling} must not leak into the objective`)
+  }
+  // The equals form goes through the same parser.
+  assert.equal(parseGoalArguments("fix tests --max-turns=unlimited", bounded).options.maxTurns, 0)
+
+  // Control: a positive integer still wins, and garbage still errors and
+  // leaves the configured default in place rather than silently unlimiting.
+  assert.equal(parseGoalArguments("fix tests --max-turns 20", bounded).options.maxTurns, 20)
+  const garbage = parseGoalArguments("fix tests --max-turns banana", bounded)
+  assert.deepEqual(garbage.errors, ["Invalid positive integer for --max-turns: banana"])
+  assert.equal(garbage.options.maxTurns, 10)
+  const negative = parseGoalArguments("fix tests --max-turns -4", bounded)
+  assert.equal(negative.options.maxTurns, 10)
+
+  // The plugin option itself: 0 survives normalizeOptions instead of being
+  // read as "missing" and replaced by the default.
+  assert.equal(normalizeOptions({ maxTurns: 0 }).maxTurns, 0)
+  assert.equal(normalizeOptions({ maxTurns: 12 }).maxTurns, 12)
+  assert.equal(normalizeOptions({ maxTurns: -1 }).maxTurns, normalizeOptions().maxTurns)
+  assert.equal(normalizeOptions({ maxTurns: "banana" }).maxTurns, normalizeOptions().maxTurns)
+
+  // And the bare parser, so the accepted spellings are pinned in one place.
+  assert.equal(parseTurnBudget("∞"), 0)
+  assert.equal(parseTurnBudget(" None "), 0)
+  assert.equal(parseTurnBudget("7"), 7)
+  assert.equal(parseTurnBudget("banana"), null)
+  assert.equal(parseTurnBudget("-1"), null)
+  assert.equal(parseTurnBudget("1.5"), null)
+})
+
+test("every /goal path that parses flags accepts an unlimited turn budget", async () => {
+  // The flag parser is shared by `/goal <condition>` and `/goal add`; `/goal
+  // edit` deliberately does NOT parse flags (it takes the remainder verbatim
+  // as the new objective and preserves the existing budgets), so it is
+  // asserted here as a non-consumer rather than left untested.
+  const { hooks } = await createHooks({ options: { maxTurns: 10 } })
+
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "flag-unlimited", arguments: "ship it --max-turns unlimited" },
+    { parts: [] },
+  )
+  assert.equal(currentGoal("flag-unlimited").options.maxTurns, 0)
+  assert.equal(currentGoal("flag-unlimited").condition, "ship it")
+
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "flag-unlimited", arguments: "add another thing --max-turns ∞" },
+    { parts: [] },
+  )
+  assert.equal(currentGoal("flag-unlimited").options.maxTurns, 0)
+  assert.equal(currentGoal("flag-unlimited").condition, "another thing")
+
+  // /goal edit keeps the budget it already had, unlimited included.
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "flag-unlimited", arguments: "edit ship it properly" },
+    { parts: [] },
+  )
+  assert.equal(currentGoal("flag-unlimited").condition, "ship it properly")
+  assert.equal(currentGoal("flag-unlimited").options.maxTurns, 0)
+
+  // Control: the bounded default still reaches a goal set without the flag.
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "flag-bounded", arguments: "ship it" },
+    { parts: [] },
+  )
+  assert.equal(currentGoal("flag-bounded").options.maxTurns, 10)
+})
+
+test("an unlimited turn budget never stops the goal and never warns about turns", () => {
+  const options = normalizeOptions()
+  assert.equal(options.maxTurns, 0)
+  const base = { startedAt: Date.now(), totalTokens: 0, options }
+
+  // The turn brake is simply gone, however many auto-continues have been sent.
+  assert.equal(stopReason({ ...base, turnCount: 0 }), null)
+  assert.equal(stopReason({ ...base, turnCount: 10_000 }), null)
+  // Control: the other two brakes still fire on the same goal shape.
+  assert.match(stopReason({ ...base, turnCount: 10_000, startedAt: Date.now() - 9 * 3600_000 }), /max duration/)
+  assert.match(stopReason({ ...base, turnCount: 10_000, totalTokens: 100_000_000 }), /max context tokens/)
+  // Control: a bounded budget still trips.
+  assert.match(
+    stopReason({ ...base, turnCount: 5, options: normalizeOptions({ maxTurns: 5 }) }),
+    /max turns reached \(5\)/,
+  )
+
+  // No "limits are near" warning about turns, at any turn count.
+  assert.equal(buildLimitWarning({ ...base, turnCount: 10_000 }), "")
+  // Control: the same goal with a bounded budget does warn.
+  assert.match(
+    buildLimitWarning({ ...base, turnCount: 8, options: normalizeOptions({ ...options, maxTurns: 10 }) }),
+    /2 auto-continue turn\(s\) remaining/,
+  )
+
+  // And the continuation prompt says "unlimited" rather than a bogus number.
+  const goal = {
+    condition: "ship it",
+    startedAt: Date.now(),
+    totalTokens: 25,
+    turnCount: 4000,
+    options,
+  }
+  assert.match(buildContinueMessage(goal), /turns_remaining: unlimited/)
+  assert.match(
+    buildContinueMessage({ ...goal, turnCount: 4, options: normalizeOptions({ maxTurns: 10 }) }),
+    /turns_remaining: 6/,
+  )
+})
+
+test("set_goal accepts maxTurns 0 as unlimited and still rejects a negative count", async () => {
+  const handlers = buildAgentToolHandlers({
+    defaultGoalOptions: normalizeOptions({ maxTurns: 10 }),
+    persist: async () => true,
+  })
+  const sid = "set-goal-unlimited"
+  assert.match(await handlers.setGoal(sid, { objective: "go", maxTurns: 0 }), /New active goal/)
+  assert.equal(currentGoal(sid).options.maxTurns, 0)
+  assert.match(await handlers.setGoal(sid, { objective: "go", maxTurns: -1 }), /Invalid maxTurns/)
+})
+
+test("an unlimited turn budget survives the JSON round trip that Infinity cannot", () => {
+  // WHY 0 AND NOT Infinity: the goal record is persisted as JSON, and
+  // JSON.stringify(Infinity) is the literal null. An "unlimited" goal written
+  // as Infinity comes back indistinguishable from a missing field, and
+  // normalizeOptions would hand it the bounded default on reload.
+  assert.equal(JSON.parse(JSON.stringify({ maxTurns: Infinity })).maxTurns, null)
+  assert.equal(normalizeOptions({ maxTurns: null }).maxTurns, normalizeOptions().maxTurns)
+
+  const persisted = JSON.parse(
+    JSON.stringify({
+      sessionID: "round-trip",
+      condition: "ship it",
+      startedAt: Date.now(),
+      options: normalizeOptions({ maxTurns: 0, maxDurationMs: 8 * 3600_000, maxTokens: 100_000_000 }),
+    }),
+  )
+  assert.equal(persisted.options.maxTurns, 0, "0 is JSON-safe on the way out")
+
+  const loaded = normalizePersistedGoal(persisted)
+  assert.equal(loaded.options.maxTurns, 0, "and stays unlimited on the way back in")
+  assert.equal(isUnlimitedTurnBudget(loaded.options.maxTurns), true)
+  assert.equal(stopReason({ ...loaded, turnCount: 9999, totalTokens: 0 }), null)
+
+  // Control: a persisted bounded budget is not turned into an unlimited one.
+  const bounded = normalizePersistedGoal(
+    JSON.parse(JSON.stringify({ sessionID: "round-trip", condition: "ship it", options: { maxTurns: 7 } })),
+  )
+  assert.equal(bounded.options.maxTurns, 7)
+})
+
+test("/goal status renders the unlimited turn budget and the 8-hour window", () => {
+  const goal = {
+    condition: "ship it",
+    turnCount: 3,
+    options: normalizeOptions(),
+    totalTokens: 147_000,
+    startedAt: Date.now() - 90 * 60_000,
+    lastProgressAt: Date.now() - 5000,
+    noProgressTurns: 0,
+    lastStatus: "Continuing after assistant turn 3.",
+  }
+  const status = formatStatus(goal)
+  assert.match(status, /Auto-continues sent: 3\/∞/)
+  assert.match(status, /Elapsed: \d+s \(1\.5h\/8h\)/)
+
+  // Control: a bounded goal still shows its real ceiling.
+  const bounded = formatStatus({ ...goal, options: normalizeOptions({ maxTurns: 10, maxDurationMs: 45 * 60_000 }) })
+  assert.match(bounded, /Auto-continues sent: 3\/10/)
+  assert.match(bounded, /Elapsed: \d+s \(1\.5h\/45m\)/)
+})
+
+test("the shared budget formatters round to one decimal and drop a trailing .0", () => {
+  // The same table the sidebar panel asserts, driven through the server half's
+  // own re-export so the two halves are provably the same function.
+  assert.equal(formatBudgetMinutes(0), "0m")
+  assert.equal(formatBudgetMinutes(45), "45m")
+  assert.equal(formatBudgetMinutes(60), "1h")
+  assert.equal(formatBudgetMinutes(90), "1.5h")
+  assert.equal(formatBudgetMinutes(480), "8h")
+  // 481 min = 8.016 h -> rounds to 8.0 -> "8h", not "8.0h".
+  assert.equal(formatBudgetMinutes(481), "8h")
+
+  assert.equal(formatBudgetDuration(0), "0m")
+  assert.equal(formatBudgetDuration(45 * 60_000), "45m")
+  assert.equal(formatBudgetDuration(60 * 60_000), "1h")
+  assert.equal(formatBudgetDuration(90 * 60_000), "1.5h")
+  assert.equal(formatBudgetDuration(8 * 3600_000), "8h")
+  assert.equal(formatBudgetDuration(-1), "0m")
+
+  assert.equal(formatTurnLimit(10), "10")
+  assert.equal(formatTurnLimit(0), "∞")
+  assert.equal(formatTurnLimit(null), "∞")
+  assert.equal(formatTurnBudget(3, 0), "3/∞")
+  assert.equal(isUnlimitedTurnBudget(0), true)
+  assert.equal(isUnlimitedTurnBudget(1), false)
+
+  // Prose surfaces (history, command output) spell it out instead.
+  assert.equal(describeTurnLimit(0), "unlimited")
+  assert.equal(describeTurnLimit(10), "10")
 })
