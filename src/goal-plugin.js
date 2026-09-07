@@ -95,12 +95,30 @@ const DEFAULT_OPTIONS = {
   //
   // WHAT ACTUALLY BRAKES A DEFAULT RUN. The no-tool-call and no-progress
   // pauses catch a loop that has stopped DOING anything — a talk-only turn, or
-  // a stalled turn under `noProgressTokenThreshold` output tokens — within two
-  // turns. Neither catches a loop that keeps CALLING TOOLS: both gates are
-  // skipped for any turn with a tool call (`latestHasToolCall`), so an agent
-  // re-running the same failing command forever is caught by neither. For that
-  // run the binding brake is the 8-hour clock, with the budget wrap-up handoff
-  // at `budgetWrapupRatio` of it.
+  // a stalled turn under `noProgressTokenThreshold` output tokens. Both judge
+  // the WHOLE turn (every assistant message answering one prompt, see
+  // `assistantMessagesForTurn`), and both are skipped for any turn that called
+  // a tool anywhere (`turnHasToolCall`), so an agent re-running the same
+  // failing command forever is caught by neither. For that run the binding
+  // brake is the 8-hour clock, with the budget wrap-up handoff at
+  // `budgetWrapupRatio` of it.
+  //
+  // `noToolCallTurnsBeforePause` is 10, not 2: judging a goal purely on tool
+  // calls is a blunt instrument, so it takes ten consecutive tool-free turns
+  // to call a run a self-chat loop. `noProgressTurnsBeforePause` stays at 2 —
+  // it is a much narrower claim (repeated near-zero output with no change).
+  //
+  // `maxRecentMessages` is the VISIBILITY WINDOW the turn is reconstructed
+  // from. It is 200 because a single OpenCode turn is now known to be many
+  // assistant messages: a 50-message window can slice off the tool-bearing
+  // head of a long turn and leave only its text-only summary visible, which is
+  // exactly the false "no tool calls" reading this release fixes. The host
+  // serves any limit with the same two SQL queries (`Session.messages` ->
+  // `MessageV2.page`, one indexed SELECT plus one `IN` hydrate;
+  // opencode 1.18.29 `packages/opencode/src/session/session.ts:828-835`,
+  // `session/message-v2.ts:425-466` and `:98-123`), so the per-call cost of a
+  // wider window is rows, not round trips — and an omitted limit is strictly
+  // more expensive, since the host then pages the ENTIRE session in 50s.
   //
   // `maxTokens` is deliberately out of reach: `goal.totalTokens` is the peak
   // CONTEXT WINDOW size (see the `Math.max` in the token tracker), which the
@@ -112,10 +130,10 @@ const DEFAULT_OPTIONS = {
   maxDurationMs: 8 * 60 * 60 * 1000,
   maxTokens: 100000000,
   minDelayMs: 1500,
-  maxRecentMessages: 50,
+  maxRecentMessages: 200,
   noProgressTokenThreshold: 50,
   noProgressTurnsBeforePause: 2,
-  noToolCallTurnsBeforePause: 2,
+  noToolCallTurnsBeforePause: 10,
   noInterruptOnUserMessage: false,
   noContinueWhileChildrenActive: false,
   budgetWrapupRatio: 0.8,
@@ -3152,6 +3170,98 @@ function compactionEventIdentity(event) {
 function messageParentID(message) {
   const id = message?.info?.parentID || message?.parentID || ""
   return typeof id === "string" && id.length <= MAX_GOAL_META_LENGTH ? id : ""
+}
+
+// ONE TURN IS N ASSISTANT MESSAGES, NOT ONE.
+//
+// OpenCode creates a NEW assistant message for every LLM step of a single
+// prompt: the step loop in `packages/opencode/src/session/prompt.ts` at
+// :1088 builds `const msg: SessionV1.Assistant = { id: MessageID.ascending(),
+// parentID: lastUser.id, role: "assistant", … }` at :1187-1201 and persists it
+// with `sessions.updateMessage(msg)` at :1202 (verified against a source
+// checkout of 1.18.29). So a continuation turn that runs tools and then writes
+// its summary is several assistant messages sharing one `parentID` — the
+// user/continuation message they all answer. The steps that called tools end
+// with finish reason "tool-calls"; the closing summary is a SEPARATE,
+// text-only assistant message.
+//
+// Judging only the newest message therefore read almost every real working
+// turn as "talk only". Measured on a live OpenCode session database
+// (ses_f9aa8ea73ffe5H1B0AWDYpNCpM, 43 turns, 2026-09-07): 33 turns used tools
+// and in 28 of them the LAST assistant message was text-only, so the
+// no-tool-call brake would have charged 28 of 33 productive turns and paused a
+// healthy goal after two of them.
+//
+// Grouping rule, applied in order:
+//   1. no latest assistant message -> `[]` (there is no turn to judge);
+//   2. the latest assistant has a `parentID` -> every assistant message in the
+//      visible list carrying the SAME parentID, in list order, minus
+//      compaction messages;
+//   3. no parentID at all (older hosts, embedded clients) -> the contiguous
+//      run of assistant-role messages ending at the latest assistant, i.e.
+//      everything after the last non-assistant message, minus compaction
+//      messages.
+// Pure: no runtime state, no host calls, no mutation of its input.
+function assistantMessagesForTurn(messages, latestAssistant) {
+  if (!latestAssistant) return []
+  const list = Array.isArray(messages) ? messages : []
+  const inTurn = (message) =>
+    messageRole(message) === "assistant" && !isCompactionAssistantMessage(message)
+
+  const parentID = messageParentID(latestAssistant)
+  if (parentID) {
+    const grouped = list.filter(
+      (message) => inTurn(message) && messageParentID(message) === parentID,
+    )
+    // A latest assistant that is not itself in the visible list still has to be
+    // judged, so never return an empty turn for a message that exists.
+    return grouped.length > 0 ? grouped : [latestAssistant]
+  }
+
+  let index = -1
+  const latestID = messageID(latestAssistant)
+  for (let i = list.length - 1; i >= 0; i -= 1) {
+    if (list[i] === latestAssistant || (latestID && messageID(list[i]) === latestID)) {
+      index = i
+      break
+    }
+  }
+  if (index < 0) return [latestAssistant]
+  const run = []
+  for (let i = index; i >= 0; i -= 1) {
+    const message = list[i]
+    // A non-assistant message (the user prompt this turn answers) ends the run.
+    // A compaction assistant is assistant-role, so it does not end the run, but
+    // it is never part of the turn's work.
+    if (messageRole(message) !== "assistant") break
+    if (isCompactionAssistantMessage(message)) continue
+    run.push(message)
+  }
+  return run.reverse()
+}
+
+// Turn-level aggregates. Each takes the message list produced by
+// `assistantMessagesForTurn` so the brakes judge the WHOLE turn: a tool part
+// anywhere in it is real work, and the output/reasoning tokens of a turn are
+// the sum over its steps, not the tail message's share of them.
+function turnCallsTool(turnMessages) {
+  return (Array.isArray(turnMessages) ? turnMessages : []).some((message) =>
+    messageHasToolCall(message),
+  )
+}
+
+function sumTurnOutputTokens(turnMessages) {
+  return (Array.isArray(turnMessages) ? turnMessages : []).reduce(
+    (total, message) => total + outputTokensForMessage(message),
+    0,
+  )
+}
+
+function sumTurnReasoningTokens(turnMessages) {
+  return (Array.isArray(turnMessages) ? turnMessages : []).reduce(
+    (total, message) => total + toNonNegativeInteger(messageTokens(message).reasoning),
+    0,
+  )
 }
 
 function findLatestExecutionContext(messages) {
@@ -6750,7 +6860,13 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         const latestAssistant = findLatestAssistantMessage(messages)
         const latestAssistantID = messageID(latestAssistant)
         const latestText = getText(latestAssistant?.parts)
-        const latestOutputTokens = latestAssistant ? outputTokensForMessage(latestAssistant) : null
+        // Every assistant message OpenCode produced in answer to this one
+        // prompt (see assistantMessagesForTurn). The stall brakes below judge
+        // the WHOLE turn: a turn that ran tools and then wrote a text-only
+        // summary is several messages, and scoring only the tail one charged
+        // the no-tool-call brake for real work.
+        const turnMessages = assistantMessagesForTurn(messages, latestAssistant)
+        const turnOutputTokens = latestAssistant ? sumTurnOutputTokens(turnMessages) : null
         const previousAssistantText = activeGoalAfterMessages.lastAssistantText
         const assistantChanged = summarizeText(latestText) !== summarizeText(previousAssistantText)
         const assistantRepeated =
@@ -7123,33 +7239,37 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           return
         }
 
-        // Hoist tool-call check so both the noProgress and noToolCall gates can
-        // use it. A tool call is evidence of real work even when prose output
-        // is tiny (e.g. a thinking model that calls a tool with < 50 output
-        // tokens), so it resets noProgressTurns the same way the noToolCall
-        // gate already resets noToolCallTurns.
-        const latestHasToolCall = messageHasToolCall(latestAssistant)
+        // Hoist the tool-call check so both the noProgress and noToolCall gates
+        // can use it. A tool call is evidence of real work even when prose
+        // output is tiny (e.g. a thinking model that calls a tool with < 50
+        // output tokens), so it resets noProgressTurns the same way the
+        // noToolCall gate already resets noToolCallTurns. It is asked of the
+        // whole turn: a tool part on ANY of the turn's assistant messages is
+        // enough, because the model's closing summary is its own text-only
+        // message and is the one this used to read.
+        const turnHasToolCall = turnCallsTool(turnMessages)
         // A turn that produced only reasoning tokens (no prose, no tool calls)
-        // is an extended-thinking pass, not a stall. latestOutputTokens counts
-        // prose output only; reasoning tokens are tracked separately. Without
-        // this guard a pure-thinking turn matches lowOutputTurn (output=0 < threshold)
-        // and latestText is empty, so it would false-positively look stalled.
-        const latestHasThinkingTokens =
-          toNonNegativeInteger(messageTokens(latestAssistant).reasoning) > 0
+        // is an extended-thinking pass, not a stall. turnOutputTokens counts
+        // prose output only; reasoning tokens are summed separately over the
+        // same turn. Without this guard a pure-thinking turn matches
+        // lowOutputTurn (output=0 < threshold) and latestText is empty, so it
+        // would false-positively look stalled.
+        const turnReasoningTokens = sumTurnReasoningTokens(turnMessages)
+        const turnHasThinkingTokens = turnReasoningTokens > 0
 
         const lowOutputTurn =
           activeGoalAfterMessages.turnCount > 0 &&
           !activationBoundary &&
-          latestOutputTokens !== null &&
-          latestOutputTokens < activeGoalAfterMessages.options.noProgressTokenThreshold
+          turnOutputTokens !== null &&
+          turnOutputTokens < activeGoalAfterMessages.options.noProgressTokenThreshold
         // A turn that used a tool is never stalled even with low output tokens:
         // reasoning-heavy models often produce small prose output while doing
         // real work via tool calls. Excluding tool-call turns prevents false
         // noProgress pauses on thinking models.
         const lowOutputLooksStalled =
           lowOutputTurn &&
-          !latestHasToolCall &&
-          !latestHasThinkingTokens &&
+          !turnHasToolCall &&
+          !turnHasThinkingTokens &&
           (assistantRepeated || !latestText || !assistantChanged)
         // A child-wake pass re-examines an assistant turn the parent already
         // produced and was already charged for: the parent ran nothing in
@@ -7172,7 +7292,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
             }
             activeGoalAfterMessages.stopped = true
             activeGoalAfterMessages.stopReason = "no progress"
-            activeGoalAfterMessages.lastStatus = `Goal auto-continue paused after ${activeGoalAfterMessages.noProgressTurns} low-progress turn(s); the latest turn produced ${latestOutputTokens} output token(s). Run /${commandName} resume to continue.`
+            activeGoalAfterMessages.lastStatus = `Goal auto-continue paused after ${activeGoalAfterMessages.noProgressTurns} low-progress turn(s); the latest turn produced ${turnOutputTokens} output token(s). Run /${commandName} resume to continue.`
             pushHistory(
               activeGoalAfterMessages,
               "paused",
@@ -7201,14 +7321,14 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           // Resetting here would let an alternating defer/wake cycle keep a
           // genuinely stalled loop running indefinitely.
           !childWakeEvent &&
-          (latestOutputTokens !== null || assistantChanged || !latestAssistant)
+          (turnOutputTokens !== null || assistantChanged || !latestAssistant)
         ) {
           activeGoalAfterMessages.noProgressTurns = 0
         }
 
-        // No-tool-call gate: a continuation turn (turnCount > 0) that produced
-        // an assistant message with no tool calls is "talk only". Repeated
-        // talk-only turns indicate a self-chat loop, so pause after the
+        // No-tool-call gate: a continuation turn (turnCount > 0) in which NONE
+        // of the turn's assistant messages called a tool is "talk only".
+        // Repeated talk-only turns indicate a self-chat loop, so pause after the
         // configured grace window. Complements the low-output check above:
         // a turn can be high-output yet still make no real progress because it
         // never touched a tool.
@@ -7222,7 +7342,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           activeGoalAfterMessages.turnCount > 0 &&
           !activationBoundary &&
           Boolean(latestAssistant) &&
-          !latestHasToolCall
+          !turnHasToolCall
         if (noToolCallContinuation && !lowOutputLooksStalled && !childWakeEvent) {
           activeGoalAfterMessages.noToolCallTurns += 1
           if (
@@ -7254,7 +7374,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
             "warning",
             `Observed a continuation turn with no tool calls; grace count ${activeGoalAfterMessages.noToolCallTurns}/${activeGoalAfterMessages.options.noToolCallTurnsBeforePause}.`,
           )
-        } else if (latestHasToolCall || !latestAssistant) {
+        } else if (turnHasToolCall || !latestAssistant) {
           activeGoalAfterMessages.noToolCallTurns = 0
         }
 
@@ -7733,6 +7853,10 @@ export const testInternals = {
   extractBlockedReason,
   extractCompletionEvidence,
   findLatestAssistantMessage,
+  assistantMessagesForTurn,
+  turnCallsTool,
+  sumTurnOutputTokens,
+  sumTurnReasoningTokens,
   formatArgumentErrors,
   goalDisplayState,
   formatStatus,

@@ -242,10 +242,14 @@ export interface GoalPluginOptions {
 
   /**
    * How many recent session messages to scan when looking for the latest
-   * assistant turn before auto-continuing. Higher values make long,
-   * tool-heavy sessions less likely to lose the most recent assistant
-   * response.
-   * @default 50
+   * assistant turn before auto-continuing. This is the visibility window the
+   * turn is reconstructed from: OpenCode writes one assistant message per LLM
+   * step, so a single turn can be many messages and a narrow window can hide
+   * its tool-bearing head behind a text-only summary. Higher values make long,
+   * tool-heavy sessions less likely to lose part of the most recent turn; the
+   * host serves any limit with the same two queries, so a wider window costs
+   * rows, not round trips.
+   * @default 200
    */
   maxRecentMessages?: number
 
@@ -260,17 +264,21 @@ export interface GoalPluginOptions {
   /**
    * Grace window for low-output stalls: the goal is paused only after this
    * many consecutive stalled low-output turns, rather than on the first
-   * one. Overridable per-goal with `--no-progress-turns`.
+   * one. Output tokens are summed over the whole turn (every assistant
+   * message answering one prompt). Overridable per-goal with
+   * `--no-progress-turns`.
    * @default 2
    */
   noProgressTurnsBeforePause?: number
 
   /**
-   * Grace window for tool-free continuation turns (a "talk only" turn that
-   * calls no tool). Complements the no-progress check by catching
-   * self-chat loops that still produce output. Overridable per-goal with
+   * Grace window for tool-free continuation turns (a "talk only" turn in
+   * which none of the turn's assistant messages called a tool). Complements
+   * the no-progress check by catching self-chat loops that still produce
+   * output. Judging a run purely on tool calls is blunt, so the default is
+   * ten consecutive tool-free turns. Overridable per-goal with
    * `--no-tool-turns`. Set the plugin option to `0` to disable this heuristic.
-   * @default 2
+   * @default 10
    */
   noToolCallTurnsBeforePause?: number
 

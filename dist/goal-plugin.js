@@ -15141,10 +15141,10 @@ var DEFAULT_OPTIONS = {
   maxDurationMs: 8 * 60 * 60 * 1000,
   maxTokens: 1e8,
   minDelayMs: 1500,
-  maxRecentMessages: 50,
+  maxRecentMessages: 200,
   noProgressTokenThreshold: 50,
   noProgressTurnsBeforePause: 2,
-  noToolCallTurnsBeforePause: 2,
+  noToolCallTurnsBeforePause: 10,
   noInterruptOnUserMessage: false,
   noContinueWhileChildrenActive: false,
   budgetWrapupRatio: 0.8,
@@ -17432,6 +17432,46 @@ function compactionEventIdentity(event) {
 function messageParentID(message) {
   const id = message?.info?.parentID || message?.parentID || "";
   return typeof id === "string" && id.length <= MAX_GOAL_META_LENGTH ? id : "";
+}
+function assistantMessagesForTurn(messages, latestAssistant) {
+  if (!latestAssistant)
+    return [];
+  const list = Array.isArray(messages) ? messages : [];
+  const inTurn = (message) => messageRole(message) === "assistant" && !isCompactionAssistantMessage(message);
+  const parentID = messageParentID(latestAssistant);
+  if (parentID) {
+    const grouped = list.filter((message) => inTurn(message) && messageParentID(message) === parentID);
+    return grouped.length > 0 ? grouped : [latestAssistant];
+  }
+  let index = -1;
+  const latestID = messageID(latestAssistant);
+  for (let i = list.length - 1;i >= 0; i -= 1) {
+    if (list[i] === latestAssistant || latestID && messageID(list[i]) === latestID) {
+      index = i;
+      break;
+    }
+  }
+  if (index < 0)
+    return [latestAssistant];
+  const run = [];
+  for (let i = index;i >= 0; i -= 1) {
+    const message = list[i];
+    if (messageRole(message) !== "assistant")
+      break;
+    if (isCompactionAssistantMessage(message))
+      continue;
+    run.push(message);
+  }
+  return run.reverse();
+}
+function turnCallsTool(turnMessages) {
+  return (Array.isArray(turnMessages) ? turnMessages : []).some((message) => messageHasToolCall(message));
+}
+function sumTurnOutputTokens(turnMessages) {
+  return (Array.isArray(turnMessages) ? turnMessages : []).reduce((total, message) => total + outputTokensForMessage(message), 0);
+}
+function sumTurnReasoningTokens(turnMessages) {
+  return (Array.isArray(turnMessages) ? turnMessages : []).reduce((total, message) => total + toNonNegativeInteger(messageTokens(message).reasoning), 0);
 }
 function findLatestExecutionContext(messages) {
   for (const message of [...messages || []].reverse()) {
@@ -19993,7 +20033,8 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         const latestAssistant = findLatestAssistantMessage(messages);
         const latestAssistantID = messageID(latestAssistant);
         const latestText = getText(latestAssistant?.parts);
-        const latestOutputTokens = latestAssistant ? outputTokensForMessage(latestAssistant) : null;
+        const turnMessages = assistantMessagesForTurn(messages, latestAssistant);
+        const turnOutputTokens = latestAssistant ? sumTurnOutputTokens(turnMessages) : null;
         const previousAssistantText = activeGoalAfterMessages.lastAssistantText;
         const assistantChanged = summarizeText(latestText) !== summarizeText(previousAssistantText);
         const assistantRepeated = latestAssistantID && latestAssistantID === activeGoalAfterMessages.lastAssistantMessageID;
@@ -20221,10 +20262,11 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           }
           return;
         }
-        const latestHasToolCall = messageHasToolCall(latestAssistant);
-        const latestHasThinkingTokens = toNonNegativeInteger(messageTokens(latestAssistant).reasoning) > 0;
-        const lowOutputTurn = activeGoalAfterMessages.turnCount > 0 && !activationBoundary && latestOutputTokens !== null && latestOutputTokens < activeGoalAfterMessages.options.noProgressTokenThreshold;
-        const lowOutputLooksStalled = lowOutputTurn && !latestHasToolCall && !latestHasThinkingTokens && (assistantRepeated || !latestText || !assistantChanged);
+        const turnHasToolCall = turnCallsTool(turnMessages);
+        const turnReasoningTokens = sumTurnReasoningTokens(turnMessages);
+        const turnHasThinkingTokens = turnReasoningTokens > 0;
+        const lowOutputTurn = activeGoalAfterMessages.turnCount > 0 && !activationBoundary && turnOutputTokens !== null && turnOutputTokens < activeGoalAfterMessages.options.noProgressTokenThreshold;
+        const lowOutputLooksStalled = lowOutputTurn && !turnHasToolCall && !turnHasThinkingTokens && (assistantRepeated || !latestText || !assistantChanged);
         if (lowOutputLooksStalled && !childWakeEvent) {
           activeGoalAfterMessages.noProgressTurns += 1;
           if (activeGoalAfterMessages.noProgressTurns >= activeGoalAfterMessages.options.noProgressTurnsBeforePause) {
@@ -20233,7 +20275,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
             }
             activeGoalAfterMessages.stopped = true;
             activeGoalAfterMessages.stopReason = "no progress";
-            activeGoalAfterMessages.lastStatus = `Goal auto-continue paused after ${activeGoalAfterMessages.noProgressTurns} low-progress turn(s); the latest turn produced ${latestOutputTokens} output token(s). Run /${commandName} resume to continue.`;
+            activeGoalAfterMessages.lastStatus = `Goal auto-continue paused after ${activeGoalAfterMessages.noProgressTurns} low-progress turn(s); the latest turn produced ${turnOutputTokens} output token(s). Run /${commandName} resume to continue.`;
             pushHistory(activeGoalAfterMessages, "paused", `Paused after ${activeGoalAfterMessages.noProgressTurns} low-progress turn(s) below ${activeGoalAfterMessages.options.noProgressTokenThreshold} output tokens.`);
             await persist(sessionID);
             announceLifecycle(sessionID, "Goal paused — no progress threshold reached.", {
@@ -20247,10 +20289,10 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           }
           activeGoalAfterMessages.lastStatus = `Low-progress turn detected (${activeGoalAfterMessages.noProgressTurns}/${activeGoalAfterMessages.options.noProgressTurnsBeforePause}); monitoring for another stalled turn before pausing.`;
           pushHistory(activeGoalAfterMessages, "warning", `Observed a low-progress turn below ${activeGoalAfterMessages.options.noProgressTokenThreshold} output tokens; grace count ${activeGoalAfterMessages.noProgressTurns}/${activeGoalAfterMessages.options.noProgressTurnsBeforePause}.`);
-        } else if (!childWakeEvent && (latestOutputTokens !== null || assistantChanged || !latestAssistant)) {
+        } else if (!childWakeEvent && (turnOutputTokens !== null || assistantChanged || !latestAssistant)) {
           activeGoalAfterMessages.noProgressTurns = 0;
         }
-        const noToolCallContinuation = activeGoalAfterMessages.options.noToolCallTurnsBeforePause > 0 && activeGoalAfterMessages.turnCount > 0 && !activationBoundary && Boolean(latestAssistant) && !latestHasToolCall;
+        const noToolCallContinuation = activeGoalAfterMessages.options.noToolCallTurnsBeforePause > 0 && activeGoalAfterMessages.turnCount > 0 && !activationBoundary && Boolean(latestAssistant) && !turnHasToolCall;
         if (noToolCallContinuation && !lowOutputLooksStalled && !childWakeEvent) {
           activeGoalAfterMessages.noToolCallTurns += 1;
           if (activeGoalAfterMessages.noToolCallTurns >= activeGoalAfterMessages.options.noToolCallTurnsBeforePause) {
@@ -20270,7 +20312,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           }
           activeGoalAfterMessages.lastStatus = `Continuation turn produced no tool calls (${activeGoalAfterMessages.noToolCallTurns}/${activeGoalAfterMessages.options.noToolCallTurnsBeforePause}); monitoring for another before pausing.`;
           pushHistory(activeGoalAfterMessages, "warning", `Observed a continuation turn with no tool calls; grace count ${activeGoalAfterMessages.noToolCallTurns}/${activeGoalAfterMessages.options.noToolCallTurnsBeforePause}.`);
-        } else if (latestHasToolCall || !latestAssistant) {
+        } else if (turnHasToolCall || !latestAssistant) {
           activeGoalAfterMessages.noToolCallTurns = 0;
         }
         const elapsedSinceLastContinue = Date.now() - activeGoalAfterMessages.lastContinueAt;
@@ -20633,6 +20675,10 @@ var testInternals = {
   extractBlockedReason,
   extractCompletionEvidence,
   findLatestAssistantMessage,
+  assistantMessagesForTurn,
+  turnCallsTool,
+  sumTurnOutputTokens,
+  sumTurnReasoningTokens,
   formatArgumentErrors,
   goalDisplayState,
   formatStatus,
