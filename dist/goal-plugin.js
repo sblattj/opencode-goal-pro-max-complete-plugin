@@ -18661,8 +18661,12 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
     if (!sidebarStatus || !sessionID)
       return;
     const goal = goalStates.get(sessionID) || sidebarTerminals.get(sessionID);
-    if (!goal)
+    if (!goal) {
+      if (currentRuntime().appliedTitles.has(sessionID) && listSessionGoals(sessionID).length === 0) {
+        await restoreSessionTitle(sessionID);
+      }
       return;
+    }
     const now = Date.now();
     const context = sidebarSequenceContext(sessionID);
     const title = buildSessionTitle(goal, now, context);

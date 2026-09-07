@@ -4728,7 +4728,19 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
     // the sidebar honest ("✓ …" / state `completed`) instead of leaving the last
     // running render up forever.
     const goal = goalStates.get(sessionID) || sidebarTerminals.get(sessionID)
-    if (!goal) return
+    if (!goal) {
+      // A goal can leave without passing through `/goal clear`: the `clear_goal`
+      // tool clears state directly, and a finished goal's terminal snapshot is
+      // dropped once its result ages out. Found on a live opencode 1.18.29 run,
+      // where the model answered `/goal clear` by calling the tool and the dead
+      // goal's status stayed on the session forever. Only a render this process
+      // actually wrote is undone (`appliedTitles`), and only once every goal is
+      // gone, so a sequence between objectives is never blanked.
+      if (currentRuntime().appliedTitles.has(sessionID) && listSessionGoals(sessionID).length === 0) {
+        await restoreSessionTitle(sessionID)
+      }
+      return
+    }
     const now = Date.now()
     const context = sidebarSequenceContext(sessionID)
     const title = buildSessionTitle(goal, now, context)

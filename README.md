@@ -31,7 +31,7 @@ This project is independently implemented for OpenCode. Product names used elsew
 |---|---|
 | Node.js | Declared support: `>=18`; CI covers Node 18, 20, 22, and 24 |
 | Operating systems | Filesystem-sensitive lifecycle tests run on Linux, macOS, and Windows |
-| Package entrypoint | Installed-tarball contracts verify both export paths, consumer TypeScript resolution, hooks, and all 11 tools |
+| Package entrypoint | Installed-tarball contracts verify all three export paths (`.`, `./server`, `./tui`), the plugin-manifest targets OpenCode reads from `exports`, consumer TypeScript resolution, hooks, and all 14 tools |
 | Provider/backend quirks | Strict-template backends require the goal block to merge into the primary `system` message; covered by regression tests |
 | OpenCode 2 | Not supported and not yet tested; the peer/engine pin is `>=1.17.15 <2`. See the [OpenCode 2 section](docs/compatibility.md#opencode-2) |
 
@@ -75,6 +75,14 @@ Add the plugin and command to your OpenCode config:
     }
   }
 }
+```
+
+For the sidebar **panel**, add one more line to a `tui.json` beside it — OpenCode
+loads TUI plugins from that file, not from `opencode.json` (see
+[Sidebar panel (TUI)](#sidebar-panel-tui)):
+
+```json
+{ "plugin": ["opencode-goal-plugin"] }
 ```
 
 ## Usage
@@ -460,7 +468,7 @@ Alongside the title, the plugin writes a structured payload to the session's `me
 }
 ```
 
-**Mechanism.** Both halves are one `PATCH /session/{id}` call (`client.session.update`). The session title is what the OpenCode TUI sidebar renders for the current session, and `metadata` is reconciled into the TUI's reactive session store on the `session.updated` event. This needs no TUI plugin entrypoint, no `@opentui` dependency, and no build step: a server-only plugin module cannot register the richer sidebar slots, which require a precompiled TUI entry, but it can drive what the sidebar already renders.
+**Mechanism.** Both halves are one `PATCH /session/{id}` call (`client.session.update`). The session title is what the OpenCode TUI sidebar renders for the current session, and `metadata` is reconciled into the TUI's reactive session store on the `session.updated` event. This half needs no TUI entrypoint and no `@opentui` dependency, so it works on every client that shows a session title — including `opencode run`, the desktop client, and any host reading the session record over HTTP. The [sidebar panel](#sidebar-panel-tui) below renders the same payload as a real panel when the host supports TUI plugins.
 
 **Turning it off.** The status is **on by default** — an unattended goal you cannot see is the problem this solves — but it writes a user-visible field, so there are two kill switches:
 
@@ -483,6 +491,53 @@ The session's original title is captured before the first overwrite and restored
 The sidebar refreshes on goal commands and on idle, compaction, and interruption events — **not** on the `message.updated` events that stream during an assistant turn. Streaming refreshes would put an API round-trip in the response path for a cosmetic update, and idle is the cadence a human actually reads the status at.
 
 The captured original title lives in memory only, so a hard process kill leaves the last status line on the session. The plugin recognizes its own status lines and will not mistake one for your title, so `/goal clear` after a restart leaves the host's title alone rather than restoring stale goal status — but it cannot recover the title the session had before the goal started. Rename the session if you want it back. `metadata.goal` is this plugin's own namespace, so a clear does drop it even after a restart.
+
+## Sidebar panel (TUI)
+
+The title line is one row. When OpenCode's TUI supports plugin sidebar slots (1.18.x and later), the package also ships a **TUI half** that renders the whole goal as a panel above the todo list:
+
+```
+Goal
+▶ ship the release
+3/10 turns · 2/30m · 45k/200k tokens
+step 2/4
+3/7 actions verified, 1 blocked
+● rebuild dist [pass]
+◐ rerun the suite
+⛔ waiting on the audit
++4 more
+Success: tests pass and changelog updated
+Constraints: do not touch the public API
+```
+
+State drives the colour: blocked is an error, completed a success, paused a warning. An action is only green when it is `done` **and** its verdict is `pass` — a `done` action with no verdict is exactly the unsubstantiated completion the CEV gate exists to catch, so it is not allowed to read as finished. The panel hides itself entirely when the session has no goal, and disappears on `/goal clear`.
+
+**How it loads.** A plugin module may export `server()` or `tui()`, never both — but one *package* may ship both, because OpenCode resolves each kind's entrypoint from `package.json` `exports`:
+
+| Export | File | Kind |
+|---|---|---|
+| `.` / `./server` / `main` | `dist/goal-plugin.js` | server: commands, tools, hooks, the title/metadata writes |
+| `./tui` | `dist/goal-tui.js` | tui: the sidebar panel |
+
+**The TUI half needs its own config file.** This trips everyone: OpenCode does *not* load TUI plugins from `opencode.json`'s `plugin` array — that list only ever produces server plugins. TUI plugins come from a separate **`tui.json`** (or `tui.jsonc`), read from the global config directory, from `$OPENCODE_TUI_CONFIG`, and from each `.opencode/` directory between the project and your home directory. Verified against opencode 1.18.29: `packages/opencode/src/config/tui.ts:157-168` is the only place `plugin_origins` is populated, and it runs once per **tui** config file (`tui.ts:183-210`, `config/paths.ts:43-45`); the TUI runtime then loads exactly that list (`packages/opencode/src/plugin/tui/runtime.ts:1088`).
+
+So a full install is two entries:
+
+```jsonc
+// opencode.json — the server half (commands, tools, hooks, sidebar payload)
+{ "plugin": ["opencode-goal-plugin"] }
+```
+
+```jsonc
+// tui.json, next to it — the TUI half (the sidebar panel)
+{ "plugin": ["opencode-goal-plugin"] }
+```
+
+The server half works on its own; without the `tui.json` entry you get the title line and no panel. **Point each entry at the package (or, for a local checkout, its directory) — never at a file inside it**: OpenCode reads `package.json` from the target file's own directory and does not walk upward, so a config naming `…/dist/goal-plugin.js` can never resolve `exports["./tui"]`.
+
+`solid-js` and `@opentui/solid` are provided by the host to TUI plugins at runtime, so they are not dependencies of this package and are deliberately left external in the bundle; a second copy of Solid would have its own reactive graph and would never update. On a host without TUI plugin slots the `./tui` target is simply never loaded, and the title line remains the fallback.
+
+`sidebarStatus: false` / `OPENCODE_GOAL_SIDEBAR=0` disable the server half's writes, which empties the payload the panel reads — so they turn the panel off too.
 
 ## Verified action plan (Claim → Evidence → Verdict)
 

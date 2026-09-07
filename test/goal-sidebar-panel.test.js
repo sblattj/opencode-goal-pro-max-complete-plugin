@@ -1,0 +1,443 @@
+// Unit tests for the TUI sidebar goal panel.
+//
+// `src/goal-sidebar-view.js` deliberately imports nothing, so the panel that
+// opencode renders in a terminal can be driven here with a fake runtime
+// standing in for `solid-js` and `@opentui/solid/jsx-runtime`. The fake `jsx`
+// keeps the props object it is handed, so a value the panel captured eagerly
+// renders stale on a second pass while a getter re-reads — which is what makes
+// the reactivity test below able to fail.
+import assert from "node:assert/strict"
+import test from "node:test"
+import {
+  createGoalSidebar,
+  formatPanelTokens,
+  goalPanelModel,
+  GOAL_PANEL_PAYLOAD_VERSION,
+  GOAL_PANEL_TITLE,
+} from "../src/goal-sidebar-view.js"
+
+const THEME = {
+  text: "text",
+  textMuted: "muted",
+  error: "error",
+  warning: "warning",
+  success: "success",
+}
+
+function fakeRuntime() {
+  const Show = function Show() {}
+  const For = function For() {}
+  return {
+    Show,
+    For,
+    createMemo: (fn) => fn,
+    jsx: (type, props) => ({ type, props }),
+  }
+}
+
+// Collapse a `text` element's children — a string, a nested `b`, or an array of
+// either — into the single string a terminal row would show.
+function flatten(value) {
+  if (value === null || value === undefined || value === false || value === true) return ""
+  if (Array.isArray(value)) return value.map(flatten).join("")
+  if (typeof value === "object") return flatten(value.props?.children)
+  return String(value)
+}
+
+// Walk the tree once and return the `text` ELEMENTS, not their current values.
+// Holding the elements is what lets a test read them again after the session
+// changed, which is the only way to tell a getter from a frozen string.
+function collect(runtime, node) {
+  if (node === null || node === undefined || node === false || node === true) return []
+  if (Array.isArray(node)) return node.flatMap((item) => collect(runtime, item))
+  if (typeof node !== "object") return []
+  const { type, props } = node
+  if (type === runtime.Show) return props.when ? collect(runtime, props.children) : []
+  if (type === runtime.For) {
+    return (props.each || []).flatMap((item, index) => collect(runtime, props.children(item, () => index)))
+  }
+  if (typeof type === "function") return collect(runtime, type(props))
+  if (type === "text") return [node]
+  return collect(runtime, props?.children)
+}
+
+function readLine(element) {
+  return { fg: element.props.fg, text: flatten(element.props.children) }
+}
+
+function renderLines(runtime, node) {
+  return collect(runtime, node).map(readLine)
+}
+
+function fakeApi(sessions, options = {}) {
+  const registrations = []
+  const logged = []
+  return {
+    registrations,
+    logged,
+    api: {
+      slots: {
+        register(view) {
+          registrations.push(view)
+        },
+      },
+      theme: { current: THEME },
+      state: { session: { get: (id) => sessions.get(id) } },
+      client: {
+        app: {
+          log: options.log ?? (async (input) => logged.push(input)),
+        },
+      },
+    },
+  }
+}
+
+function payload(overrides = {}) {
+  return {
+    v: GOAL_PANEL_PAYLOAD_VERSION,
+    goalId: "goal_1",
+    state: "active",
+    objective: "ship the sidebar panel",
+    turns: { used: 3, max: 10 },
+    minutes: { used: 2, max: 30 },
+    tokens: { used: 45_000, max: 200_000 },
+    plan: { total: 0, verified: 0, blocked: 0, actions: [] },
+    updatedAt: 1,
+    ...overrides,
+  }
+}
+
+test("no goal means no panel model at all", () => {
+  for (const raw of [null, undefined, "", 0, false, [], "a goal"]) {
+    assert.equal(goalPanelModel(raw), null, `${JSON.stringify(raw)} must not produce a panel`)
+  }
+  // `/goal clear` writes `metadata.goal = null`; a payload whose objective went
+  // missing must hide too rather than render a headerless panel.
+  assert.equal(goalPanelModel(payload({ objective: "" })), null)
+  assert.equal(goalPanelModel(payload({ objective: "   " })), null)
+  assert.equal(goalPanelModel(payload({ objective: 42 })), null)
+})
+
+test("a running goal reduces to its header, budgets, and nothing it was not given", () => {
+  const model = goalPanelModel(payload())
+  assert.equal(model.state, "active")
+  assert.equal(model.icon, "▶")
+  assert.equal(model.objective, "ship the sidebar panel")
+  assert.deepEqual(model.stats, ["3/10 turns", "2/30m", "45k/200k tokens"])
+  assert.equal(model.sequence, "")
+  assert.equal(model.progress, "")
+  assert.deepEqual(model.actions, [])
+  assert.equal(model.hiddenActions, 0)
+  assert.deepEqual(model.notes, [])
+})
+
+test("each state carries its own icon and an unknown one degrades to active", () => {
+  assert.equal(goalPanelModel(payload({ state: "paused" })).icon, "⏸")
+  assert.equal(goalPanelModel(payload({ state: "blocked" })).icon, "⛔")
+  assert.equal(goalPanelModel(payload({ state: "completed" })).icon, "✓")
+  const unknown = goalPanelModel(payload({ state: "exploded" }))
+  assert.equal(unknown.state, "active")
+  assert.equal(unknown.icon, "▶")
+})
+
+test("a budget with no ceiling is dropped instead of rendering a bare number", () => {
+  const model = goalPanelModel(
+    payload({ turns: { used: 3, max: 0 }, minutes: undefined, tokens: { used: 10, max: null } }),
+  )
+  assert.deepEqual(model.stats, [])
+})
+
+test("token counts are abbreviated the way the session title abbreviates them", () => {
+  assert.equal(formatPanelTokens(0), "0")
+  assert.equal(formatPanelTokens(999), "999")
+  assert.equal(formatPanelTokens(1000), "1k")
+  assert.equal(formatPanelTokens(1500), "1.5k")
+  assert.equal(formatPanelTokens(12_345), "12k")
+  assert.equal(formatPanelTokens(1_500_000), "1.5m")
+  assert.equal(formatPanelTokens(12_000_000), "12m")
+  assert.equal(formatPanelTokens(-5), "0")
+  assert.equal(formatPanelTokens("nope"), "0")
+})
+
+test("an ordered sequence shows its position and an unordered one shows nothing", () => {
+  assert.equal(goalPanelModel(payload({ sequence: { ordered: true, position: 2, total: 4 } })).sequence, "step 2/4")
+  assert.equal(goalPanelModel(payload({ sequence: { ordered: true, position: 0, total: 0 } })).sequence, "")
+  assert.equal(goalPanelModel(payload({ sequence: undefined })).sequence, "")
+})
+
+test("actions carry a status mark and a done action without a pass verdict is not verified", () => {
+  const model = goalPanelModel(
+    payload({
+      plan: {
+        total: 4,
+        verified: 1,
+        blocked: 1,
+        actions: [
+          { id: "a1", title: "reproduce", status: "done", verdict: "pass" },
+          { id: "a2", title: "claim it works", status: "done", verdict: null },
+          { id: "a3", title: "measure", status: "in_progress", verdict: "fail" },
+          { id: "a4", title: "waiting", status: "blocked", verdict: undefined },
+        ],
+      },
+    }),
+  )
+  assert.equal(model.progress, "1/4 actions verified, 1 blocked")
+  assert.deepEqual(
+    model.actions.map((action) => [action.mark, action.title, action.verdict, action.verified]),
+    [
+      ["●", "reproduce", "pass", true],
+      ["●", "claim it works", null, false],
+      ["◐", "measure", "fail", false],
+      ["⛔", "waiting", null, false],
+    ],
+  )
+})
+
+test("a plan with no blocked actions omits the blocked clause", () => {
+  const model = goalPanelModel(payload({ plan: { total: 3, verified: 2, blocked: 0, actions: [] } }))
+  assert.equal(model.progress, "2/3 actions verified")
+  assert.equal(model.hiddenActions, 3)
+})
+
+test("a long plan is capped and the remainder is counted, not dropped silently", () => {
+  const actions = Array.from({ length: 40 }, (_, index) => ({
+    id: `a${index}`,
+    title: `action ${index}`,
+    status: "pending",
+    verdict: null,
+  }))
+  const model = goalPanelModel(payload({ plan: { total: 40, verified: 0, blocked: 0, actions } }))
+  assert.equal(model.actions.length, 12)
+  assert.equal(model.hiddenActions, 28)
+  assert.equal(model.actions.at(-1).title, "action 11")
+})
+
+test("junk inside the plan is discarded rather than rendered", () => {
+  const model = goalPanelModel(
+    payload({
+      plan: {
+        total: 3,
+        actions: [null, "nope", { title: "" }, { title: "real", status: "sideways", verdict: "maybe" }],
+      },
+    }),
+  )
+  assert.equal(model.actions.length, 1)
+  assert.deepEqual(
+    { ...model.actions[0], id: model.actions[0].id },
+    { id: "real", title: "real", status: "pending", verdict: null, mark: "○", verified: false },
+  )
+})
+
+test("why it stopped comes before what it was asked to satisfy", () => {
+  const model = goalPanelModel(
+    payload({
+      state: "blocked",
+      blockedReason: "the build is red",
+      stopReason: "max turns reached",
+      successCriteria: "tests pass",
+      constraints: "do not touch prod",
+    }),
+  )
+  assert.deepEqual(model.notes, [
+    { label: "Blocked", text: "the build is red", tone: "error" },
+    { label: "Success", text: "tests pass", tone: "muted" },
+    { label: "Constraints", text: "do not touch prod", tone: "muted" },
+  ])
+})
+
+test("a stop reason is shown only when nothing is blocking", () => {
+  const model = goalPanelModel(payload({ state: "paused", stopReason: "max turns reached" }))
+  assert.deepEqual(model.notes, [{ label: "Stopped", text: "max turns reached", tone: "warning" }])
+})
+
+test("an overlong objective is truncated so it cannot push the sidebar apart", () => {
+  const model = goalPanelModel(payload({ objective: "x".repeat(400) }))
+  assert.equal(model.objective.length, 120)
+  assert.ok(model.objective.endsWith("…"))
+})
+
+test("the panel registers a sidebar_content view and logs that it did", async () => {
+  const runtime = fakeRuntime()
+  const { tui } = createGoalSidebar(runtime)
+  const { api, registrations, logged } = fakeApi(new Map())
+
+  await tui(api, {}, { spec: "opencode-goal-plugin" })
+
+  assert.equal(registrations.length, 1)
+  assert.equal(typeof registrations[0].order, "number")
+  assert.deepEqual(Object.keys(registrations[0].slots), ["sidebar_content"])
+  assert.equal(logged.length, 1)
+  assert.equal(logged[0].body.service, "opencode-goal-plugin")
+})
+
+test("a log that rejects does not take the TUI down with it", async () => {
+  const runtime = fakeRuntime()
+  const { tui } = createGoalSidebar(runtime)
+  const { api, registrations } = fakeApi(new Map(), {
+    log: async () => {
+      throw new Error("host refused")
+    },
+  })
+
+  await tui(api, {}, { spec: "opencode-goal-plugin" })
+  assert.equal(registrations.length, 1)
+})
+
+test("the registered view renders the whole goal for its session", async () => {
+  const runtime = fakeRuntime()
+  const { tui } = createGoalSidebar(runtime)
+  const sessions = new Map([
+    [
+      "ses_goal",
+      {
+        id: "ses_goal",
+        metadata: {
+          goal: payload({
+            sequence: { ordered: true, position: 2, total: 4 },
+            plan: {
+              total: 14,
+              verified: 1,
+              blocked: 1,
+              actions: [
+                { id: "a1", title: "reproduce", status: "done", verdict: "pass" },
+                { id: "a2", title: "waiting", status: "blocked", verdict: null },
+              ],
+            },
+            successCriteria: "tests pass",
+            constraints: "do not touch prod",
+          }),
+        },
+      },
+    ],
+  ])
+  const { api, registrations } = fakeApi(sessions)
+  await tui(api, {}, { spec: "opencode-goal-plugin" })
+
+  const node = registrations[0].slots.sidebar_content({}, { session_id: "ses_goal" })
+  const lines = renderLines(runtime, node)
+
+  assert.deepEqual(
+    lines.map((line) => line.text),
+    [
+      GOAL_PANEL_TITLE,
+      "▶ ship the sidebar panel",
+      "3/10 turns · 2/30m · 45k/200k tokens",
+      "step 2/4",
+      "1/14 actions verified, 1 blocked",
+      "● reproduce [pass]",
+      "⛔ waiting",
+      "+12 more",
+      "Success: tests pass",
+      "Constraints: do not touch prod",
+    ],
+  )
+})
+
+test("the panel colours by state: blocked is an error, completed is a success", async () => {
+  const runtime = fakeRuntime()
+  const { tui } = createGoalSidebar(runtime)
+  const sessions = new Map([
+    ["ses_blocked", { id: "ses_blocked", metadata: { goal: payload({ state: "blocked" }) } }],
+    ["ses_done", { id: "ses_done", metadata: { goal: payload({ state: "completed" }) } }],
+    ["ses_paused", { id: "ses_paused", metadata: { goal: payload({ state: "paused" }) } }],
+  ])
+  const { api, registrations } = fakeApi(sessions)
+  await tui(api, {}, { spec: "opencode-goal-plugin" })
+
+  const headline = (sessionID) => {
+    const node = registrations[0].slots.sidebar_content({}, { session_id: sessionID })
+    return renderLines(runtime, node)[1]
+  }
+
+  assert.deepEqual(headline("ses_blocked"), { fg: THEME.error, text: "⛔ ship the sidebar panel" })
+  assert.deepEqual(headline("ses_done"), { fg: THEME.success, text: "✓ ship the sidebar panel" })
+  assert.deepEqual(headline("ses_paused"), { fg: THEME.warning, text: "⏸ ship the sidebar panel" })
+})
+
+test("a verified action reads as success and a failed verdict reads as an error", async () => {
+  const runtime = fakeRuntime()
+  const { tui } = createGoalSidebar(runtime)
+  const sessions = new Map([
+    [
+      "ses_plan",
+      {
+        id: "ses_plan",
+        metadata: {
+          goal: payload({
+            turns: undefined,
+            minutes: undefined,
+            tokens: undefined,
+            plan: {
+              total: 3,
+              verified: 1,
+              blocked: 0,
+              actions: [
+                { id: "a1", title: "proved", status: "done", verdict: "pass" },
+                { id: "a2", title: "broke", status: "in_progress", verdict: "fail" },
+                { id: "a3", title: "later", status: "pending", verdict: null },
+              ],
+            },
+          }),
+        },
+      },
+    ],
+  ])
+  const { api, registrations } = fakeApi(sessions)
+  await tui(api, {}, { spec: "opencode-goal-plugin" })
+
+  const node = registrations[0].slots.sidebar_content({}, { session_id: "ses_plan" })
+  const lines = renderLines(runtime, node)
+  assert.deepEqual(lines.slice(2), [
+    { fg: THEME.textMuted, text: "1/3 actions verified" },
+    { fg: THEME.success, text: "● proved [pass]" },
+    { fg: THEME.error, text: "◐ broke [fail]" },
+    { fg: THEME.textMuted, text: "○ later" },
+  ])
+})
+
+test("the panel is hidden for a cleared goal, an unknown session, and a session with no metadata", async () => {
+  const runtime = fakeRuntime()
+  const { tui } = createGoalSidebar(runtime)
+  const sessions = new Map([
+    ["ses_cleared", { id: "ses_cleared", metadata: { goal: null } }],
+    ["ses_bare", { id: "ses_bare" }],
+    ["ses_other", { id: "ses_other", metadata: { somethingElse: true } }],
+  ])
+  const { api, registrations } = fakeApi(sessions)
+  await tui(api, {}, { spec: "opencode-goal-plugin" })
+
+  for (const sessionID of ["ses_cleared", "ses_bare", "ses_other", "ses_missing", "", undefined]) {
+    const node = registrations[0].slots.sidebar_content({}, { session_id: sessionID })
+    assert.deepEqual(renderLines(runtime, node), [], `${sessionID} must render nothing`)
+  }
+})
+
+test("the panel re-reads the session instead of freezing the values it first saw", async () => {
+  const runtime = fakeRuntime()
+  const { tui } = createGoalSidebar(runtime)
+  const session = { id: "ses_live", metadata: { goal: payload() } }
+  const sessions = new Map([["ses_live", session]])
+  const { api, registrations } = fakeApi(sessions)
+  await tui(api, {}, { spec: "opencode-goal-plugin" })
+
+  // Mount ONCE: the component body and every element in the tree are built a
+  // single time, exactly as the host builds them. Everything the panel shows is
+  // passed as a getter, so re-reading these same elements after the host
+  // replaces the session record must show the new values.
+  const node = registrations[0].slots.sidebar_content({}, { session_id: "ses_live" })
+  const mounted = node.type(node.props)
+  const lines = collect(runtime, mounted)
+  assert.equal(mounted.props.when, true)
+  assert.deepEqual(readLine(lines[1]), { fg: THEME.text, text: "▶ ship the sidebar panel" })
+  assert.equal(readLine(lines[2]).text, "3/10 turns · 2/30m · 45k/200k tokens")
+
+  session.metadata = { goal: payload({ state: "completed", turns: { used: 7, max: 10 } }) }
+  assert.deepEqual(readLine(lines[1]), { fg: THEME.success, text: "✓ ship the sidebar panel" })
+  assert.equal(readLine(lines[2]).text, "7/10 turns · 2/30m · 45k/200k tokens")
+
+  // And a cleared goal collapses the branch the panel lives in rather than
+  // leaving a header with nothing under it.
+  session.metadata = { goal: null }
+  assert.equal(mounted.props.when, false)
+  assert.deepEqual(renderLines(runtime, node), [])
+})

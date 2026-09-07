@@ -15,6 +15,11 @@
       "types": "./index.d.ts",
       "import": "./dist/goal-plugin.js",
       "default": "./dist/goal-plugin.js"
+    },
+    "./tui": {
+      "types": "./tui.d.ts",
+      "import": "./dist/goal-tui.js",
+      "default": "./dist/goal-tui.js"
     }
   },
   "bin": {
@@ -28,6 +33,7 @@
     "demo",
     "docs",
     "index.d.ts",
+    "tui.d.ts",
     "README.md",
     "CHANGELOG.md",
     "CONTRIBUTING.md",
@@ -44,13 +50,16 @@
     "smoke": "node scripts/smoke-command-hook.mjs",
     "smoke:packed-host": "node scripts/packed-host-contract.mjs",
     "smoke:packed-tools": "node scripts/packed-tool-contract.mjs",
+    "smoke:packed-manifest": "node scripts/packed-manifest-contract.mjs",
     "benchmark:behavior": "node scripts/behavior-benchmark.mjs",
     "verify": "node scripts/verify.mjs",
-    "check": "node -c src/goal-plugin.js && npm test",
-    "build": "bun build ./src/goal-plugin.js --outfile ./dist/goal-plugin.js --target node",
+    "check": "node -c src/goal-plugin.js && node -c src/goal-tui.js && node -c src/goal-sidebar-view.js && npm test",
+    "build": "npm run build:server && npm run build:tui",
+    "build:server": "bun build ./src/goal-plugin.js --outfile ./dist/goal-plugin.js --target node",
+    "build:tui": "bun build ./src/goal-tui.js --outfile ./dist/goal-tui.js --target node --packages external",
     "prepack": "npm run build",
     "pack:check": "npm pack --dry-run",
-    "release:check": "npm run check && npm run test:coverage && npm run type:check && npm run test:mutation && npm run benchmark:behavior && npm run smoke && npm run smoke:packed-host && npm run smoke:packed-tools && npm run verify && npm audit --omit=dev --audit-level=high && npm run pack:check"
+    "release:check": "npm run check && npm run test:coverage && npm run type:check && npm run test:mutation && npm run benchmark:behavior && npm run smoke && npm run smoke:packed-host && npm run smoke:packed-tools && npm run smoke:packed-manifest && npm run verify && npm audit --omit=dev --audit-level=high && npm run pack:check"
   },
   "keywords": [
     "opencode",
