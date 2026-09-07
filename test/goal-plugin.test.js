@@ -64,6 +64,17 @@ const {
   legacyStateFilePaths,
   listSessionGoals,
   messageHasToolCall,
+  messageHasWorkToolCall,
+  isPluginOwnToolName,
+  messageTokenCounts,
+  usageStepStarted,
+  addUsageDelta,
+  normalizeUsage,
+  contextWindowLimit,
+  turnTerminalText,
+  turnWasTruncated,
+  messageParentID,
+  isCompactionAssistantMessage,
   normalizeCommandOptions,
   normalizeMode,
   promoteNextOrderedGoal,
@@ -115,12 +126,82 @@ test("normalizeMessageUsage extracts current and flattened OpenCode usage safely
         cost: 0.0125,
       },
     }),
-    { input: 10, output: 4, reasoning: 2, cacheRead: 30, cacheWrite: 5, cost: 0.0125, costKnown: true },
+    { input: 10, output: 4, reasoning: 2, cacheRead: 30, cacheWrite: 5, cost: 0.0125, costKnown: true, totalOnly: false },
   )
   assert.deepEqual(
     normalizeMessageUsage({ tokens: { input: 3, cache_read: 7, cache_write: 2 }, cost: "bad" }),
-    { input: 3, output: 0, reasoning: 0, cacheRead: 7, cacheWrite: 2, cost: 0, costKnown: false },
+    { input: 3, output: 0, reasoning: 0, cacheRead: 7, cacheWrite: 2, cost: 0, costKnown: false, totalOnly: false },
   )
+})
+
+// One reader, one answer: the flattened and total-only shapes have to move the
+// SPEND accumulator and the CONTEXT measure together, or one brake silently
+// reads ~0 while the other reads the truth.
+test("every token spelling moves both the spend accumulator and the context measure", () => {
+  const nested = { info: { tokens: { input: 1000, output: 100, reasoning: 10, cache: { read: 500, write: 20 } } } }
+  const flat = { info: { tokens: { input: 1000, output: 100, reasoning: 10, cache_read: 500, cache_write: 20 } } }
+  const camel = { info: { tokens: { input: 1000, output: 100, reasoning: 10, cacheRead: 500, cacheWrite: 20 } } }
+  for (const [label, shape] of [["nested", nested], ["flat", flat], ["camel", camel]]) {
+    assert.equal(totalTokensForMessage(shape), 1630, `${label} context`)
+    const usage = normalizeMessageUsage(shape)
+    assert.equal(
+      usage.input + usage.output + usage.reasoning + usage.cacheRead + usage.cacheWrite,
+      1630,
+      `${label} spend`,
+    )
+  }
+  // A host that reports only a total: the total IS that message's billed
+  // tokens, so it feeds spend as well as context rather than leaving the spend
+  // brake dead at 0.
+  const totalOnly = { info: { tokens: { total: 120_000 } } }
+  assert.equal(totalTokensForMessage(totalOnly), 120_000)
+  assert.equal(goalSpendTokens({ usage: normalizeMessageUsage(totalOnly) }), 120_000)
+  assert.equal(normalizeMessageUsage(totalOnly).totalOnly, true)
+  // Control: a shape with components present ignores a stale/aggregate total
+  // for spend and keeps the components.
+  const both = { info: { tokens: { input: 10, output: 5, total: 999 } } }
+  assert.equal(normalizeMessageUsage(both).input, 10)
+  assert.equal(normalizeMessageUsage(both).totalOnly, false)
+})
+
+// A step boundary inside ONE assistant message, on a provider that reports no
+// cost. Before this, only a cost increase could mark a step, so an unpriced
+// provider (local models, any custom OpenAI-compatible lane) had every step
+// after the first read as a streaming delta.
+test("a new billed step is detected without a cost signal, and streaming still adds only its delta", () => {
+  const step = (input, output, cost) => ({ info: { tokens: { input, output, reasoning: 0, cache: { read: 0, write: 0 } }, cost } })
+  const usage = (m) => normalizeMessageUsage(m)
+  const empty = normalizeUsage({})
+
+  // Streaming inside one step: same prompt, output growing. NOT a new step.
+  assert.equal(usageStepStarted(usage(step(20_000, 500, 0)), usage(step(20_000, 10, 0))), false)
+  // A new step on an unpriced provider: the prompt grew by the previous step's
+  // output plus its tool result.
+  assert.equal(usageStepStarted(usage(step(24_000, 500, 0)), usage(step(20_000, 500, 0))), true)
+  // A priced provider still uses the cost signal.
+  assert.equal(usageStepStarted(usage(step(20_000, 500, 0.02)), usage(step(20_000, 500, 0.01))), true)
+  // A re-delivered OLDER reading reports SMALLER numbers and must never be read
+  // as a step, or the same step is counted twice.
+  assert.equal(usageStepStarted(usage(step(20_000, 10, 0)), usage(step(24_000, 500, 0))), false)
+  // A total-only host cannot tell the two apart at all, so it never claims one.
+  assert.equal(
+    usageStepStarted(usage({ info: { tokens: { total: 40_000 } } }), usage({ info: { tokens: { total: 20_000 } } })),
+    false,
+  )
+
+  // End to end over ten unpriced steps of one message: 20k -> 56k input,
+  // 500 output each. The cost-only rule recorded 56,500 of 385,000.
+  let total = empty
+  let previous = normalizeUsage({})
+  let expected = 0
+  for (let i = 0; i < 10; i += 1) {
+    const current = usage(step(20_000 + i * 4_000, 500, 0))
+    expected += 20_000 + i * 4_000 + 500
+    total = addUsageDelta(total, current, previous)
+    previous = current
+  }
+  assert.equal(expected, 385_000)
+  assert.equal(goalSpendTokens({ usage: total }), 385_000)
 })
 
 function textPart(text) {
@@ -301,7 +382,11 @@ async function createHooks(overrides = {}) {
           aborts.push(input)
           return {}
         }),
+      // Only wired when a test asks for it, so every other test still proves
+      // the plugin works against a host that offers neither.
+      ...(overrides.sessionGet ? { get: overrides.sessionGet } : {}),
     },
+    ...(overrides.config ? { config: overrides.config } : {}),
   }
   hooks = await GoalPlugin(
     { client },
@@ -1326,12 +1411,12 @@ test("continue message includes budget context and completion audit", () => {
     peakContextTokens: 25,
     usage: spentUsage(25),
     turnCount: 2,
-    options: normalizeOptions({ maxTokens: 100, maxTurns: 5 }),
+    options: normalizeOptions({ maxTokens: 100, maxTurns: 5, contextWindowTokens: 200_000 }),
   })
   assert.match(messageText, /<progress_budget>/)
   // Spend against the token budget...
   assert.match(messageText, /tokens_remaining: 75/)
-  // ...and peak context against the separate 200,000-token window.
+  // ...and peak context against the separate, explicitly set 200,000-token window.
   assert.match(messageText, /context_remaining: 199975/)
   assert.match(messageText, /Completion format/)
   assert.match(
@@ -5393,7 +5478,7 @@ test("formatStatus includes all key fields", () => {
   const goal = {
     condition: "ship it",
     turnCount: 3,
-    options: normalizeOptions({ maxTurns: 10, maxTokens: 200000, maxDurationMs: 300000 }),
+    options: normalizeOptions({ maxTurns: 10, maxTokens: 200000, maxDurationMs: 300000, contextWindowTokens: 200000 }),
     peakContextTokens: 50000,
     startedAt: Date.now() - 30000,
     lastProgressAt: Date.now() - 5000,
@@ -7120,7 +7205,12 @@ test("stopReason returns correct string for each limit type", () => {
   const base = {
     startedAt: Date.now(),
     peakContextTokens: 0,
-    options: normalizeOptions({ maxTurns: 5, maxDurationMs: 60000, maxTokens: 1000 }),
+    options: normalizeOptions({
+      maxTurns: 5,
+      maxDurationMs: 60000,
+      maxTokens: 1000,
+      contextWindowTokens: 200_000,
+    }),
   }
   assert.match(stopReason({ ...base, turnCount: 5 }), /max turns/)
   assert.match(stopReason({ ...base, turnCount: 4, startedAt: Date.now() - 70000 }), /max duration/)
@@ -7136,6 +7226,21 @@ test("stopReason returns correct string for each limit type", () => {
     /^context window reached \(200,000\)$/,
   )
   assert.equal(stopReason({ ...base, turnCount: 4 }), null)
+
+  // With NO context ceiling — the shipped default until the host names the
+  // model's window — no peak can trip the context brake, however large.
+  const autoWindow = { ...base, options: normalizeOptions({ maxTurns: 5, maxDurationMs: 60000, maxTokens: 1000 }) }
+  assert.equal(autoWindow.options.contextWindowTokens, 0)
+  assert.equal(stopReason({ ...autoWindow, turnCount: 4, peakContextTokens: 5_000_000 }), null)
+  // ...and the window LEARNED from the host is a real ceiling on the same goal.
+  assert.match(
+    stopReason({ ...autoWindow, turnCount: 4, peakContextTokens: 400_000, modelContextTokens: 400_000 }),
+    /^context window reached \(400,000\)$/,
+  )
+  assert.equal(
+    stopReason({ ...autoWindow, turnCount: 4, peakContextTokens: 399_999, modelContextTokens: 400_000 }),
+    null,
+  )
 })
 
 test("normalizeOptions falls back to defaults for zero, negative, and non-numeric values", () => {
@@ -10668,6 +10773,7 @@ async function createTitleHooks(overrides = {}) {
           return {}
         }),
     },
+    ...(overrides.config ? { config: overrides.config } : {}),
   }
   const hooks = await GoalPlugin(
     { client },
@@ -11438,9 +11544,13 @@ test("an unlimited turn budget never stops the goal and never warns about turns"
     stopReason({ ...base, turnCount: 10_000, usage: spentUsage(100_000_000) }),
     /^max tokens reached \(100,000,000\)$/,
   )
-  // And context pressure has its own, much lower ceiling on the same goal.
+  // And context pressure has its own, much lower ceiling on the same goal —
+  // once the host has named the model's window. Until then there is none, which
+  // is what keeps a 400k- or 1m-context model from being paused at 160k.
+  assert.equal(base.options.contextWindowTokens, 0)
+  assert.equal(stopReason({ ...base, turnCount: 10_000, peakContextTokens: 200_000 }), null)
   assert.match(
-    stopReason({ ...base, turnCount: 10_000, peakContextTokens: 200_000 }),
+    stopReason({ ...base, turnCount: 10_000, peakContextTokens: 200_000, modelContextTokens: 200_000 }),
     /^context window reached \(200,000\)$/,
   )
   // Control: a bounded budget still trips.
@@ -11583,6 +11693,9 @@ test("the budget wrap-up is reachable under the shipped defaults on all three of
     startedAt: now - elapsedMs,
     usage: spentUsage(spend),
     peakContextTokens: peak,
+    // The shipped default is AUTO: the ceiling is the model's own window, read
+    // from the host. 200,000 stands in for a model whose window the host named.
+    modelContextTokens: 200_000,
     options,
     ...extra,
   })
@@ -11597,15 +11710,35 @@ test("the budget wrap-up is reachable under the shipped defaults on all three of
   assert.equal(budgetWrapupNeeded(goal({ spend: 79_999_999 }), now), false)
   assert.equal(budgetWrapupNeeded(goal({ spend: 80_000_000 }), now), true)
 
-  // 3. Peak CONTEXT against the 200,000-token window: 160k, on the same goal
-  // and at one minute elapsed, so neither of the other two can be the cause.
+  // 3. Peak CONTEXT against the model's own 200,000-token window: 160k, on the
+  // same goal and at one minute elapsed, so neither of the other two can be the
+  // cause.
   assert.equal(budgetWrapupNeeded(goal({ elapsedMs: 60_000, peak: 159_999 }), now), false)
   assert.equal(budgetWrapupNeeded(goal({ elapsedMs: 60_000, peak: 160_000 }), now), true)
+
+  // Control, and the reason the default is AUTO rather than a constant: with no
+  // window reported, the same 160k peak is not 80 % of anything and the goal is
+  // not paused for a handoff. A fixed 200,000 default ended healthy runs on
+  // 400k- and 1m-context models at 160k, below where the host itself compacts.
+  assert.equal(
+    budgetWrapupNeeded({ ...goal({ elapsedMs: 60_000, peak: 160_000 }), modelContextTokens: 0 }, now),
+    false,
+  )
+  // ...and on the model that really is 1m wide, 160k is 16 % and nothing fires,
+  // while 800k does.
+  assert.equal(
+    budgetWrapupNeeded({ ...goal({ elapsedMs: 60_000, peak: 160_000 }), modelContextTokens: 1_000_000 }, now),
+    false,
+  )
+  assert.equal(
+    budgetWrapupNeeded({ ...goal({ elapsedMs: 60_000, peak: 800_000 }), modelContextTokens: 1_000_000 }, now),
+    true,
+  )
 
   // The two token dimensions do not bleed into each other: a saturated 200k
   // context is 0.2 % of the spend budget, and 160k of spend is 80 % of nothing
   // the context guard measures.
-  assert.equal(budgetWrapupNeeded({ ...goal({ peak: 199_000 }), options: normalizeOptions({ contextWindowTokens: 2_000_000 }) }, now), false)
+  assert.equal(budgetWrapupNeeded({ ...goal({ peak: 199_000 }), modelContextTokens: 0, options: normalizeOptions({ contextWindowTokens: 2_000_000 }) }, now), false)
   assert.equal(budgetWrapupNeeded(goal({ spend: 160_000 }), now), false)
 
   // Control: a smaller token budget fires on spend far earlier.
@@ -11700,6 +11833,9 @@ test("the sidebar panel renders the session title's own duration string, and nei
   goal.usage = spentUsage(147_000)
   goal.peakContextTokens = 147_000
   goal.turnCount = 1
+  // The ctx stat renders against the window the host reported for this goal's
+  // model, which is where the ceiling comes from under the shipped defaults.
+  goal.modelContextTokens = 200_000
 
   const at = (elapsedMs) => {
     const now = goal.startedAt + elapsedMs
@@ -11760,6 +11896,7 @@ test("the limits-are-near warning is scaled to the 8-hour window", () => {
     turnCount: 4,
     peakContextTokens: 147_000,
     usage: spentUsage(0),
+    modelContextTokens: 200_000,
     options,
     ...extra,
   })
@@ -11780,6 +11917,12 @@ test("the limits-are-near warning is scaled to the 8-hour window", () => {
   assert.match(
     buildLimitWarning(goal(15 * 60_000, { peakContextTokens: 185_000 })),
     /15,000 context token\(s\) remaining/,
+  )
+  // With no window reported there is no headroom to run out of, so the context
+  // warning cannot fire at all — including on the same 185,000-token peak.
+  assert.doesNotMatch(
+    buildLimitWarning(goal(15 * 60_000, { peakContextTokens: 185_000, modelContextTokens: 0 })),
+    /context token\(s\) remaining/,
   )
 })
 
@@ -11912,6 +12055,7 @@ test("the session title and the sidebar render spend against the token budget, w
     turnCount: 3,
     usage: spentUsage(2_400_000),
     peakContextTokens: 147_000,
+    modelContextTokens: 200_000,
     startedAt: now - 120_000,
     pausedAt: 0,
     plan: emptyPlan(),
@@ -11940,6 +12084,22 @@ test("the session title and the sidebar render spend against the token budget, w
   })
   assert.match(status, /Token spend: 2,400,000\/100,000,000/)
   assert.match(status, /Peak context: 147,000\/200,000/)
+
+  // With no window reported the ctx stat is dropped entirely rather than
+  // rendered against a ceiling of zero, and the status names the peak with an
+  // unlimited ceiling.
+  const noWindow = { ...goal, modelContextTokens: 0 }
+  const noWindowPayload = JSON.parse(JSON.stringify(buildSidebarMetadata(noWindow, now)))
+  assert.equal(noWindowPayload.context, undefined)
+  assert.deepEqual(goalPanelModel(noWindowPayload).stats, [
+    "3/∞ turns",
+    "2m/8h",
+    "2.4m/100m tokens",
+  ])
+  assert.match(
+    formatStatus({ ...noWindow, lastProgressAt: now - 1000, noProgressTurns: 0, lastStatus: "working" }),
+    /Peak context: 147,000\/∞/,
+  )
 })
 
 test("a pre-0.11.0 state record loads: totalTokens is the peak context, spend starts at zero", () => {
@@ -11964,11 +12124,37 @@ test("a pre-0.11.0 state record loads: totalTokens is the peak context, spend st
     costKnown: false,
   })
   assert.equal(goalSpendTokens(legacy), 0)
-  assert.equal(legacy.options.contextWindowTokens, 200_000, "the new option gets its default")
+  // The new option gets its default, and the default is AUTO (0): a record
+  // written before the option existed cannot be assumed to have been running on
+  // a 200,000-token model. Loading one must not invent a ceiling it was never
+  // measured against — at 165,000 peak an invented 200,000 window would put the
+  // resumed goal instantly past the 80 % wrap-up and pause it on the next turn.
+  assert.equal(legacy.options.contextWindowTokens, 0, "the new option defaults to auto-detect")
+  assert.equal(legacy.modelContextTokens, 0, "and no window has been learned yet")
   assert.equal(stopReason(legacy), null)
+  assert.equal(stopReason({ ...legacy, peakContextTokens: 10_000_000 }), null)
   assert.equal(buildLimitWarning(legacy), "")
   assert.match(formatStatus(legacy), /Token spend: 0\/200,000/)
-  assert.match(formatStatus(legacy), /Peak context: 165,000\/200,000/)
+  assert.match(formatStatus(legacy), /Peak context: 165,000\/∞/)
+  // Once the host names the model's window, the same loaded record is measured
+  // against it — that is the only thing that turns the ceiling back on.
+  assert.match(
+    stopReason({ ...legacy, modelContextTokens: 160_000 }),
+    /^context window reached \(160,000\)$/,
+  )
+  assert.equal(stopReason({ ...legacy, modelContextTokens: 180_000 }), null)
+  assert.match(formatStatus({ ...legacy, modelContextTokens: 180_000 }), /Peak context: 165,000\/180,000/)
+  // An explicitly persisted window survives the round trip and still wins.
+  assert.equal(
+    normalizePersistedGoal({
+      sessionID: "legacy-session",
+      condition: "ship it",
+      startedAt: Date.now(),
+      modelContextTokens: 400_000,
+      modelKey: "anthropic/claude-x",
+    }).modelContextTokens,
+    400_000,
+  )
 
   // The new key wins when a file written by both versions carries both.
   assert.equal(
@@ -12065,7 +12251,12 @@ test("--context-window accepts a plain, k, and m value and rejects garbage", () 
   assert.deepEqual(bad.errors, [
     "Invalid token budget for --context-window: banana (use a positive number, optionally with a k or m suffix)",
   ])
-  assert.equal(bad.options.contextWindowTokens, 200_000, "a garbage value leaves the configured default")
+  assert.equal(bad.options.contextWindowTokens, 0, "a garbage value leaves the configured default (auto)")
+  // 0 is a legal explicit value, and it means auto-detect rather than "reject".
+  const off = parse("ship it --context-window 0")
+  assert.deepEqual(off.errors, [
+    "Invalid token budget for --context-window: 0 (use a positive number, optionally with a k or m suffix)",
+  ])
 })
 
 test("the continuation message reports remaining spend and remaining context separately", () => {
@@ -12075,6 +12266,9 @@ test("the continuation message reports remaining spend and remaining context sep
     turnCount: 2,
     usage: spentUsage(30_000_000),
     peakContextTokens: 150_000,
+    // Under the shipped defaults the ceiling is the model's own window, learned
+    // from the host rather than assumed.
+    modelContextTokens: 200_000,
     options: normalizeOptions(),
   }
   const text = buildContinueMessage(goal)
@@ -12090,11 +12284,517 @@ test("the continuation message reports remaining spend and remaining context sep
   assert.match(over, /^tokens_remaining: 0$/m)
   assert.match(over, /^context_remaining: 0$/m)
 
-  // A goal record with no context ceiling at all (an embedded host that hand-
-  // builds options) falls back to the default instead of rendering NaN.
-  const noCeiling = buildContinueMessage({
-    ...goal,
-    options: { maxTurns: 0, maxTokens: 100_000_000, maxDurationMs: 60_000, warnTurnsRemaining: 3, warnTokensRemaining: 25_000, warnDurationMsRemaining: 600_000 },
-  })
+  // A goal record whose options were hand-built by an embedded host, with no
+  // contextWindowTokens key at all, still measures against the learned window
+  // rather than rendering NaN.
+  const handBuiltOptions = { maxTurns: 0, maxTokens: 100_000_000, maxDurationMs: 60_000, warnTurnsRemaining: 3, warnTokensRemaining: 25_000, warnDurationMsRemaining: 600_000 }
+  const noCeiling = buildContinueMessage({ ...goal, options: handBuiltOptions })
   assert.match(noCeiling, /^context_remaining: 50000$/m)
+
+  // And with no ceiling from either source the model is told the truth —
+  // "unlimited" — not a made-up headroom and not NaN.
+  const unlimited = buildContinueMessage({ ...goal, modelContextTokens: 0, options: handBuiltOptions })
+  assert.match(unlimited, /^context_remaining: unlimited$/m)
+  assert.doesNotMatch(unlimited, /NaN/)
+
+  // An explicit --context-window still overrides the model's own window, in
+  // both directions.
+  assert.match(
+    buildContinueMessage({ ...goal, options: normalizeOptions({ contextWindowTokens: 400_000 }) }),
+    /^context_remaining: 250000$/m,
+  )
+})
+
+// ---------------------------------------------------------------------------
+// Review follow-ups: turn aggregation and cumulative spend.
+// ---------------------------------------------------------------------------
+
+test("the turn's completion marker is read from its last text-bearing step, not the tail message", async () => {
+  const steps = [
+    turnStep("tt1", "tt-parent", { text: "Starting.", tool: true }),
+    turnStep("tt2", "tt-parent", {
+      text: "All done.\n[goal:evidence] ran npm test, 83 pass\n[goal:complete]",
+    }),
+    // The turn ENDS with a tool call carrying no text at all. Measured on a live
+    // session, 10 of 40 real turns end this way.
+    turnStep("tt3", "tt-parent", { text: null, tool: true }),
+  ]
+  assert.equal(
+    steps[2].parts.some((part) => part.type === "text"),
+    false,
+    "the fixture's tail message really has no text part",
+  )
+  assert.match(turnTerminalText(steps, steps[2]), /\[goal:complete\]$/)
+  // The control: the OLD single-message reading is `getText(latestAssistant)`,
+  // which on this turn is the empty string, so the completion was discarded.
+  assert.equal(turnTerminalText([steps[2]], steps[2]), "")
+
+  // A marker EARLIER in the turn that later text supersedes is still ignored,
+  // because the markers anchor on the final line of the terminal text.
+  const retracted = [
+    turnStep("tr1", "tr-parent", { text: "[goal:complete]" }),
+    turnStep("tr2", "tr-parent", { text: "Actually the build is still red." }),
+  ]
+  assert.equal(turnTerminalText(retracted, retracted[1]), "Actually the build is still red.")
+  assert.equal(goalIsComplete(turnTerminalText(retracted, retracted[1])), false)
+
+  // End to end through the real idle handler: the goal completes.
+  const session = "turn-terminal-text"
+  const { hooks } = await createHooks({
+    messages: async () => ({
+      data: [
+        userMessage("go", "tt-user"),
+        turnStep("tt1", "tt-parent", { text: "Starting.", tool: true, sessionID: session }),
+        turnStep("tt2", "tt-parent", {
+          text: "All done.\n[goal:evidence] ran npm test, 83 pass\n[goal:complete]",
+          sessionID: session,
+        }),
+        turnStep("tt3", "tt-parent", { text: null, tool: true, sessionID: session }),
+      ],
+    }),
+    options: { minDelayMs: 1 },
+  })
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: session, arguments: "ship it" },
+    { parts: [] },
+  )
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID: session, status: { type: "idle" } } },
+  })
+  assert.equal(currentGoal(session), null, "the marker on a non-tail step still completes the goal")
+  const statusOutput = { parts: [] }
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: session, arguments: "status" },
+    statusOutput,
+  )
+  assert.match(statusOutput.parts[0].text, /State: achieved/)
+})
+
+test("a compaction summary in the visible run ENDS the turn rather than being skipped over", () => {
+  // No user message in the list at all, so the compaction summary is the only
+  // available boundary — which is what makes this discriminating.
+  const preCompaction = turnStep("kc1", "", { text: "ran the suite", tool: true })
+  const compaction = turnStep("kc2", "", { text: "Summary so far.", compaction: true })
+  const afterCompaction = turnStep("kc3", "", { text: "Carrying on." })
+  const list = [preCompaction, compaction, afterCompaction]
+
+  const grouped = assistantMessagesForTurn(list, afterCompaction)
+  assert.deepEqual(grouped.map((m) => m.info.id), ["kc3"])
+  assert.equal(turnCallsTool(grouped), false)
+
+  // The control, and the whole point: SKIPPING the compaction message instead of
+  // stopping at it walks straight into the pre-compaction context and drags
+  // kc1's tool call into a genuinely tool-free turn, so the no-tool-call brake
+  // could never fire again after a compaction.
+  const skipped = list.filter((message) => !isCompactionAssistantMessage(message))
+  assert.deepEqual(skipped.map((m) => m.info.id), ["kc1", "kc3"])
+  assert.equal(turnCallsTool(skipped), true)
+})
+
+test("a turn sliced by the visibility window charges neither stall brake", async () => {
+  const full = [turnStep("w1", "wp", {}), turnStep("w2", "wp", {}), turnStep("w3", "wp", {})]
+  // Window full AND the turn starts at index 0: the head was cut off.
+  assert.equal(turnWasTruncated(full, full, 3), true)
+  // Window full but the turn starts later: its head is visible.
+  const withUser = [userMessage("go", "wu"), full[1], full[2]]
+  assert.equal(turnWasTruncated(withUser, [full[1], full[2]], 3), false)
+  // Window NOT full: this is the whole session, so nothing was cut. Without
+  // this clause every short list whose first entry is an assistant message
+  // scores as truncated and the brakes are disabled outright.
+  assert.equal(turnWasTruncated(full, full, 4), false)
+  assert.equal(turnWasTruncated(full, [], 3), false)
+  assert.equal(turnWasTruncated(full, full, 0), false)
+
+  // End to end: three text-only assistant messages of one turn, exactly filling
+  // the window. Nothing is charged, and the goal says why.
+  const build = (session) => (turn) => [
+    turnStep(`v1-${turn}`, `vp-${turn}`, { sessionID: session }),
+    turnStep(`v2-${turn}`, `vp-${turn}`, { sessionID: session }),
+    turnStep(`v3-${turn}`, `vp-${turn}`, { sessionID: session }),
+  ]
+  const truncated = await runIdleTurns(
+    "turn-truncated",
+    { maxRecentMessages: 3, noToolCallTurnsBeforePause: 10 },
+    build("turn-truncated"),
+  )
+  assert.equal(truncated.goal.noToolCallTurns, 0)
+  assert.equal(truncated.goal.noProgressTurns, 0)
+  assert.ok(
+    truncated.goal.history.some(
+      (entry) => entry.type === "warning" && /visibility window/.test(entry.detail),
+    ),
+    "a truncated turn is reported rather than silently un-judged",
+  )
+
+  // The control varies ONE factor — the window is one message wider, so the
+  // same three messages are no longer at its edge — and the brake charges.
+  const observed = await runIdleTurns(
+    "turn-not-truncated",
+    { maxRecentMessages: 4, noToolCallTurnsBeforePause: 10 },
+    build("turn-not-truncated"),
+  )
+  assert.ok(observed.goal.noToolCallTurns > 0)
+  assert.equal(
+    observed.goal.history.some((entry) => /visibility window/.test(entry.detail)),
+    false,
+  )
+})
+
+test("the goal plugin's own tool calls are not the turn's work", async () => {
+  for (const name of ["goal_status", "goal_plan_set", "goal_action_update", "goal_complete"]) {
+    assert.equal(isPluginOwnToolName(name), true, name)
+  }
+  // Host namespacing puts a separator in front of the tool name.
+  assert.equal(isPluginOwnToolName("opencode-goal-plugin_goal_status"), true)
+  assert.equal(isPluginOwnToolName("mcp.goal_plan_set"), true)
+  // Real work is never excluded, and a name that merely ends in these letters
+  // without a separator is real work too.
+  assert.equal(isPluginOwnToolName("bash"), false)
+  assert.equal(isPluginOwnToolName("upgoal_set"), false)
+  assert.equal(isPluginOwnToolName("goal_plan_setter"), false)
+  assert.equal(isPluginOwnToolName(""), false)
+
+  const pluginToolStep = (id, sessionID) => ({
+    info: { id, role: "assistant", sessionID, parentID: `pp-${id}`, tokens: { input: 1, output: 100, reasoning: 0 } },
+    parts: [textPart("Recording the plan."), { type: "tool", tool: "goal_plan_set", state: { status: "completed" } }],
+  })
+  // messageHasToolCall (the raw reading) still sees a tool; the WORK reading
+  // does not, which is the difference the brake now runs on.
+  assert.equal(messageHasToolCall(pluginToolStep("x", "s")), true)
+  assert.equal(messageHasWorkToolCall(pluginToolStep("x", "s")), false)
+
+  const session = "plugin-tools-are-not-work"
+  const { goal } = await runIdleTurns(
+    session,
+    { noToolCallTurnsBeforePause: 10 },
+    (turn) => [pluginToolStep(`pt-${turn}`, session)],
+  )
+  assert.ok(
+    goal.noToolCallTurns > 0,
+    "a turn that only bookkeeps against the plugin's own tools is not doing work",
+  )
+})
+
+test("a delegated child session's tokens are charged to the goal that delegated it", async () => {
+  const parents = { "child-a": "parent-a", "grandchild-a": "child-a" }
+  const getCalls = []
+  const { hooks } = await createHooks({
+    options: { minDelayMs: 1, maxTokens: 1_000_000 },
+    sessionGet: async (input) => {
+      const id = input?.sessionID || input?.path?.id
+      getCalls.push(id)
+      return { data: { id, parentID: parents[id] || "" } }
+    },
+  })
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "parent-a", arguments: "ship it" },
+    { parts: [] },
+  )
+  const deliver = (sessionID, id, input) =>
+    hooks.event({
+      event: {
+        type: "message.updated",
+        properties: { info: { id, role: "assistant", sessionID, tokens: { input, output: 100 } } },
+      },
+    })
+
+  // The control: before this existed a subagent's whole spend moved the budget
+  // by exactly zero, so an orchestrator-shaped goal could burn its real budget
+  // invisibly.
+  assert.equal(goalSpendTokens(currentGoal("parent-a")), 0)
+  await deliver("child-a", "kid-1", 30_000)
+  assert.equal(goalSpendTokens(currentGoal("parent-a")), 30_100)
+  // A grandchild walks up to the same goal.
+  await deliver("grandchild-a", "kid-2", 5_000)
+  assert.equal(goalSpendTokens(currentGoal("parent-a")), 35_200)
+  // ...and NOTHING else about a child is the parent's: its context is not the
+  // parent's context and its messages never join the parent's turn.
+  assert.equal(currentGoal("parent-a").peakContextTokens, 0)
+
+  // A session with no goal anywhere in its ancestry is ignored, and its
+  // unanswerable parent is remembered rather than re-probed per message.
+  await deliver("orphan-a", "kid-3", 9_000)
+  await deliver("orphan-a", "kid-4", 9_000)
+  assert.equal(goalSpendTokens(currentGoal("parent-a")), 35_200)
+  assert.equal(getCalls.filter((id) => id === "orphan-a").length, 1)
+  assert.equal(getCalls.filter((id) => id === "child-a").length, 1)
+})
+
+test("a message counted before a restart is not billed again when the host re-delivers it", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "goal-spend-dedupe-"))
+  const stateFilePath = join(dir, "state.json")
+  try {
+    const client = {
+      app: { log: async () => {} },
+      session: {
+        messages: async () => ({ data: [message("still working")] }),
+        promptAsync: async () => ({}),
+      },
+    }
+    const options = { persistState: true, stateFilePath, minDelayMs: 1, maxTokens: 1_000_000 }
+    const updated = (id, input) => ({
+      event: {
+        type: "message.updated",
+        properties: {
+          info: { id, role: "assistant", sessionID: "spend-dedupe", tokens: { input, output: 100 } },
+        },
+      },
+    })
+
+    const first = await GoalPlugin({ client }, options)
+    await first["command.execute.before"](
+      { command: "goal", sessionID: "spend-dedupe", arguments: "ship it" },
+      { parts: [] },
+    )
+    await first.event(updated("dedupe-1", 30_000))
+    assert.equal(goalSpendTokens(currentGoal("spend-dedupe")), 30_100)
+    await first.dispose()
+
+    const second = await GoalPlugin({ client }, options)
+    await second["command.execute.before"](
+      { command: "goal", sessionID: "spend-dedupe", arguments: "status" },
+      { parts: [] },
+    )
+    assert.equal(goalSpendTokens(currentGoal("spend-dedupe")), 30_100)
+    // The per-process seenUsage map is empty after a restart, so without the
+    // messageIDs cross-check this re-delivery reads as a brand-new message and
+    // bills the same 30,100 tokens a second time — against a brake that pauses
+    // the run.
+    await second.event(updated("dedupe-1", 30_000))
+    assert.equal(goalSpendTokens(currentGoal("spend-dedupe")), 30_100)
+    // A genuinely new message after the restart still accrues.
+    await second.event(updated("dedupe-2", 10_000))
+    assert.equal(goalSpendTokens(currentGoal("spend-dedupe")), 40_200)
+    await second.dispose()
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("a message still streaming across a compaction keeps billing without re-inflating the peak", async () => {
+  const session = "spend-straddles-compaction"
+  const { hooks } = await createHooks({ options: { minDelayMs: 1, maxTokens: 1_000_000 } })
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: session, arguments: "ship it" },
+    { parts: [] },
+  )
+  const updated = (output) =>
+    hooks.event({
+      event: {
+        type: "message.updated",
+        properties: {
+          info: { id: "straddle-1", role: "assistant", sessionID: session, tokens: { input: 30_000, output } },
+        },
+      },
+    })
+
+  await updated(100)
+  assert.equal(goalSpendTokens(currentGoal(session)), 30_100)
+  assert.equal(currentGoal(session).peakContextTokens, 30_100)
+
+  await hooks.event({ event: { type: "session.compacted", properties: { sessionID: session } } })
+  assert.equal(currentGoal(session).peakContextTokens, 0)
+
+  // The same message keeps streaming and reports 300 more billed output tokens.
+  // The stale-re-delivery guard is a CONTEXT guard: returning early on it threw
+  // these away, so real billed tokens went unbilled whenever a message was in
+  // flight across a compaction.
+  await updated(400)
+  assert.equal(goalSpendTokens(currentGoal(session)), 30_400)
+  assert.equal(
+    currentGoal(session).peakContextTokens,
+    0,
+    "but the pre-compaction message must never become the new peak",
+  )
+})
+
+test("the context ceiling is learned from the model the goal is running on", async () => {
+  const catalogCalls = []
+  const session = "model-window"
+  const assistant = {
+    info: {
+      id: "mw-1",
+      role: "assistant",
+      sessionID: session,
+      providerID: "anthropic",
+      modelID: "claude-sonnet-4-5",
+      tokens: { input: 10, output: 100, reasoning: 0 },
+    },
+    parts: [textPart("still working")],
+  }
+  const { hooks } = await createHooks({
+    messages: async () => ({ data: [assistant] }),
+    options: { minDelayMs: 1 },
+    config: {
+      providers: async () => {
+        catalogCalls.push(1)
+        return {
+          data: {
+            providers: [
+              { id: "anthropic", models: { "claude-sonnet-4-5": { limit: { context: 1_000_000, output: 64_000 } } } },
+              { id: "other", models: {} },
+            ],
+          },
+        }
+      },
+    },
+  })
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: session, arguments: "ship it" },
+    { parts: [] },
+  )
+  const before = currentGoal(session)
+  assert.equal(before.options.contextWindowTokens, 0, "the shipped default detects instead of assuming")
+  assert.equal(before.modelContextTokens, 0)
+  assert.equal(contextWindowLimit(before), 0)
+
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID: session, status: { type: "idle" } } },
+  })
+  const goal = currentGoal(session)
+  assert.equal(goal.modelKey, "anthropic/claude-sonnet-4-5")
+  assert.equal(goal.modelContextTokens, 1_000_000)
+  assert.equal(contextWindowLimit(goal), 1_000_000)
+
+  // The reason the fixed 200,000 default had to go: on this model a 160,000
+  // peak is 16 % of the window, and the 80 % wrap-up PAUSES the goal.
+  const now = Date.now()
+  const at = (peak, window) => ({
+    budgetWrapupSent: false,
+    startedAt: now,
+    usage: spentUsage(0),
+    peakContextTokens: peak,
+    modelContextTokens: window,
+    options: goal.options,
+  })
+  assert.equal(budgetWrapupNeeded(at(160_000, 1_000_000), now), false)
+  assert.equal(budgetWrapupNeeded(at(160_000, 200_000), now), true)
+  assert.equal(budgetWrapupNeeded(at(800_000, 1_000_000), now), true)
+
+  // The catalog is read once per plugin instance, not once per turn.
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID: session, status: { type: "idle" } } },
+  })
+  assert.equal(catalogCalls.length, 1)
+})
+
+test("a host that cannot name the model's window leaves the goal with no context ceiling", async () => {
+  const session = "model-window-failopen"
+  const assistant = {
+    info: {
+      id: "mwf-1",
+      role: "assistant",
+      sessionID: session,
+      providerID: "anthropic",
+      modelID: "claude-sonnet-4-5",
+      tokens: { input: 10, output: 100, reasoning: 0 },
+    },
+    parts: [textPart("still working")],
+  }
+  const logs = []
+  const { hooks } = await createHooks({
+    messages: async () => ({ data: [assistant] }),
+    options: { minDelayMs: 1 },
+    log: async (input) => {
+      logs.push(input)
+    },
+    config: {
+      providers: async () => {
+        throw new Error("catalog unavailable")
+      },
+    },
+  })
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: session, arguments: "ship it" },
+    { parts: [] },
+  )
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID: session, status: { type: "idle" } } },
+  })
+  const goal = currentGoal(session)
+  assert.ok(goal, "a catalog failure must never stop the goal")
+  assert.equal(goal.modelContextTokens, 0)
+  assert.equal(contextWindowLimit(goal), 0)
+  assert.equal(stopReason({ ...goal, peakContextTokens: 10_000_000 }), null)
+  assert.ok(
+    logs.some((entry) => /context-window ceiling|model catalog/i.test(JSON.stringify(entry))),
+    "and it is reported once rather than swallowed",
+  )
+
+  // A host with no config API at all takes the same path.
+  const { hooks: bare } = await createHooks({
+    messages: async () => ({ data: [assistant] }),
+    options: { minDelayMs: 1 },
+  })
+  await bare["command.execute.before"](
+    { command: "goal", sessionID: "model-window-none", arguments: "ship it" },
+    { parts: [] },
+  )
+  await bare.event({
+    event: {
+      type: "session.status",
+      properties: { sessionID: "model-window-none", status: { type: "idle" } },
+    },
+  })
+  assert.equal(currentGoal("model-window-none").modelContextTokens, 0)
+})
+
+test("the terminal sidebar render keeps the context ceiling learned from the model", async () => {
+  const session = "sidebar-model-window"
+  let turn = 0
+  const assistant = () => ({
+    info: {
+      id: `tw-${turn}`,
+      role: "assistant",
+      sessionID: session,
+      providerID: "anthropic",
+      modelID: "claude-sonnet-4-5",
+      tokens: { input: 147_000, output: 100, reasoning: 0 },
+    },
+    parts: [
+      textPart(
+        turn === 0
+          ? "still working"
+          : "Shipped.\n[goal:evidence] the suite is green\n[goal:complete]",
+      ),
+    ],
+  })
+  const { hooks, updates } = await createTitleHooks({
+    messages: async () => ({ data: [assistant()] }),
+    config: {
+      providers: async () => ({
+        data: {
+          providers: [
+            { id: "anthropic", models: { "claude-sonnet-4-5": { limit: { context: 1_000_000 } } } },
+          ],
+        },
+      }),
+    },
+  })
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: session, arguments: "ship it" },
+    { parts: [] },
+  )
+  await hooks.event({
+    event: {
+      type: "message.updated",
+      properties: { info: { id: "tw-peak", role: "assistant", sessionID: session, tokens: { input: 147_000, output: 100 } } },
+    },
+  })
+  const idle = {
+    event: { type: "session.status", properties: { sessionID: session, status: { type: "idle" } } },
+  }
+  await hooks.event(idle)
+  const running = updates.at(-1).body.metadata.goal
+  assert.deepEqual(running.context, { used: 147_100, max: 1_000_000 })
+
+  turn = 1
+  await hooks.event(idle)
+  assert.equal(currentGoal(session), null, "the goal was archived")
+  const finished = updates.at(-1).body.metadata.goal
+  assert.equal(finished.state, "completed")
+  // The window lives on the goal, not in its options, so the terminal snapshot
+  // has to carry it; otherwise the last render a user sees drops the ctx stat
+  // that every earlier render had.
+  assert.deepEqual(finished.context, { used: 147_100, max: 1_000_000 })
 })

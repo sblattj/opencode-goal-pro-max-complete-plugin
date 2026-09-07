@@ -25,6 +25,7 @@ import {
   formatTurnBudget,
   formatTurnLimit,
   isUnlimitedTurnBudget,
+  UNLIMITED_MARK,
   UNLIMITED_WORD,
 } from "./goal-format.js"
 import {
@@ -74,6 +75,13 @@ const MAX_PERSISTED_ENTRIES = 2000
 const MAX_LIVE_GOALS_PER_SESSION = 100
 const MAX_MESSAGE_IDS_PER_GOAL = 2000
 const MAX_TRACKED_MESSAGE_IDS = 20_000
+// Child/subagent sessions whose parent link is remembered, and how far up that
+// chain a delegated message is attributed. Both are bounded because a long-lived
+// server sees unboundedly many sessions and a cycle in a host's parent links
+// must not become an infinite walk.
+const MAX_TRACKED_SESSION_PARENTS = 2_000
+const MAX_DELEGATED_SESSION_DEPTH = 8
+const MAX_TRACKED_MODEL_WINDOWS = 256
 const MAX_PENDING_COMMAND_TURNS_PER_SESSION = 8
 const COMMAND_TURN_TTL_MS = 5 * 60 * 1000
 const DEFAULT_LEDGER_MAX_BYTES = 2 * 1024 * 1024
@@ -132,12 +140,21 @@ const DEFAULT_OPTIONS = {
   // spend and context are different quantities: `goal.peakContextTokens` is the
   // largest single-message context the goal has seen (the `Math.max` in the
   // token tracker), which the model bounds and which a compaction resets to
-  // zero, while spend only ever grows. 200,000 is the common model window;
-  // pass `--context-window 1m` on a wider model.
+  // zero, while spend only ever grows.
+  //
+  // 0 means AUTO, and is the default. A FIXED default ceiling is a trap: at
+  // `budgetWrapupRatio` the goal is PAUSED for a handoff, so a 200,000 default
+  // ends a healthy run at 160,000 peak on a 400k- or 1m-context model — below
+  // the point where OpenCode itself would have compacted, which resets the
+  // peak. So the ceiling is the model's OWN window, read from the host
+  // (`client.config.providers()` -> `models[id].limit.context`) on the first
+  // idle of the run. Until the host reports one there is NO context ceiling,
+  // which is exactly the 0.10.x behaviour. `--context-window 400k` overrides
+  // both.
   maxTurns: 0,
   maxDurationMs: 8 * 60 * 60 * 1000,
   maxTokens: 100000000,
-  contextWindowTokens: 200000,
+  contextWindowTokens: 0,
   minDelayMs: 1500,
   maxRecentMessages: 200,
   noProgressTokenThreshold: 50,
@@ -333,6 +350,56 @@ const TOOL_PART_TYPES = new Set(["tool", "tool-invocation", "subtask", "tool_use
 function messageHasToolCall(message) {
   const parts = Array.isArray(message?.parts) ? message.parts : []
   return parts.some((part) => part && TOOL_PART_TYPES.has(part.type))
+}
+
+// THE PLUGIN'S OWN TOOLS ARE NOT WORK.
+//
+// The no-tool-call brake asks "did this turn touch a tool?", and until now any
+// tool part answered yes — including `goal_status`, which does nothing but read
+// the goal the brake is protecting. A model that calls `goal_status` once per
+// turn therefore held the brake off forever, and since 0.11.0 defaults the turn
+// budget to unlimited there is no longer a `max turns reached` backstop behind
+// it: the blast radius of that loop went from 10 turns to the 8-hour clock.
+// Bookkeeping against the goal is not progress toward it, so these names are
+// excluded from the "did real work" test — and only from that test.
+// `messageHasToolCall` keeps its literal meaning for every other caller.
+const PLUGIN_TOOL_NAMES = new Set([
+  "goal_status",
+  "goal_set",
+  "goal_pause",
+  "goal_resume",
+  "goal_block",
+  "goal_complete",
+  "goal_plan_get",
+  "goal_plan_set",
+  "goal_action_update",
+])
+
+function toolPartName(part) {
+  const raw = part?.tool ?? part?.toolName ?? part?.name ?? part?.tool_name
+  return typeof raw === "string" ? raw.trim().toLowerCase() : ""
+}
+
+// Hosts may namespace a plugin tool (`opencode-goal-plugin_goal_status`,
+// `mcp.goal_status`), so a suffix behind a non-alphanumeric separator counts
+// too. A tool merely ENDING in one of these names (`my_goal_set`) is
+// deliberately included: the separator test is what keeps `upgoal_set` out.
+function isPluginOwnToolName(name) {
+  if (!name) return false
+  if (PLUGIN_TOOL_NAMES.has(name)) return true
+  for (const tool of PLUGIN_TOOL_NAMES) {
+    if (!name.endsWith(tool) || name.length === tool.length) continue
+    if (/[^a-z0-9]/.test(name.charAt(name.length - tool.length - 1))) return true
+  }
+  return false
+}
+
+function messageHasWorkToolCall(message) {
+  const parts = Array.isArray(message?.parts) ? message.parts : []
+  return parts.some(
+    (part) =>
+      part && TOOL_PART_TYPES.has(part.type) && !isPluginOwnToolName(toolPartName(part)),
+  )
 }
 
 const GOAL_MODES = new Set(["normal", "ordered"])
@@ -652,6 +719,12 @@ function buildSidebarTerminal(goal, state, finishedAt) {
     plan: goal.plan,
     turnCount: goal.turnCount,
     peakContextTokens: goal.peakContextTokens,
+    // ...and the ceiling that peak is measured against. Under the shipped
+    // defaults the context window is AUTO, so the limit lives on the goal
+    // rather than in its options; without carrying it the final render of a
+    // finished goal would silently drop the ctx stat every earlier render had.
+    modelContextTokens: goal.modelContextTokens,
+    modelKey: goal.modelKey,
     // The terminal render goes through the same renderers as a live goal, and
     // they read spend out of `usage`. Without it a finished goal would render
     // `0/100m` tokens.
@@ -735,11 +808,17 @@ function buildSidebarMetadata(goal, now = Date.now(), context = {}) {
     // the context. `147k/100m` in the panel means "147k spent of a 100m budget".
     tokens: { used: goalSpendTokens(goal), max: goal.options.maxTokens },
     // Context pressure: the peak single-message context against the model's
-    // window. A compaction resets `used`; spend never goes down.
-    context: {
-      used: toNonNegativeInteger(goal.peakContextTokens),
-      max: contextWindowLimit(goal),
-    },
+    // window. A compaction resets `used`; spend never goes down. Omitted
+    // entirely when no ceiling is known, because `max: 0` would render as a
+    // budget of zero; the panel already drops the stat when the key is absent.
+    ...(contextWindowLimit(goal) > 0
+      ? {
+          context: {
+            used: toNonNegativeInteger(goal.peakContextTokens),
+            max: contextWindowLimit(goal),
+          },
+        }
+      : {}),
     plan: {
       total: progress.total,
       verified: progress.verified,
@@ -1109,7 +1188,7 @@ function formatStatus(
   lines.push(
     `Auto-continues sent: ${formatTurnBudget(goal.turnCount, goal.options.maxTurns)}`,
     `Token spend: ${goalSpendTokens(goal).toLocaleString()}/${goal.options.maxTokens.toLocaleString()}`,
-    `Peak context: ${toNonNegativeInteger(goal.peakContextTokens).toLocaleString()}/${contextWindowLimit(goal).toLocaleString()}`,
+    `Peak context: ${formatContextBudget(goal)}`,
     formatUsage(goal.usage),
     `Elapsed: ${elapsed}s (${formatBudgetDuration(elapsedMs)}/${formatBudgetDuration(goal.options.maxDurationMs)})`,
     `Last progress: ${lastProgress}`,
@@ -1188,8 +1267,10 @@ function stopReason(goal) {
   }
   // Context pressure is its own brake, on its own measure: spend only grows,
   // while the peak context is bounded by the model and reset by a compaction.
-  if (toNonNegativeInteger(goal.peakContextTokens) >= contextWindowLimit(goal)) {
-    return `context window reached (${contextWindowLimit(goal).toLocaleString()})`
+  // A ceiling of 0 is "unknown / auto" and can never be reached.
+  const contextWindow = contextWindowLimit(goal)
+  if (contextWindow > 0 && toNonNegativeInteger(goal.peakContextTokens) >= contextWindow) {
+    return `context window reached (${contextWindow.toLocaleString()})`
   }
   return null
 }
@@ -1596,10 +1677,12 @@ function normalizeOptions(options = {}) {
     maxTurns: toTurnBudget(options.maxTurns, DEFAULT_OPTIONS.maxTurns),
     maxDurationMs: toPositiveInteger(options.maxDurationMs, DEFAULT_OPTIONS.maxDurationMs),
     maxTokens: toPositiveInteger(options.maxTokens, DEFAULT_OPTIONS.maxTokens),
-    contextWindowTokens: toPositiveInteger(
-      options.contextWindowTokens,
-      DEFAULT_OPTIONS.contextWindowTokens,
-    ),
+    // 0 is kept verbatim: it is the "auto / no fixed ceiling" value, not a
+    // missing one, and it is the default.
+    contextWindowTokens:
+      Number.isSafeInteger(options.contextWindowTokens) && options.contextWindowTokens >= 0
+        ? options.contextWindowTokens
+        : DEFAULT_OPTIONS.contextWindowTokens,
     minDelayMs: toPositiveInteger(options.minDelayMs, DEFAULT_OPTIONS.minDelayMs),
     maxRecentMessages: toPositiveInteger(
       options.maxRecentMessages,
@@ -1863,6 +1946,15 @@ function normalizePersistedGoal(rawGoal) {
     peakContextTokens: toNonNegativeInteger(
       rawGoal.peakContextTokens ?? rawGoal.totalTokens,
     ),
+    // A pre-0.11.0 record carries a peak but no model window, and the context
+    // guard must not fire on a number that was never measured against one: with
+    // no window there is no ceiling, and the real one is relearned from the
+    // host on the first idle after the upgrade.
+    modelContextTokens: toNonNegativeInteger(rawGoal.modelContextTokens),
+    modelKey:
+      typeof rawGoal.modelKey === "string" && rawGoal.modelKey.length <= MAX_GOAL_META_LENGTH
+        ? rawGoal.modelKey
+        : "",
     usage: normalizeUsage(rawGoal.usage),
     options: normalizeOptions(isPlainObject(rawGoal.options) ? rawGoal.options : {}),
     lastStatus: typeof rawGoal.lastStatus === "string" ? rawGoal.lastStatus : "Goal recovered.",
@@ -2734,7 +2826,8 @@ function buildLimitWarning(goal) {
   const remainingTurns = goal.options.maxTurns - goal.turnCount
   const remainingMs = goal.options.maxDurationMs - (Date.now() - goal.startedAt)
   const remainingTokens = goal.options.maxTokens - goalSpendTokens(goal)
-  const remainingContext = contextWindowLimit(goal) - toNonNegativeInteger(goal.peakContextTokens)
+  const contextWindow = contextWindowLimit(goal)
+  const remainingContext = contextWindow - toNonNegativeInteger(goal.peakContextTokens)
   const warnings = []
 
   // An unlimited turn budget has nothing to run out of, so it never warns.
@@ -2748,7 +2841,8 @@ function buildLimitWarning(goal) {
     warnings.push(`${Math.max(0, remainingTokens).toLocaleString()} budget token(s) remaining`)
   }
   // Same headroom, measured against the context window rather than the budget.
-  if (remainingContext <= goal.options.warnTokensRemaining) {
+  // No known window means no headroom to run out of, so it never warns.
+  if (contextWindow > 0 && remainingContext <= goal.options.warnTokensRemaining) {
     warnings.push(`${Math.max(0, remainingContext).toLocaleString()} context token(s) remaining`)
   }
 
@@ -2842,10 +2936,11 @@ function buildContinueMessage(
   } = {},
 ) {
   const remainingTokens = Math.max(0, goal.options.maxTokens - goalSpendTokens(goal))
-  const remainingContext = Math.max(
-    0,
-    contextWindowLimit(goal) - toNonNegativeInteger(goal.peakContextTokens),
-  )
+  const contextWindow = contextWindowLimit(goal)
+  const remainingContext =
+    contextWindow > 0
+      ? Math.max(0, contextWindow - toNonNegativeInteger(goal.peakContextTokens))
+      : UNLIMITED_WORD
   const remainingTurns = isUnlimitedTurnBudget(goal.options.maxTurns)
     ? UNLIMITED_WORD
     : Math.max(0, goal.options.maxTurns - goal.turnCount)
@@ -2963,7 +3058,7 @@ function buildCompactionContext(goal) {
     "The summary below is reconstructed deterministically from the plugin's persisted goal record, not from chat memory.",
     buildGoalBlock(goal),
     `Goal status: ${goal.stopped ? goal.stopReason || "stopped" : "active"}.`,
-    `Auto-continues used: ${formatTurnBudget(goal.turnCount, goal.options.maxTurns)}. Token spend: ${goalSpendTokens(goal)}/${goal.options.maxTokens}. Peak context: ${toNonNegativeInteger(goal.peakContextTokens)}/${contextWindowLimit(goal)}. Elapsed: ${elapsedSeconds}s.`,
+    `Auto-continues used: ${formatTurnBudget(goal.turnCount, goal.options.maxTurns)}. Token spend: ${goalSpendTokens(goal)}/${goal.options.maxTokens}. Peak context: ${formatContextBudget(goal)}. Elapsed: ${elapsedSeconds}s.`,
     goal.lastCheckpoint ? `Latest checkpoint: ${escapeGoalText(summarizeText(goal.lastCheckpoint.summary, 200))}` : null,
     ...buildCompactionProgressSummary(goal),
     // Plan STATE only. The full plan contract and the CEV rule ride in the
@@ -3055,21 +3150,57 @@ function emptyUsage() {
   return { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0, costKnown: false }
 }
 
-// Normalize both current OpenCode message info and the flattened shapes used by
-// older SDK adapters. Invalid provider values are ignored so diagnostics can
-// never corrupt budget enforcement or persisted state.
-function normalizeMessageUsage(message) {
+// ONE reader for every spelling of a message's token counts.
+//
+// Current OpenCode always sends the nested shape
+// `{input, output, reasoning, cache: {read, write}}`, but older SDK adapters
+// flatten the cache fields (`cacheRead` / `cache_read`) or report only a
+// `total`. Two readers that accept different spellings silently disagree — the
+// spend brake reading one shape and the context guard the other, so on a
+// flattened host the context guard measured ~0.6 % of the real context while
+// on a total-only host the spend brake measured nothing at all. Both go
+// through this, so a shape either moves both brakes or neither.
+//
+// Invalid provider values are ignored so diagnostics can never corrupt budget
+// enforcement or persisted state.
+function messageTokenCounts(message) {
   const tokens = messageTokens(message)
   const cache = isPlainObject(tokens.cache) ? tokens.cache : {}
-  const rawCost = message?.info?.cost ?? message?.cost
-  return {
+  const counts = {
     input: toNonNegativeInteger(tokens.input),
     output: toNonNegativeInteger(tokens.output),
     reasoning: toNonNegativeInteger(tokens.reasoning),
     cacheRead: toNonNegativeInteger(cache.read ?? tokens.cacheRead ?? tokens.cache_read),
     cacheWrite: toNonNegativeInteger(cache.write ?? tokens.cacheWrite ?? tokens.cache_write),
+    total: toNonNegativeInteger(tokens.total),
+  }
+  const components =
+    counts.input + counts.output + counts.reasoning + counts.cacheRead + counts.cacheWrite
+  // A host that reports ONLY a total still has to move both brakes. A
+  // message's `total` is its own billed input+output+cache for that step, so
+  // attributing it to `input` is the faithful spend contribution for that
+  // message, not an inflation — and it is what the context measure reads too.
+  if (components === 0 && counts.total > 0) {
+    counts.input = counts.total
+    // Recorded because a total is the one shape that cannot tell a new step
+    // apart from the same one growing — see usageStepStarted.
+    counts.totalOnly = true
+  }
+  return counts
+}
+
+function normalizeMessageUsage(message) {
+  const counts = messageTokenCounts(message)
+  const rawCost = message?.info?.cost ?? message?.cost
+  return {
+    input: counts.input,
+    output: counts.output,
+    reasoning: counts.reasoning,
+    cacheRead: counts.cacheRead,
+    cacheWrite: counts.cacheWrite,
     cost: Number.isFinite(Number(rawCost)) && Number(rawCost) >= 0 ? Number(rawCost) : 0,
     costKnown: rawCost !== undefined && Number.isFinite(Number(rawCost)) && Number(rawCost) >= 0,
+    totalOnly: counts.totalOnly === true,
   }
 }
 
@@ -3082,11 +3213,49 @@ function normalizeUsage(value) {
   return usage
 }
 
+// Did this reading of a message begin a NEW BILLED STEP, or is it the same
+// step streaming?
+//
+// OpenCode runs many LLM steps inside ONE assistant message and, per step,
+// ACCUMULATES `cost` while REPLACING `tokens`
+// (`assistantMessage.cost += usage.cost, assistantMessage.tokens = usage.tokens`
+// in the shipped host). So a step's token counts are only recoverable through
+// the cost signal — and a provider with no pricing metadata reports `cost: 0`
+// forever (`@ai-sdk/openai-compatible` defaults every price to 0), which
+// covers local models and any custom OpenAI-compatible lane. On those the cost
+// signal never fires, every step after the first was read as a streaming delta,
+// and a 10-step turn recorded 56,500 of 385,000 tokens — a 6.8x undercount of
+// the quantity `maxTokens` is supposed to bound.
+//
+// With no usable cost, the PROMPT SIZE is the signal: within one step the
+// prompt is fixed, so `input` and the cache counts do not move while `output`
+// streams; a new step's prompt carries the previous step's output and its tool
+// result, so its input (or its cache read) is strictly larger. Only that
+// monotone growth counts — a host re-delivering an OLDER reading of the same
+// message reports SMALLER numbers, and reading that as a step boundary would
+// add a step's tokens twice.
+//
+// A new step whose input is byte-identical to the previous one is still read as
+// streaming: it undercounts rather than double counts, which is the safe
+// direction for a brake that pauses a run.
+function usageStepStarted(current, previous) {
+  if (previous.cost > 0 && current.cost > previous.cost) return true
+  // A host that reports only a `total` offers no way to tell a new step from
+  // the same one growing — the total is replaced per step AND grows within
+  // one — so it is always read as growth, for the same reason.
+  if (current.totalOnly === true || previous.totalOnly === true) return false
+  return (
+    current.input > previous.input ||
+    current.cacheRead > previous.cacheRead ||
+    current.cacheWrite > previous.cacheWrite
+  )
+}
+
 function addUsageDelta(total, current, previous) {
   const next = normalizeUsage(total)
-  const completedAnotherStep = previous.cost > 0 && current.cost > previous.cost
+  const startedAnotherStep = usageStepStarted(current, previous)
   for (const field of USAGE_TOKEN_FIELDS) {
-    next[field] += completedAnotherStep
+    next[field] += startedAnotherStep
       ? current[field]
       : Math.max(0, current[field] - previous[field])
   }
@@ -3116,36 +3285,41 @@ function goalSpendTokens(goal) {
   return spend
 }
 
-// The context-pressure ceiling for a goal. Every production path runs its
-// options through `normalizeOptions`, which always sets this, but a goal record
-// hand-built by an embedded host (or a fixture) can omit it — and an absent
-// ceiling must fall back to the default rather than render `NaN` into a prompt.
+// The context-pressure ceiling for a goal, in precedence order:
+//   1. an explicit `contextWindowTokens` (the `--context-window` flag, the
+//      plugin option, or `goal_set`), which always wins;
+//   2. `goal.modelContextTokens` — the window the HOST reports for the model
+//      this goal is actually running on, learned on the first idle;
+//   3. 0, meaning NO context ceiling: nothing to compare against, so no
+//      context stop, no context wrap-up, no context warning and no `ctx` stat.
+// Every consumer must treat 0 as "unbounded"; a hand-built goal record from an
+// embedded host or a fixture reaches that branch too, and must render a ceiling
+// word rather than `NaN`.
 function contextWindowLimit(goal) {
-  return toPositiveInteger(
-    goal?.options?.contextWindowTokens,
-    DEFAULT_OPTIONS.contextWindowTokens,
-  )
+  const configured = toNonNegativeInteger(goal?.options?.contextWindowTokens)
+  if (configured > 0) return configured
+  return toNonNegativeInteger(goal?.modelContextTokens)
 }
 
-function cacheTokensForMessage(tokens) {
-  // OpenCode reports cached context separately as `cache: { read, write }`.
-  // On cache-heavy providers (e.g. Anthropic prompt caching) most of the
-  // conversation context arrives as `cache.read` with a small `input`, so the
-  // cache fields must be counted toward the context-window estimate or the
-  // token budget is undercounted by an order of magnitude.
-  const cache = isPlainObject(tokens.cache) ? tokens.cache : {}
-  return toNonNegativeInteger(cache.read) + toNonNegativeInteger(cache.write)
+// `147,000/200,000`, or `147,000/∞` when no ceiling is known.
+function formatContextBudget(goal) {
+  const limit = contextWindowLimit(goal)
+  const used = toNonNegativeInteger(goal?.peakContextTokens).toLocaleString()
+  return `${used}/${limit > 0 ? limit.toLocaleString() : UNLIMITED_MARK}`
 }
 
+// A single message's CONTEXT size — the quantity `peakContextTokens` takes the
+// maximum of. OpenCode reports cached context separately as
+// `cache: { read, write }`; on cache-heavy providers (e.g. Anthropic prompt
+// caching) most of the conversation arrives as `cache.read` with a small
+// `input`, so the cache fields must be counted or the context is undercounted
+// by an order of magnitude. Flattened and total-only shapes are handled by
+// `messageTokenCounts`, the same reader the spend accumulator uses.
 function totalTokensForMessage(message) {
-  const tokens = messageTokens(message)
-  const reportedTotal = toNonNegativeInteger(tokens.total)
-  if (reportedTotal > 0) return reportedTotal
+  const counts = messageTokenCounts(message)
+  if (counts.total > 0) return counts.total
   return (
-    toNonNegativeInteger(tokens.input) +
-    toNonNegativeInteger(tokens.output) +
-    toNonNegativeInteger(tokens.reasoning) +
-    cacheTokensForMessage(tokens)
+    counts.input + counts.output + counts.reasoning + counts.cacheRead + counts.cacheWrite
   )
 }
 
@@ -3265,9 +3439,10 @@ function messageParentID(message) {
 // OpenCode creates a NEW assistant message for every LLM step of a single
 // prompt: the step loop in `packages/opencode/src/session/prompt.ts` at
 // :1088 builds `const msg: SessionV1.Assistant = { id: MessageID.ascending(),
-// parentID: lastUser.id, role: "assistant", … }` at :1187-1201 and persists it
-// with `sessions.updateMessage(msg)` at :1202 (verified against a source
-// checkout of 1.18.29). So a continuation turn that runs tools and then writes
+// parentID: lastUser.id, role: "assistant", … }` at :1186-1200 and persists it
+// with `sessions.updateMessage(msg)` at :1201 (line numbers re-derived against
+// a source checkout of 1.18.29; note the SECOND, unrelated
+// `const msg: SessionV1.Assistant` at :489 whose persist is at :503). So a continuation turn that runs tools and then writes
 // its summary is several assistant messages sharing one `parentID` — the
 // user/continuation message they all answer. The steps that called tools end
 // with finish reason "tool-calls"; the closing summary is a SEPARATE,
@@ -3287,8 +3462,14 @@ function messageParentID(message) {
 //      compaction messages;
 //   3. no parentID at all (older hosts, embedded clients) -> the contiguous
 //      run of assistant-role messages ending at the latest assistant, i.e.
-//      everything after the last non-assistant message, minus compaction
-//      messages.
+//      everything after the last non-assistant message OR compaction summary.
+//
+// The fallback needs SOME boundary in the visible list. A host that reports no
+// `parentID` and returns no user messages either (no such host is known;
+// OpenCode 1.18.29 does both) would present its whole visible list as one turn,
+// and a single ancient tool call in it would hold the no-tool-call brake off
+// forever. That is the latent cost of rule 3 and the reason rule 2 is tried
+// first.
 // Pure: no runtime state, no host calls, no mutation of its input.
 function assistantMessagesForTurn(messages, latestAssistant) {
   if (!latestAssistant) return []
@@ -3319,13 +3500,36 @@ function assistantMessagesForTurn(messages, latestAssistant) {
   for (let i = index; i >= 0; i -= 1) {
     const message = list[i]
     // A non-assistant message (the user prompt this turn answers) ends the run.
-    // A compaction assistant is assistant-role, so it does not end the run, but
-    // it is never part of the turn's work.
+    // So does a compaction summary: it is assistant-role, but everything before
+    // it belongs to the pre-compaction context, and walking THROUGH it merged
+    // two turns — a genuinely tool-free turn inherited the previous turn's tool
+    // call and the no-tool-call brake could never fire.
     if (messageRole(message) !== "assistant") break
-    if (isCompactionAssistantMessage(message)) continue
+    if (isCompactionAssistantMessage(message)) break
     run.push(message)
   }
   return run.reverse()
+}
+
+// Was the turn SLICED by the visibility window?
+//
+// `assistantMessagesForTurn` groups only over what `maxRecentMessages` made
+// visible. A turn whose tool-bearing head fell outside that window scores as
+// "talk only" — the exact false positive the grouping exists to remove, by
+// another route — and its output tokens are undercounted too.
+//
+// Two conditions, and BOTH are required. The window must be FULL, because a
+// list shorter than the limit is the whole session and nothing was cut; and the
+// turn must start at index 0 of that full list, because in a complete view a
+// turn is always preceded by the user message it answers. A truncated turn
+// charges neither stall brake — and does not clear them either, since nothing
+// about it was actually observed.
+function turnWasTruncated(messages, turnMessages, visibilityLimit) {
+  const list = Array.isArray(messages) ? messages : []
+  const turn = Array.isArray(turnMessages) ? turnMessages : []
+  const limit = toPositiveInteger(visibilityLimit, 0)
+  if (limit <= 0 || list.length < limit || turn.length === 0) return false
+  return turn[0] === list[0]
 }
 
 // Turn-level aggregates. Each takes the message list produced by
@@ -3334,8 +3538,34 @@ function assistantMessagesForTurn(messages, latestAssistant) {
 // the sum over its steps, not the tail message's share of them.
 function turnCallsTool(turnMessages) {
   return (Array.isArray(turnMessages) ? turnMessages : []).some((message) =>
-    messageHasToolCall(message),
+    messageHasWorkToolCall(message),
   )
+}
+
+// The turn's TERMINAL TEXT — the text of the last assistant message in the turn
+// that produced any.
+//
+// One turn is N assistant messages, and the last of them frequently has no text
+// part at all: measured on a live OpenCode session (40 real turns), 10 END with
+// a message carrying no text, and 3 carry a tool part AND text. Reading only
+// the newest message therefore threw away real `[goal:complete]` /
+// `[goal:blocked]` markers whenever the model wrote its summary and then made
+// one last tool call — the completion was silently discarded and the goal kept
+// auto-continuing to a budget ceiling, while the same blind spot fed the
+// `formatFailures` cap.
+//
+// The turn's texts are NOT concatenated: `goalIsComplete` / `goalIsBlocked`
+// anchor on the FINAL line, so the marker has to be the last thing the model
+// wrote. A marker in an earlier message of the turn is still ignored as long as
+// anything later in the turn produced text, which is what keeps a quoted or
+// retracted marker from being honored.
+function turnTerminalText(turnMessages, latestAssistant) {
+  const turn = Array.isArray(turnMessages) ? turnMessages : []
+  for (let i = turn.length - 1; i >= 0; i -= 1) {
+    const text = getText(turn[i]?.parts)
+    if (text) return text
+  }
+  return getText(latestAssistant?.parts)
 }
 
 function sumTurnOutputTokens(turnMessages) {
@@ -3347,7 +3577,7 @@ function sumTurnOutputTokens(turnMessages) {
 
 function sumTurnReasoningTokens(turnMessages) {
   return (Array.isArray(turnMessages) ? turnMessages : []).reduce(
-    (total, message) => total + toNonNegativeInteger(messageTokens(message).reasoning),
+    (total, message) => total + messageTokenCounts(message).reasoning,
     0,
   )
 }
@@ -3611,7 +3841,7 @@ function userInterventionDetected(
 }
 
 function outputTokensForMessage(message) {
-  return toNonNegativeInteger(messageTokens(message).output)
+  return messageTokenCounts(message).output
 }
 
 // The early handoff: at `budgetWrapupRatio` of a budget the goal is asked to
@@ -3884,6 +4114,11 @@ function buildGoalState(sessionID, condition, options, meta = {}, lastStatus = "
     startedAt: Date.now(),
     pausedAt: 0,
     peakContextTokens: 0,
+    // The context window of the model this goal runs on, learned from the host
+    // on the first idle. 0 means "not known yet", which means no context
+    // ceiling — see contextWindowLimit.
+    modelContextTokens: 0,
+    modelKey: "",
     usage: emptyUsage(),
     options,
     lastStatus,
@@ -5568,6 +5803,120 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
     )
   }
 
+  // Parent links for sessions that hold no goal of their own, so a delegated
+  // subagent's token spend can be attributed to the goal that delegated it.
+  // A resolved-as-absent parent is remembered too ("" means "no parent, or the
+  // host could not say"), because one unanswerable lookup must not become a
+  // host call per message for the rest of the process.
+  const sessionParentIDs = new Map()
+  const sessionParentLookups = new Map()
+  const rememberSessionParent = (sessionID, parentID) => {
+    if (!sessionID) return
+    sessionParentIDs.set(sessionID, typeof parentID === "string" ? parentID : "")
+    while (sessionParentIDs.size > MAX_TRACKED_SESSION_PARENTS) {
+      sessionParentIDs.delete(sessionParentIDs.keys().next().value)
+    }
+  }
+  const lookupSessionParent = async (sessionID) => {
+    if (sessionParentIDs.has(sessionID)) return sessionParentIDs.get(sessionID)
+    const pending = sessionParentLookups.get(sessionID)
+    if (pending) return pending
+    const lookup = (async () => {
+      try {
+        const info = await sessionApi.get(sessionID)
+        const parentID =
+          isPlainObject(info) && typeof info.parentID === "string" ? info.parentID : ""
+        rememberSessionParent(sessionID, parentID)
+        return parentID
+      } catch (error) {
+        // Fail closed for SPEND ONLY: an unknowable parent means the child's
+        // tokens go unattributed, which is exactly the behaviour before this
+        // existed. Nothing pauses, nothing throws.
+        rememberSessionParent(sessionID, "")
+        return ""
+      } finally {
+        sessionParentLookups.delete(sessionID)
+      }
+    })()
+    sessionParentLookups.set(sessionID, lookup)
+    return lookup
+  }
+  // Nearest ancestor session that holds a goal, or null. Bounded so a host that
+  // reports a cyclic parent chain cannot spin here.
+  const goalForDelegatedSession = async (sessionID) => {
+    if (!sessionID) return null
+    let current = sessionID
+    for (let hop = 0; hop < MAX_DELEGATED_SESSION_DEPTH; hop += 1) {
+      const parentID = await lookupSessionParent(current)
+      if (!parentID || parentID === current) return null
+      const goal = goalStates.get(parentID)
+      if (goal) return goal
+      current = parentID
+    }
+    return null
+  }
+
+  // THE CONTEXT CEILING IS THE MODEL'S OWN WINDOW, NOT A GUESSED CONSTANT.
+  // Read once per plugin instance from the host catalog
+  // (`client.config.providers()` -> `providers[].models[id].limit.context`) and
+  // cached per provider/model. Every failure path yields 0, which means "no
+  // context ceiling" — the guard stays off rather than pausing a healthy run
+  // against a number nobody verified.
+  let providerCatalogPromise = null
+  const providerCatalog = () => {
+    if (!providerCatalogPromise) {
+      providerCatalogPromise = (async () => {
+        try {
+          const response = await client?.config?.providers?.()
+          const data =
+            response && typeof response === "object" && "data" in response
+              ? response.data
+              : response
+          return Array.isArray(data?.providers) ? data.providers : []
+        } catch (error) {
+          await logChildActivityProbeFailure(
+            "model-catalog",
+            "Could not read the host model catalog; goals run without a context-window ceiling until one is set explicitly",
+            error,
+          )
+          return []
+        }
+      })()
+    }
+    return providerCatalogPromise
+  }
+  const modelContextWindows = new Map()
+  const modelContextWindow = async (providerID, modelID) => {
+    const key = `${providerID}/${modelID}`
+    if (modelContextWindows.has(key)) return modelContextWindows.get(key)
+    const providers = await providerCatalog()
+    const provider = providers.find(
+      (entry) => isPlainObject(entry) && entry.id === providerID,
+    )
+    const models = isPlainObject(provider?.models) ? provider.models : {}
+    const tokens = toNonNegativeInteger(models[modelID]?.limit?.context)
+    modelContextWindows.set(key, tokens)
+    while (modelContextWindows.size > MAX_TRACKED_MODEL_WINDOWS) {
+      modelContextWindows.delete(modelContextWindows.keys().next().value)
+    }
+    return tokens
+  }
+  // Learn the ceiling this goal's context guard measures against from the model
+  // it is actually running on. An explicit `contextWindowTokens` always wins and
+  // short-circuits the lookup entirely.
+  const ensureGoalContextWindow = async (goal, latestAssistant) => {
+    if (!goal || toNonNegativeInteger(goal.options?.contextWindowTokens) > 0) return
+    const info = isPlainObject(latestAssistant?.info) ? latestAssistant.info : latestAssistant
+    const providerID = typeof info?.providerID === "string" ? info.providerID : ""
+    const modelID = typeof info?.modelID === "string" ? info.modelID : ""
+    if (!providerID || !modelID) return
+    const key = `${providerID}/${modelID}`
+    if (goal.modelKey === key) return
+    const tokens = await modelContextWindow(providerID, modelID)
+    goal.modelKey = key
+    goal.modelContextTokens = tokens
+  }
+
   // With noContinueWhileChildrenActive, auto-continue is deferred while any
   // child session (subagent, background task) is still active, so the goal
   // loop does not prompt the orchestrator over work a child is already doing.
@@ -6594,10 +6943,13 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
 
       if (event?.type === "session.updated") {
         const sessionID = getSessionID(event)
-        rememberSessionExecutionContext(
-          sessionID,
-          event?.properties?.info || event?.data?.info,
-        )
+        const info = event?.properties?.info || event?.data?.info
+        rememberSessionExecutionContext(sessionID, info)
+        // The session record carries its own parent link, so a child session
+        // that announces itself costs the delegated-spend lookup nothing.
+        if (sessionID && isPlainObject(info)) {
+          rememberSessionParent(sessionID, info.parentID)
+        }
       }
 
       if (!passive && event?.type === "message.updated") {
@@ -6759,37 +7111,77 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         const currentSessionID = messageSessionID(message)
         const runtime = currentRuntime()
 
-        const goal = goalStates.get(currentSessionID)
+        const ownGoal = goalStates.get(currentSessionID)
+        // DELEGATED WORK IS STILL THIS GOAL'S SPEND. A subagent/subtask runs in
+        // a CHILD session, which has no goal of its own, so every token it
+        // burned used to move the budget by zero — an orchestrator-shaped goal
+        // could spend its whole real budget invisibly. Its usage is accrued
+        // against the nearest ancestor that holds a goal. Nothing else about it
+        // is: a child's context is not the parent's context, its messages are
+        // not part of the parent's turn, and its traffic says nothing about the
+        // parent's compaction epoch.
+        const goal =
+          ownGoal || (goalStates.size > 0 ? await goalForDelegatedSession(currentSessionID) : null)
         if (!goal) return
+        const delegated = !ownGoal
 
         // Any message traffic for this goal marks the current compaction epoch
         // as having seen activity, which is what lets an identity-less
         // `session.compacted` re-delivery be told apart from a real one. Recorded
         // before the stale-redelivery guard below: a message that is stale for
         // token accounting still proves the host is delivering message events.
-        goal.messageSeenSinceCompaction = true
+        if (!delegated) goal.messageSeenSinceCompaction = true
 
-        // Skip stale re-deliveries from a prior budget window or a replaced goal.
+        // Stale re-deliveries from a prior budget window or a replaced goal.
         // resetGoalBudget and cleanupGoal both leave seenTokens entries in place
         // so this guard can fire: if an ID is already recorded in seenTokens but
         // is absent from the current goal.messageIDs, it belongs to a previous
         // budget epoch or a different goal that was replaced, and the event must
         // not re-inflate peakContextTokens.
-        if (seenTokens.has(currentMessageID) && !goal.messageIDs.has(currentMessageID)) return
+        //
+        // It is a CONTEXT guard, not a spend guard. A compaction clears
+        // goal.messageIDs while deliberately keeping seenTokens, so returning
+        // here also threw away every later update of the message that was
+        // in flight across the compaction — real billed tokens, discarded for
+        // the sake of a peak that must not re-inflate. Spend still accrues; the
+        // message just never re-enters messageIDs, so it stays stale for peak.
+        const staleForContext =
+          seenTokens.has(currentMessageID) && !goal.messageIDs.has(currentMessageID)
 
         let changed = false
+        const currentUsage = normalizeMessageUsage(message)
+        const previousUsage = seenUsage.get(currentMessageID) || emptyUsage()
+        // Spend is PERSISTED; `seenUsage` is per plugin instance. After a
+        // restart the map is empty, so a re-delivered event for a message that
+        // was already counted would have looked brand new and been counted a
+        // second time. `goal.messageIDs` is persisted alongside the spend it
+        // produced, so a message it already contains that `seenUsage` has never
+        // seen is a message this process did not count: it was counted before
+        // the restart. The cost is the remainder of a message still streaming
+        // when the plugin restarted; the alternative is unbounded double
+        // counting against a brake that pauses the run.
+        const usageCountedBeforeRestart =
+          !seenUsage.has(currentMessageID) && goal.messageIDs.has(currentMessageID)
+        if (
+          !usageCountedBeforeRestart &&
+          (USAGE_TOKEN_FIELDS.some((field) => currentUsage[field] > previousUsage[field]) ||
+            currentUsage.cost > previousUsage.cost)
+        ) {
+          goal.usage = addUsageDelta(goal.usage, currentUsage, previousUsage)
+          setBoundedMessageValue(seenUsage, currentMessageID, currentUsage)
+          if (!staleForContext) rememberMessageID(goal, currentMessageID)
+          changed = true
+        }
+
+        if (delegated || staleForContext) {
+          if (changed) await persist(goal.sessionID)
+          return
+        }
+
         const currentOutputTokens = outputTokensForMessage(message)
         const previousOutputTokens = seenOutputTokens.get(currentMessageID) || 0
         const currentTokens = totalTokensForMessage(message)
         const previousTokens = seenTokens.get(currentMessageID) || 0
-        const currentUsage = normalizeMessageUsage(message)
-        const previousUsage = seenUsage.get(currentMessageID) || emptyUsage()
-        if (USAGE_TOKEN_FIELDS.some((field) => currentUsage[field] > previousUsage[field]) || currentUsage.cost > previousUsage.cost) {
-          goal.usage = addUsageDelta(goal.usage, currentUsage, previousUsage)
-          setBoundedMessageValue(seenUsage, currentMessageID, currentUsage)
-          rememberMessageID(goal, currentMessageID)
-          changed = true
-        }
         if (currentTokens > previousTokens) {
           // Track the context window size (peak input+output+reasoning),
           // not cumulative API token consumption. Each message's tokens
@@ -6962,16 +7354,29 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
 
         const latestAssistant = findLatestAssistantMessage(messages)
         const latestAssistantID = messageID(latestAssistant)
-        const latestText = getText(latestAssistant?.parts)
         // Every assistant message OpenCode produced in answer to this one
-        // prompt (see assistantMessagesForTurn). The stall brakes below judge
-        // the WHOLE turn: a turn that ran tools and then wrote a text-only
-        // summary is several messages, and scoring only the tail one charged
-        // the no-tool-call brake for real work.
+        // prompt (see assistantMessagesForTurn). The stall brakes and the
+        // terminal markers below judge the WHOLE turn: a turn that ran tools and
+        // then wrote a text-only summary is several messages, and scoring only
+        // the tail one charged the no-tool-call brake for real work — and, one
+        // real turn in four, read the turn's text as empty because its last
+        // message carries no text part at all.
         const turnMessages = assistantMessagesForTurn(messages, latestAssistant)
+        const turnText = turnTerminalText(turnMessages, latestAssistant)
         const turnOutputTokens = latestAssistant ? sumTurnOutputTokens(turnMessages) : null
+        // A turn sliced by the visibility window was never fully observed, so
+        // it charges neither stall brake.
+        const turnTruncated = turnWasTruncated(
+          messages,
+          turnMessages,
+          activeGoalAfterMessages.options.maxRecentMessages,
+        )
+        // The context ceiling comes from the model this goal actually runs on.
+        // Cached after the first resolution, and a no-op once it is known or
+        // once `contextWindowTokens` was set explicitly.
+        await ensureGoalContextWindow(activeGoalAfterMessages, latestAssistant)
         const previousAssistantText = activeGoalAfterMessages.lastAssistantText
-        const assistantChanged = summarizeText(latestText) !== summarizeText(previousAssistantText)
+        const assistantChanged = summarizeText(turnText) !== summarizeText(previousAssistantText)
         const assistantRepeated =
           latestAssistantID && latestAssistantID === activeGoalAfterMessages.lastAssistantMessageID
         // A retained pre-compaction assistant must not be scored as fresh
@@ -6991,10 +7396,10 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           )
         activeGoalAfterMessages.skipNextTerminalCheck = false
 
-        if (!activationBoundary && latestText && (!assistantRepeated || assistantChanged)) {
-          recordCheckpoint(activeGoalAfterMessages, latestText)
+        if (!activationBoundary && turnText && (!assistantRepeated || assistantChanged)) {
+          recordCheckpoint(activeGoalAfterMessages, turnText)
         }
-        activeGoalAfterMessages.lastAssistantText = latestText
+        activeGoalAfterMessages.lastAssistantText = turnText
         activeGoalAfterMessages.lastAssistantMessageID = latestAssistantID
 
         // Latest instruction wins: if a real (non-plugin) user message arrived
@@ -7033,8 +7438,8 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         // line" — currently an unsatisfied action plan.
         let completionRejection = ""
 
-        if (!terminalBoundary && goalIsComplete(latestText)) {
-          const evidence = extractCompletionEvidence(latestText)
+        if (!terminalBoundary && goalIsComplete(turnText)) {
+          const evidence = extractCompletionEvidence(turnText)
           // Plan gate: a recorded action plan outranks a "done" message. The
           // goal completes only when every action is done with verdict=pass or
           // blocked with a stated reason.
@@ -7066,7 +7471,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
             if (completionAuditor) {
               let verdict
               try {
-                verdict = await completionAuditor({ goal: activeGoalAfterMessages, sessionID, latestText })
+                verdict = await completionAuditor({ goal: activeGoalAfterMessages, sessionID, latestText: turnText })
               } catch (error) {
                 await logPluginError(client, "Completion auditor threw", error)
                 verdict = { approved: false, reason: "auditor error" }
@@ -7211,8 +7616,8 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
             "completion-unverified",
             "Assistant output [goal:complete] without a [goal:evidence] line; completion rejected, continuing.",
           )
-        } else if (!terminalBoundary && goalIsBlocked(latestText)) {
-          const reason = extractBlockedReason(latestText)
+        } else if (!terminalBoundary && goalIsBlocked(turnText)) {
+          const reason = extractBlockedReason(turnText)
           if (reason) {
             await announceAudit(
               sessionID,
@@ -7351,11 +7756,23 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         // enough, because the model's closing summary is its own text-only
         // message and is the one this used to read.
         const turnHasToolCall = turnCallsTool(turnMessages)
+        // A turn whose head fell outside the visibility window was never fully
+        // observed: its tool calls and most of its output tokens are simply not
+        // in the list. Charging a stall brake on that evidence reproduces the
+        // exact false positive the turn grouping exists to remove. Say so, and
+        // charge nothing.
+        if (turnTruncated && activeGoalAfterMessages.turnCount > 0 && !activationBoundary) {
+          pushHistory(
+            activeGoalAfterMessages,
+            "warning",
+            `The latest turn reaches the edge of the ${activeGoalAfterMessages.options.maxRecentMessages}-message visibility window and may be truncated; the stall brakes were not charged for it. Raise maxRecentMessages if this repeats.`,
+          )
+        }
         // A turn that produced only reasoning tokens (no prose, no tool calls)
         // is an extended-thinking pass, not a stall. turnOutputTokens counts
         // prose output only; reasoning tokens are summed separately over the
         // same turn. Without this guard a pure-thinking turn matches
-        // lowOutputTurn (output=0 < threshold) and latestText is empty, so it
+        // lowOutputTurn (output=0 < threshold) and turnText is empty, so it
         // would false-positively look stalled.
         const turnReasoningTokens = sumTurnReasoningTokens(turnMessages)
         const turnHasThinkingTokens = turnReasoningTokens > 0
@@ -7363,6 +7780,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         const lowOutputTurn =
           activeGoalAfterMessages.turnCount > 0 &&
           !activationBoundary &&
+          !turnTruncated &&
           turnOutputTokens !== null &&
           turnOutputTokens < activeGoalAfterMessages.options.noProgressTokenThreshold
         // A turn that used a tool is never stalled even with low output tokens:
@@ -7373,7 +7791,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           lowOutputTurn &&
           !turnHasToolCall &&
           !turnHasThinkingTokens &&
-          (assistantRepeated || !latestText || !assistantChanged)
+          (assistantRepeated || !turnText || !assistantChanged)
         // A child-wake pass re-examines an assistant turn the parent already
         // produced and was already charged for: the parent ran nothing in
         // between. Charging the stall gates again would pause a healthy goal
@@ -7444,6 +7862,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           activeGoalAfterMessages.options.noToolCallTurnsBeforePause > 0 &&
           activeGoalAfterMessages.turnCount > 0 &&
           !activationBoundary &&
+          !turnTruncated &&
           Boolean(latestAssistant) &&
           !turnHasToolCall
         if (noToolCallContinuation && !lowOutputLooksStalled && !childWakeEvent) {
@@ -7550,7 +7969,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
               0,
               activeGoalBeforePrompt.formatFailures - 1,
             )
-            activeGoalBeforePrompt.lastStatus = latestText
+            activeGoalBeforePrompt.lastStatus = turnText
               ? `Continuing after assistant turn ${activeGoalBeforePrompt.turnCount}.`
               : `Continuing after idle event ${activeGoalBeforePrompt.turnCount}.`
           }
@@ -7958,7 +8377,11 @@ export const testInternals = {
   extractCompletionEvidence,
   findLatestAssistantMessage,
   assistantMessagesForTurn,
+  messageParentID,
+  isCompactionAssistantMessage,
   turnCallsTool,
+  turnTerminalText,
+  turnWasTruncated,
   sumTurnOutputTokens,
   sumTurnReasoningTokens,
   formatArgumentErrors,
@@ -7988,6 +8411,13 @@ export const testInternals = {
   isPluginGeneratedMessage,
   legacyStateFilePaths,
   messageHasToolCall,
+  messageHasWorkToolCall,
+  isPluginOwnToolName,
+  messageTokenCounts,
+  usageStepStarted,
+  addUsageDelta,
+  contextWindowLimit,
+  formatContextBudget,
   normalizeCommandOptions,
   normalizeMode,
   normalizeOptions,

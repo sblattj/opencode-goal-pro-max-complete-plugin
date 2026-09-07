@@ -15124,6 +15124,9 @@ var MAX_PERSISTED_ENTRIES = 2000;
 var MAX_LIVE_GOALS_PER_SESSION = 100;
 var MAX_MESSAGE_IDS_PER_GOAL = 2000;
 var MAX_TRACKED_MESSAGE_IDS = 20000;
+var MAX_TRACKED_SESSION_PARENTS = 2000;
+var MAX_DELEGATED_SESSION_DEPTH = 8;
+var MAX_TRACKED_MODEL_WINDOWS = 256;
 var MAX_PENDING_COMMAND_TURNS_PER_SESSION = 8;
 var COMMAND_TURN_TTL_MS = 5 * 60 * 1000;
 var DEFAULT_LEDGER_MAX_BYTES = 2 * 1024 * 1024;
@@ -15140,7 +15143,7 @@ var DEFAULT_OPTIONS = {
   maxTurns: 0,
   maxDurationMs: 8 * 60 * 60 * 1000,
   maxTokens: 1e8,
-  contextWindowTokens: 200000,
+  contextWindowTokens: 0,
   minDelayMs: 1500,
   maxRecentMessages: 200,
   noProgressTokenThreshold: 50,
@@ -15274,6 +15277,38 @@ var TOOL_PART_TYPES = new Set(["tool", "tool-invocation", "subtask", "tool_use",
 function messageHasToolCall(message) {
   const parts = Array.isArray(message?.parts) ? message.parts : [];
   return parts.some((part) => part && TOOL_PART_TYPES.has(part.type));
+}
+var PLUGIN_TOOL_NAMES = new Set([
+  "goal_status",
+  "goal_set",
+  "goal_pause",
+  "goal_resume",
+  "goal_block",
+  "goal_complete",
+  "goal_plan_get",
+  "goal_plan_set",
+  "goal_action_update"
+]);
+function toolPartName(part) {
+  const raw = part?.tool ?? part?.toolName ?? part?.name ?? part?.tool_name;
+  return typeof raw === "string" ? raw.trim().toLowerCase() : "";
+}
+function isPluginOwnToolName(name) {
+  if (!name)
+    return false;
+  if (PLUGIN_TOOL_NAMES.has(name))
+    return true;
+  for (const tool of PLUGIN_TOOL_NAMES) {
+    if (!name.endsWith(tool) || name.length === tool.length)
+      continue;
+    if (/[^a-z0-9]/.test(name.charAt(name.length - tool.length - 1)))
+      return true;
+  }
+  return false;
+}
+function messageHasWorkToolCall(message) {
+  const parts = Array.isArray(message?.parts) ? message.parts : [];
+  return parts.some((part) => part && TOOL_PART_TYPES.has(part.type) && !isPluginOwnToolName(toolPartName(part)));
 }
 var GOAL_MODES = new Set(["normal", "ordered"]);
 function normalizeMode(value) {
@@ -15482,6 +15517,8 @@ function buildSidebarTerminal(goal, state, finishedAt) {
     plan: goal.plan,
     turnCount: goal.turnCount,
     peakContextTokens: goal.peakContextTokens,
+    modelContextTokens: goal.modelContextTokens,
+    modelKey: goal.modelKey,
     usage: normalizeUsage(goal.usage),
     startedAt: goal.startedAt,
     pausedAt: finishedAt,
@@ -15526,10 +15563,12 @@ function buildSidebarMetadata(goal, now = Date.now(), context = {}) {
       max: Math.floor(goal.options.maxDurationMs / 60000)
     },
     tokens: { used: goalSpendTokens(goal), max: goal.options.maxTokens },
-    context: {
-      used: toNonNegativeInteger(goal.peakContextTokens),
-      max: contextWindowLimit(goal)
-    },
+    ...contextWindowLimit(goal) > 0 ? {
+      context: {
+        used: toNonNegativeInteger(goal.peakContextTokens),
+        max: contextWindowLimit(goal)
+      }
+    } : {},
     plan: {
       total: progress.total,
       verified: progress.verified,
@@ -15827,7 +15866,7 @@ function formatStatus(goal, commandName = "goal", completionAuditLabel = "eviden
     lines.push(`Constraints: ${goal.constraints}`);
   if (goal.mode && goal.mode !== "normal")
     lines.push(`Mode: ${goal.mode}`);
-  lines.push(`Auto-continues sent: ${formatTurnBudget(goal.turnCount, goal.options.maxTurns)}`, `Token spend: ${goalSpendTokens(goal).toLocaleString()}/${goal.options.maxTokens.toLocaleString()}`, `Peak context: ${toNonNegativeInteger(goal.peakContextTokens).toLocaleString()}/${contextWindowLimit(goal).toLocaleString()}`, formatUsage(goal.usage), `Elapsed: ${elapsed}s (${formatBudgetDuration(elapsedMs)}/${formatBudgetDuration(goal.options.maxDurationMs)})`, `Last progress: ${lastProgress}`, `No-progress turns: ${goal.noProgressTurns}`, `Recent checkpoint: ${lastCheckpoint}`, `Last status: ${goal.lastStatus || "No assistant turn recorded yet."}`);
+  lines.push(`Auto-continues sent: ${formatTurnBudget(goal.turnCount, goal.options.maxTurns)}`, `Token spend: ${goalSpendTokens(goal).toLocaleString()}/${goal.options.maxTokens.toLocaleString()}`, `Peak context: ${formatContextBudget(goal)}`, formatUsage(goal.usage), `Elapsed: ${elapsed}s (${formatBudgetDuration(elapsedMs)}/${formatBudgetDuration(goal.options.maxDurationMs)})`, `Last progress: ${lastProgress}`, `No-progress turns: ${goal.noProgressTurns}`, `Recent checkpoint: ${lastCheckpoint}`, `Last status: ${goal.lastStatus || "No assistant turn recorded yet."}`);
   lines.push(formatPlanForStatus(goal.plan));
   if (goal.stopped)
     lines.push(`Stopped: ${goal.stopReason || "unknown"}`);
@@ -15889,8 +15928,9 @@ function stopReason(goal) {
   if (goalSpendTokens(goal) >= goal.options.maxTokens) {
     return `max tokens reached (${goal.options.maxTokens.toLocaleString()})`;
   }
-  if (toNonNegativeInteger(goal.peakContextTokens) >= contextWindowLimit(goal)) {
-    return `context window reached (${contextWindowLimit(goal).toLocaleString()})`;
+  const contextWindow = contextWindowLimit(goal);
+  if (contextWindow > 0 && toNonNegativeInteger(goal.peakContextTokens) >= contextWindow) {
+    return `context window reached (${contextWindow.toLocaleString()})`;
   }
   return null;
 }
@@ -16230,7 +16270,7 @@ function normalizeOptions(options = {}) {
     maxTurns: toTurnBudget(options.maxTurns, DEFAULT_OPTIONS.maxTurns),
     maxDurationMs: toPositiveInteger(options.maxDurationMs, DEFAULT_OPTIONS.maxDurationMs),
     maxTokens: toPositiveInteger(options.maxTokens, DEFAULT_OPTIONS.maxTokens),
-    contextWindowTokens: toPositiveInteger(options.contextWindowTokens, DEFAULT_OPTIONS.contextWindowTokens),
+    contextWindowTokens: Number.isSafeInteger(options.contextWindowTokens) && options.contextWindowTokens >= 0 ? options.contextWindowTokens : DEFAULT_OPTIONS.contextWindowTokens,
     minDelayMs: toPositiveInteger(options.minDelayMs, DEFAULT_OPTIONS.minDelayMs),
     maxRecentMessages: toPositiveInteger(options.maxRecentMessages, DEFAULT_OPTIONS.maxRecentMessages),
     noProgressTokenThreshold: toPositiveInteger(options.noProgressTokenThreshold, DEFAULT_OPTIONS.noProgressTokenThreshold),
@@ -16390,6 +16430,8 @@ function normalizePersistedGoal(rawGoal) {
     startedAt: normalizeTimestamp(rawGoal.startedAt),
     pausedAt: toNonNegativeInteger(rawGoal.pausedAt),
     peakContextTokens: toNonNegativeInteger(rawGoal.peakContextTokens ?? rawGoal.totalTokens),
+    modelContextTokens: toNonNegativeInteger(rawGoal.modelContextTokens),
+    modelKey: typeof rawGoal.modelKey === "string" && rawGoal.modelKey.length <= MAX_GOAL_META_LENGTH ? rawGoal.modelKey : "",
     usage: normalizeUsage(rawGoal.usage),
     options: normalizeOptions(isPlainObject2(rawGoal.options) ? rawGoal.options : {}),
     lastStatus: typeof rawGoal.lastStatus === "string" ? rawGoal.lastStatus : "Goal recovered.",
@@ -17108,7 +17150,8 @@ function buildLimitWarning(goal) {
   const remainingTurns = goal.options.maxTurns - goal.turnCount;
   const remainingMs = goal.options.maxDurationMs - (Date.now() - goal.startedAt);
   const remainingTokens = goal.options.maxTokens - goalSpendTokens(goal);
-  const remainingContext = contextWindowLimit(goal) - toNonNegativeInteger(goal.peakContextTokens);
+  const contextWindow = contextWindowLimit(goal);
+  const remainingContext = contextWindow - toNonNegativeInteger(goal.peakContextTokens);
   const warnings = [];
   if (!unlimitedTurns && remainingTurns <= goal.options.warnTurnsRemaining) {
     warnings.push(`${remainingTurns} auto-continue turn(s) remaining`);
@@ -17119,7 +17162,7 @@ function buildLimitWarning(goal) {
   if (remainingTokens <= goal.options.warnTokensRemaining) {
     warnings.push(`${Math.max(0, remainingTokens).toLocaleString()} budget token(s) remaining`);
   }
-  if (remainingContext <= goal.options.warnTokensRemaining) {
+  if (contextWindow > 0 && remainingContext <= goal.options.warnTokensRemaining) {
     warnings.push(`${Math.max(0, remainingContext).toLocaleString()} context token(s) remaining`);
   }
   return warnings.length ? ` Limits are near: ${warnings.join(", ")}.` : "";
@@ -17179,7 +17222,8 @@ function buildContinueMessage(goal, {
   completionRejection = ""
 } = {}) {
   const remainingTokens = Math.max(0, goal.options.maxTokens - goalSpendTokens(goal));
-  const remainingContext = Math.max(0, contextWindowLimit(goal) - toNonNegativeInteger(goal.peakContextTokens));
+  const contextWindow = contextWindowLimit(goal);
+  const remainingContext = contextWindow > 0 ? Math.max(0, contextWindow - toNonNegativeInteger(goal.peakContextTokens)) : UNLIMITED_WORD;
   const remainingTurns = isUnlimitedTurnBudget(goal.options.maxTurns) ? UNLIMITED_WORD : Math.max(0, goal.options.maxTurns - goal.turnCount);
   const elapsedSeconds = Math.round((Date.now() - goal.startedAt) / 1000);
   const lines = [
@@ -17243,7 +17287,7 @@ function buildCompactionContext(goal) {
     "The summary below is reconstructed deterministically from the plugin's persisted goal record, not from chat memory.",
     buildGoalBlock(goal),
     `Goal status: ${goal.stopped ? goal.stopReason || "stopped" : "active"}.`,
-    `Auto-continues used: ${formatTurnBudget(goal.turnCount, goal.options.maxTurns)}. Token spend: ${goalSpendTokens(goal)}/${goal.options.maxTokens}. Peak context: ${toNonNegativeInteger(goal.peakContextTokens)}/${contextWindowLimit(goal)}. Elapsed: ${elapsedSeconds}s.`,
+    `Auto-continues used: ${formatTurnBudget(goal.turnCount, goal.options.maxTurns)}. Token spend: ${goalSpendTokens(goal)}/${goal.options.maxTokens}. Peak context: ${formatContextBudget(goal)}. Elapsed: ${elapsedSeconds}s.`,
     goal.lastCheckpoint ? `Latest checkpoint: ${escapeGoalText(summarizeText(goal.lastCheckpoint.summary, 200))}` : null,
     ...buildCompactionProgressSummary(goal),
     ...formatPlanForPrompt(goal.plan) ? ["<goal_plan>", formatPlanForPrompt(goal.plan), `progress: ${planStatusLabel(goal.plan)}`, "</goal_plan>"] : [],
@@ -17312,18 +17356,36 @@ var USAGE_TOKEN_FIELDS = ["input", "output", "reasoning", "cacheRead", "cacheWri
 function emptyUsage() {
   return { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0, costKnown: false };
 }
-function normalizeMessageUsage(message) {
+function messageTokenCounts(message) {
   const tokens = messageTokens(message);
   const cache = isPlainObject2(tokens.cache) ? tokens.cache : {};
-  const rawCost = message?.info?.cost ?? message?.cost;
-  return {
+  const counts = {
     input: toNonNegativeInteger(tokens.input),
     output: toNonNegativeInteger(tokens.output),
     reasoning: toNonNegativeInteger(tokens.reasoning),
     cacheRead: toNonNegativeInteger(cache.read ?? tokens.cacheRead ?? tokens.cache_read),
     cacheWrite: toNonNegativeInteger(cache.write ?? tokens.cacheWrite ?? tokens.cache_write),
+    total: toNonNegativeInteger(tokens.total)
+  };
+  const components = counts.input + counts.output + counts.reasoning + counts.cacheRead + counts.cacheWrite;
+  if (components === 0 && counts.total > 0) {
+    counts.input = counts.total;
+    counts.totalOnly = true;
+  }
+  return counts;
+}
+function normalizeMessageUsage(message) {
+  const counts = messageTokenCounts(message);
+  const rawCost = message?.info?.cost ?? message?.cost;
+  return {
+    input: counts.input,
+    output: counts.output,
+    reasoning: counts.reasoning,
+    cacheRead: counts.cacheRead,
+    cacheWrite: counts.cacheWrite,
     cost: Number.isFinite(Number(rawCost)) && Number(rawCost) >= 0 ? Number(rawCost) : 0,
-    costKnown: rawCost !== undefined && Number.isFinite(Number(rawCost)) && Number(rawCost) >= 0
+    costKnown: rawCost !== undefined && Number.isFinite(Number(rawCost)) && Number(rawCost) >= 0,
+    totalOnly: counts.totalOnly === true
   };
 }
 function normalizeUsage(value) {
@@ -17335,11 +17397,18 @@ function normalizeUsage(value) {
   usage.costKnown = source.costKnown === true || usage.cost > 0;
   return usage;
 }
+function usageStepStarted(current, previous) {
+  if (previous.cost > 0 && current.cost > previous.cost)
+    return true;
+  if (current.totalOnly === true || previous.totalOnly === true)
+    return false;
+  return current.input > previous.input || current.cacheRead > previous.cacheRead || current.cacheWrite > previous.cacheWrite;
+}
 function addUsageDelta(total, current, previous) {
   const next = normalizeUsage(total);
-  const completedAnotherStep = previous.cost > 0 && current.cost > previous.cost;
+  const startedAnotherStep = usageStepStarted(current, previous);
   for (const field of USAGE_TOKEN_FIELDS) {
-    next[field] += completedAnotherStep ? current[field] : Math.max(0, current[field] - previous[field]);
+    next[field] += startedAnotherStep ? current[field] : Math.max(0, current[field] - previous[field]);
   }
   next.cost += Math.max(0, current.cost - previous.cost);
   next.costKnown ||= current.costKnown;
@@ -17353,18 +17422,21 @@ function goalSpendTokens(goal) {
   return spend;
 }
 function contextWindowLimit(goal) {
-  return toPositiveInteger(goal?.options?.contextWindowTokens, DEFAULT_OPTIONS.contextWindowTokens);
+  const configured = toNonNegativeInteger(goal?.options?.contextWindowTokens);
+  if (configured > 0)
+    return configured;
+  return toNonNegativeInteger(goal?.modelContextTokens);
 }
-function cacheTokensForMessage(tokens) {
-  const cache = isPlainObject2(tokens.cache) ? tokens.cache : {};
-  return toNonNegativeInteger(cache.read) + toNonNegativeInteger(cache.write);
+function formatContextBudget(goal) {
+  const limit = contextWindowLimit(goal);
+  const used = toNonNegativeInteger(goal?.peakContextTokens).toLocaleString();
+  return `${used}/${limit > 0 ? limit.toLocaleString() : UNLIMITED_MARK}`;
 }
 function totalTokensForMessage(message) {
-  const tokens = messageTokens(message);
-  const reportedTotal = toNonNegativeInteger(tokens.total);
-  if (reportedTotal > 0)
-    return reportedTotal;
-  return toNonNegativeInteger(tokens.input) + toNonNegativeInteger(tokens.output) + toNonNegativeInteger(tokens.reasoning) + cacheTokensForMessage(tokens);
+  const counts = messageTokenCounts(message);
+  if (counts.total > 0)
+    return counts.total;
+  return counts.input + counts.output + counts.reasoning + counts.cacheRead + counts.cacheWrite;
 }
 function messageInfoFromEvent(event) {
   const candidates = [
@@ -17488,19 +17560,36 @@ function assistantMessagesForTurn(messages, latestAssistant) {
     if (messageRole(message) !== "assistant")
       break;
     if (isCompactionAssistantMessage(message))
-      continue;
+      break;
     run.push(message);
   }
   return run.reverse();
 }
+function turnWasTruncated(messages, turnMessages, visibilityLimit) {
+  const list = Array.isArray(messages) ? messages : [];
+  const turn = Array.isArray(turnMessages) ? turnMessages : [];
+  const limit = toPositiveInteger(visibilityLimit, 0);
+  if (limit <= 0 || list.length < limit || turn.length === 0)
+    return false;
+  return turn[0] === list[0];
+}
 function turnCallsTool(turnMessages) {
-  return (Array.isArray(turnMessages) ? turnMessages : []).some((message) => messageHasToolCall(message));
+  return (Array.isArray(turnMessages) ? turnMessages : []).some((message) => messageHasWorkToolCall(message));
+}
+function turnTerminalText(turnMessages, latestAssistant) {
+  const turn = Array.isArray(turnMessages) ? turnMessages : [];
+  for (let i = turn.length - 1;i >= 0; i -= 1) {
+    const text = getText(turn[i]?.parts);
+    if (text)
+      return text;
+  }
+  return getText(latestAssistant?.parts);
 }
 function sumTurnOutputTokens(turnMessages) {
   return (Array.isArray(turnMessages) ? turnMessages : []).reduce((total, message) => total + outputTokensForMessage(message), 0);
 }
 function sumTurnReasoningTokens(turnMessages) {
-  return (Array.isArray(turnMessages) ? turnMessages : []).reduce((total, message) => total + toNonNegativeInteger(messageTokens(message).reasoning), 0);
+  return (Array.isArray(turnMessages) ? turnMessages : []).reduce((total, message) => total + messageTokenCounts(message).reasoning, 0);
 }
 function findLatestExecutionContext(messages) {
   for (const message of [...messages || []].reverse()) {
@@ -17667,7 +17756,7 @@ function userInterventionDetected(messages, goal, ownedMessages = currentRuntime
   return lastPluginContinuationIndex >= 0 && lastRealUserIndex > lastPluginContinuationIndex;
 }
 function outputTokensForMessage(message) {
-  return toNonNegativeInteger(messageTokens(message).output);
+  return messageTokenCounts(message).output;
 }
 function budgetWrapupNeeded(goal, now = Date.now()) {
   if (goal.budgetWrapupSent)
@@ -17881,6 +17970,8 @@ function buildGoalState(sessionID, condition, options, meta3 = {}, lastStatus = 
     startedAt: Date.now(),
     pausedAt: 0,
     peakContextTokens: 0,
+    modelContextTokens: 0,
+    modelKey: "",
     usage: emptyUsage(),
     options,
     lastStatus,
@@ -19158,6 +19249,99 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
     childActivityProbeFailuresLogged.add(kind);
     return logPluginError(client, `${message} (further ${kind} failures are suppressed for this plugin instance)`, error51);
   };
+  const sessionParentIDs = new Map;
+  const sessionParentLookups = new Map;
+  const rememberSessionParent = (sessionID, parentID) => {
+    if (!sessionID)
+      return;
+    sessionParentIDs.set(sessionID, typeof parentID === "string" ? parentID : "");
+    while (sessionParentIDs.size > MAX_TRACKED_SESSION_PARENTS) {
+      sessionParentIDs.delete(sessionParentIDs.keys().next().value);
+    }
+  };
+  const lookupSessionParent = async (sessionID) => {
+    if (sessionParentIDs.has(sessionID))
+      return sessionParentIDs.get(sessionID);
+    const pending = sessionParentLookups.get(sessionID);
+    if (pending)
+      return pending;
+    const lookup = (async () => {
+      try {
+        const info = await sessionApi.get(sessionID);
+        const parentID = isPlainObject2(info) && typeof info.parentID === "string" ? info.parentID : "";
+        rememberSessionParent(sessionID, parentID);
+        return parentID;
+      } catch (error51) {
+        rememberSessionParent(sessionID, "");
+        return "";
+      } finally {
+        sessionParentLookups.delete(sessionID);
+      }
+    })();
+    sessionParentLookups.set(sessionID, lookup);
+    return lookup;
+  };
+  const goalForDelegatedSession = async (sessionID) => {
+    if (!sessionID)
+      return null;
+    let current = sessionID;
+    for (let hop = 0;hop < MAX_DELEGATED_SESSION_DEPTH; hop += 1) {
+      const parentID = await lookupSessionParent(current);
+      if (!parentID || parentID === current)
+        return null;
+      const goal = goalStates.get(parentID);
+      if (goal)
+        return goal;
+      current = parentID;
+    }
+    return null;
+  };
+  let providerCatalogPromise = null;
+  const providerCatalog = () => {
+    if (!providerCatalogPromise) {
+      providerCatalogPromise = (async () => {
+        try {
+          const response = await client?.config?.providers?.();
+          const data = response && typeof response === "object" && "data" in response ? response.data : response;
+          return Array.isArray(data?.providers) ? data.providers : [];
+        } catch (error51) {
+          await logChildActivityProbeFailure("model-catalog", "Could not read the host model catalog; goals run without a context-window ceiling until one is set explicitly", error51);
+          return [];
+        }
+      })();
+    }
+    return providerCatalogPromise;
+  };
+  const modelContextWindows = new Map;
+  const modelContextWindow = async (providerID, modelID) => {
+    const key = `${providerID}/${modelID}`;
+    if (modelContextWindows.has(key))
+      return modelContextWindows.get(key);
+    const providers = await providerCatalog();
+    const provider = providers.find((entry) => isPlainObject2(entry) && entry.id === providerID);
+    const models = isPlainObject2(provider?.models) ? provider.models : {};
+    const tokens = toNonNegativeInteger(models[modelID]?.limit?.context);
+    modelContextWindows.set(key, tokens);
+    while (modelContextWindows.size > MAX_TRACKED_MODEL_WINDOWS) {
+      modelContextWindows.delete(modelContextWindows.keys().next().value);
+    }
+    return tokens;
+  };
+  const ensureGoalContextWindow = async (goal, latestAssistant) => {
+    if (!goal || toNonNegativeInteger(goal.options?.contextWindowTokens) > 0)
+      return;
+    const info = isPlainObject2(latestAssistant?.info) ? latestAssistant.info : latestAssistant;
+    const providerID = typeof info?.providerID === "string" ? info.providerID : "";
+    const modelID = typeof info?.modelID === "string" ? info.modelID : "";
+    if (!providerID || !modelID)
+      return;
+    const key = `${providerID}/${modelID}`;
+    if (goal.modelKey === key)
+      return;
+    const tokens = await modelContextWindow(providerID, modelID);
+    goal.modelKey = key;
+    goal.modelContextTokens = tokens;
+  };
   const activeChildSessionIDs = async (sessionID) => {
     try {
       const [children, status] = await Promise.all([
@@ -19847,7 +20031,11 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       }
       if (event?.type === "session.updated") {
         const sessionID2 = getSessionID(event);
-        rememberSessionExecutionContext(sessionID2, event?.properties?.info || event?.data?.info);
+        const info = event?.properties?.info || event?.data?.info;
+        rememberSessionExecutionContext(sessionID2, info);
+        if (sessionID2 && isPlainObject2(info)) {
+          rememberSessionParent(sessionID2, info.parentID);
+        }
       }
       if (!passive && event?.type === "message.updated") {
         const message = messageInfoFromEvent(event);
@@ -19953,25 +20141,34 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           return;
         const currentSessionID = messageSessionID(message);
         const runtime3 = currentRuntime();
-        const goal2 = goalStates.get(currentSessionID);
+        const ownGoal = goalStates.get(currentSessionID);
+        const goal2 = ownGoal || (goalStates.size > 0 ? await goalForDelegatedSession(currentSessionID) : null);
         if (!goal2)
           return;
-        goal2.messageSeenSinceCompaction = true;
-        if (seenTokens.has(currentMessageID) && !goal2.messageIDs.has(currentMessageID))
-          return;
+        const delegated = !ownGoal;
+        if (!delegated)
+          goal2.messageSeenSinceCompaction = true;
+        const staleForContext = seenTokens.has(currentMessageID) && !goal2.messageIDs.has(currentMessageID);
         let changed = false;
+        const currentUsage = normalizeMessageUsage(message);
+        const previousUsage = seenUsage.get(currentMessageID) || emptyUsage();
+        const usageCountedBeforeRestart = !seenUsage.has(currentMessageID) && goal2.messageIDs.has(currentMessageID);
+        if (!usageCountedBeforeRestart && (USAGE_TOKEN_FIELDS.some((field) => currentUsage[field] > previousUsage[field]) || currentUsage.cost > previousUsage.cost)) {
+          goal2.usage = addUsageDelta(goal2.usage, currentUsage, previousUsage);
+          setBoundedMessageValue(seenUsage, currentMessageID, currentUsage);
+          if (!staleForContext)
+            rememberMessageID(goal2, currentMessageID);
+          changed = true;
+        }
+        if (delegated || staleForContext) {
+          if (changed)
+            await persist(goal2.sessionID);
+          return;
+        }
         const currentOutputTokens = outputTokensForMessage(message);
         const previousOutputTokens = seenOutputTokens.get(currentMessageID) || 0;
         const currentTokens = totalTokensForMessage(message);
         const previousTokens = seenTokens.get(currentMessageID) || 0;
-        const currentUsage = normalizeMessageUsage(message);
-        const previousUsage = seenUsage.get(currentMessageID) || emptyUsage();
-        if (USAGE_TOKEN_FIELDS.some((field) => currentUsage[field] > previousUsage[field]) || currentUsage.cost > previousUsage.cost) {
-          goal2.usage = addUsageDelta(goal2.usage, currentUsage, previousUsage);
-          setBoundedMessageValue(seenUsage, currentMessageID, currentUsage);
-          rememberMessageID(goal2, currentMessageID);
-          changed = true;
-        }
         if (currentTokens > previousTokens) {
           goal2.peakContextTokens = Math.max(goal2.peakContextTokens, currentTokens);
           setBoundedMessageValue(seenTokens, currentMessageID, currentTokens);
@@ -20070,19 +20267,21 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         }
         const latestAssistant = findLatestAssistantMessage(messages);
         const latestAssistantID = messageID(latestAssistant);
-        const latestText = getText(latestAssistant?.parts);
         const turnMessages = assistantMessagesForTurn(messages, latestAssistant);
+        const turnText = turnTerminalText(turnMessages, latestAssistant);
         const turnOutputTokens = latestAssistant ? sumTurnOutputTokens(turnMessages) : null;
+        const turnTruncated = turnWasTruncated(messages, turnMessages, activeGoalAfterMessages.options.maxRecentMessages);
+        await ensureGoalContextWindow(activeGoalAfterMessages, latestAssistant);
         const previousAssistantText = activeGoalAfterMessages.lastAssistantText;
-        const assistantChanged = summarizeText(latestText) !== summarizeText(previousAssistantText);
+        const assistantChanged = summarizeText(turnText) !== summarizeText(previousAssistantText);
         const assistantRepeated = latestAssistantID && latestAssistantID === activeGoalAfterMessages.lastAssistantMessageID;
         const terminalBoundary = currentRuntime().suppressedCommandAssistants.get(latestAssistantID) === sessionID || activeGoalAfterMessages.skipNextTerminalCheck === true;
         const activationBoundary = terminalBoundary || Boolean(activeGoalAfterMessages.compactionSourceAssistantMessageID && activeGoalAfterMessages.compactionSourceAssistantMessageID === latestAssistantID);
         activeGoalAfterMessages.skipNextTerminalCheck = false;
-        if (!activationBoundary && latestText && (!assistantRepeated || assistantChanged)) {
-          recordCheckpoint(activeGoalAfterMessages, latestText);
+        if (!activationBoundary && turnText && (!assistantRepeated || assistantChanged)) {
+          recordCheckpoint(activeGoalAfterMessages, turnText);
         }
-        activeGoalAfterMessages.lastAssistantText = latestText;
+        activeGoalAfterMessages.lastAssistantText = turnText;
         activeGoalAfterMessages.lastAssistantMessageID = latestAssistantID;
         if (!activeGoalAfterMessages.options.noInterruptOnUserMessage && userInterventionDetected(messages, activeGoalAfterMessages)) {
           await pauseActiveGoal(sessionID, {
@@ -20099,8 +20298,8 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         let completionUnverified = false;
         let blockerUnstated = false;
         let completionRejection = "";
-        if (!terminalBoundary && goalIsComplete(latestText)) {
-          const evidence = extractCompletionEvidence(latestText);
+        if (!terminalBoundary && goalIsComplete(turnText)) {
+          const evidence = extractCompletionEvidence(turnText);
           const planBlockers = planCompletionBlockers(activeGoalAfterMessages.plan);
           if (evidence && planBlockers.length) {
             completionUnverified = true;
@@ -20114,7 +20313,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
             if (completionAuditor) {
               let verdict;
               try {
-                verdict = await completionAuditor({ goal: activeGoalAfterMessages, sessionID, latestText });
+                verdict = await completionAuditor({ goal: activeGoalAfterMessages, sessionID, latestText: turnText });
               } catch (error51) {
                 await logPluginError(client, "Completion auditor threw", error51);
                 verdict = { approved: false, reason: "auditor error" };
@@ -20197,8 +20396,8 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           completionUnverified = true;
           activeGoalAfterMessages.lastStatus = "Rejected [goal:complete]: no [goal:evidence] line provided. Completion not recorded; re-prompting for evidence.";
           pushHistory(activeGoalAfterMessages, "completion-unverified", "Assistant output [goal:complete] without a [goal:evidence] line; completion rejected, continuing.");
-        } else if (!terminalBoundary && goalIsBlocked(latestText)) {
-          const reason = extractBlockedReason(latestText);
+        } else if (!terminalBoundary && goalIsBlocked(turnText)) {
+          const reason = extractBlockedReason(turnText);
           if (reason) {
             await announceAudit(sessionID, `Auditing goal blocker: the assistant reported it is blocked on "${summarizeText(activeGoalAfterMessages.condition, 120)}".`);
             const blockedGoal = activeGoal(sessionID, goalID, runID);
@@ -20301,10 +20500,13 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           return;
         }
         const turnHasToolCall = turnCallsTool(turnMessages);
+        if (turnTruncated && activeGoalAfterMessages.turnCount > 0 && !activationBoundary) {
+          pushHistory(activeGoalAfterMessages, "warning", `The latest turn reaches the edge of the ${activeGoalAfterMessages.options.maxRecentMessages}-message visibility window and may be truncated; the stall brakes were not charged for it. Raise maxRecentMessages if this repeats.`);
+        }
         const turnReasoningTokens = sumTurnReasoningTokens(turnMessages);
         const turnHasThinkingTokens = turnReasoningTokens > 0;
-        const lowOutputTurn = activeGoalAfterMessages.turnCount > 0 && !activationBoundary && turnOutputTokens !== null && turnOutputTokens < activeGoalAfterMessages.options.noProgressTokenThreshold;
-        const lowOutputLooksStalled = lowOutputTurn && !turnHasToolCall && !turnHasThinkingTokens && (assistantRepeated || !latestText || !assistantChanged);
+        const lowOutputTurn = activeGoalAfterMessages.turnCount > 0 && !activationBoundary && !turnTruncated && turnOutputTokens !== null && turnOutputTokens < activeGoalAfterMessages.options.noProgressTokenThreshold;
+        const lowOutputLooksStalled = lowOutputTurn && !turnHasToolCall && !turnHasThinkingTokens && (assistantRepeated || !turnText || !assistantChanged);
         if (lowOutputLooksStalled && !childWakeEvent) {
           activeGoalAfterMessages.noProgressTurns += 1;
           if (activeGoalAfterMessages.noProgressTurns >= activeGoalAfterMessages.options.noProgressTurnsBeforePause) {
@@ -20330,7 +20532,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         } else if (!childWakeEvent && (turnOutputTokens !== null || assistantChanged || !latestAssistant)) {
           activeGoalAfterMessages.noProgressTurns = 0;
         }
-        const noToolCallContinuation = activeGoalAfterMessages.options.noToolCallTurnsBeforePause > 0 && activeGoalAfterMessages.turnCount > 0 && !activationBoundary && Boolean(latestAssistant) && !turnHasToolCall;
+        const noToolCallContinuation = activeGoalAfterMessages.options.noToolCallTurnsBeforePause > 0 && activeGoalAfterMessages.turnCount > 0 && !activationBoundary && !turnTruncated && Boolean(latestAssistant) && !turnHasToolCall;
         if (noToolCallContinuation && !lowOutputLooksStalled && !childWakeEvent) {
           activeGoalAfterMessages.noToolCallTurns += 1;
           if (activeGoalAfterMessages.noToolCallTurns >= activeGoalAfterMessages.options.noToolCallTurnsBeforePause) {
@@ -20395,7 +20597,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
             activeGoalBeforePrompt.lastStatus = `Rejected a [goal:blocked] with no concrete blocker; re-prompting on turn ${activeGoalBeforePrompt.turnCount}.`;
           } else {
             activeGoalBeforePrompt.formatFailures = Math.max(0, activeGoalBeforePrompt.formatFailures - 1);
-            activeGoalBeforePrompt.lastStatus = latestText ? `Continuing after assistant turn ${activeGoalBeforePrompt.turnCount}.` : `Continuing after idle event ${activeGoalBeforePrompt.turnCount}.`;
+            activeGoalBeforePrompt.lastStatus = turnText ? `Continuing after assistant turn ${activeGoalBeforePrompt.turnCount}.` : `Continuing after idle event ${activeGoalBeforePrompt.turnCount}.`;
           }
           if (activeGoalBeforePrompt.formatFailures >= activeGoalBeforePrompt.options.maxPromptFailures) {
             activeGoalBeforePrompt.stopped = true;
@@ -20715,7 +20917,11 @@ var testInternals = {
   extractCompletionEvidence,
   findLatestAssistantMessage,
   assistantMessagesForTurn,
+  messageParentID,
+  isCompactionAssistantMessage,
   turnCallsTool,
+  turnTerminalText,
+  turnWasTruncated,
   sumTurnOutputTokens,
   sumTurnReasoningTokens,
   formatArgumentErrors,
@@ -20745,6 +20951,13 @@ var testInternals = {
   isPluginGeneratedMessage,
   legacyStateFilePaths,
   messageHasToolCall,
+  messageHasWorkToolCall,
+  isPluginOwnToolName,
+  messageTokenCounts,
+  usageStepStarted,
+  addUsageDelta,
+  contextWindowLimit,
+  formatContextBudget,
   normalizeCommandOptions,
   normalizeMode,
   normalizeOptions,

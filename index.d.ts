@@ -119,11 +119,16 @@ export interface GoalSidebarStatus {
   tokens: { used: number; max: number }
   /**
    * Context pressure, added in v2: `used` is the peak single-message context
-   * the goal has seen (reset to zero by a compaction) and `max` is
-   * `contextWindowTokens`. Unlike {@link GoalSidebarStatus.tokens}`.used`,
-   * this number can go down.
+   * the goal has seen (reset to zero by a compaction) and `max` is the goal's
+   * context ceiling — an explicit `contextWindowTokens`, or the window the
+   * host reported for the model this goal runs on. Unlike
+   * {@link GoalSidebarStatus.tokens}`.used`, this number can go down.
+   *
+   * OMITTED entirely when neither ceiling is known, because `max: 0` would
+   * render as a budget of zero; a consumer must treat an absent `context` as
+   * "no context ceiling" and drop the stat.
    */
-  context: { used: number; max: number }
+  context?: { used: number; max: number }
   plan: {
     total: number
     verified: number
@@ -160,6 +165,15 @@ export interface GoalAuditSnapshot {
    * cumulative spend; spend is `usage` (see {@link GoalUsage}).
    */
   peakContextTokens: number
+  /**
+   * The context window the host reported for the model this goal is running
+   * on, or `0` when it could not say. Used as the goal's context ceiling only
+   * while {@link GoalPluginOptions.contextWindowTokens} is `0` (auto), which
+   * is the default; an explicit option or `--context-window` always wins.
+   */
+  modelContextTokens: number
+  /** `<providerID>/<modelID>` the window above was read for, or `""`. */
+  modelKey: string
   usage: Readonly<GoalUsage>
   options: Readonly<GoalPluginOptions>
   lastStatus: string
@@ -261,12 +275,24 @@ export interface GoalPluginOptions {
    * single-message context (`input + output + reasoning + cache` on one
    * message, kept as a high-water mark and reset by a compaction). Distinct
    * from {@link GoalPluginOptions.maxTokens}, which bounds cumulative spend
-   * and only ever grows. At `budgetWrapupRatio` of this the goal is sent the
-   * wrap-up handoff, at `contextWindowTokens - warnTokensRemaining` it is
-   * warned, and at the ceiling it pauses with stop reason
-   * `context window reached`. Overridable per-goal with `--context-window`
-   * (accepts a `k`/`m` suffix, e.g. `400k`, `1m`).
-   * @default 200000
+   * and only ever grows. At `budgetWrapupRatio` of the ceiling the goal is sent
+   * the wrap-up handoff (which PAUSES it), at `ceiling - warnTokensRemaining`
+   * it is warned, and at the ceiling it pauses with stop reason
+   * `context window reached`.
+   *
+   * `0` — the default — means AUTO: the ceiling is the window of the model the
+   * goal is running on, read once from the host's provider catalog
+   * (`client.config.providers()` → `models[id].limit.context`). Any positive
+   * value overrides that and skips the lookup. When neither is available the
+   * goal has NO context ceiling: the guard stays off rather than pausing a
+   * healthy run against a guessed number, `/goal status` renders the peak
+   * against `∞`, the continuation prompt reports
+   * `context_remaining: unlimited`, and
+   * {@link GoalSidebarStatus.context} is omitted.
+   *
+   * Overridable per-goal with `--context-window` (accepts a `k`/`m` suffix,
+   * e.g. `400k`, `1m`).
+   * @default 0
    */
   contextWindowTokens?: number
 
