@@ -291,15 +291,15 @@ Markers must appear on their own final line. The bracketed form is canonical, bu
 
 | Limit | Default |
 |---|---|
-| Auto-continue turns | 10 |
-| Max duration | 15 minutes |
-| Context tokens | 200,000 |
+| Auto-continue turns | unlimited (`0`) |
+| Max duration | 8 hours |
+| Context tokens | 100,000,000 |
 | Min delay between continues | 1.5 seconds |
 | No-progress pause | < 50 output tokens on a stalled turn (after a 2-turn grace window) |
 | Budget wrap-up threshold | 80% of context token budget |
 | Auto-continue failure pause | 3 consecutive prompt failures |
 
-**Effective turn count.** Each LLM turn on a real task typically takes 30–90 seconds. The default 10 auto-continues is normally the binding brake before the 15-minute window; raise `--max-turns` and/or `--max-minutes` deliberately for longer work.
+**Effective turn count.** Turns are **unlimited by default** (`maxTurns: 0`), and the wall clock is 8 hours. With those defaults neither the turn counter nor the token budget is the brake that normally stops a run: the binding brakes are the **no-tool-call pause** (two consecutive talk-only continuation turns) and the **no-progress pause** (two consecutive stalled low-output turns), with the 8-hour window behind them as the outer bound. That is deliberate — an arbitrary turn count stops a healthy long run for no reason, while a loop that has stopped doing work is caught within two turns either way. Set `--max-turns <n>` when you want a hard ceiling on a single goal, and `--max-minutes` to shorten the window.
 
 **Token budget.** The plugin tracks the session's context window size (`input + output + reasoning` tokens on the latest message). This matches the token count that OpenCode displays, so the numbers should be consistent. When the context window reaches the `--max-tokens` limit, the plugin sends a wrap-up prompt and stops. In high-context sessions (large codebases, long conversation history), the context can grow quickly — treat the budget as a safety brake.
 
@@ -337,7 +337,7 @@ Override any limit for a single goal:
 
 | Flag | Controls |
 |---|---|
-| `--max-turns <n>` | Auto-continue turn limit |
+| `--max-turns <n>` | Auto-continue turn limit. `0`, `unlimited`, `none`, `inf`, `infinite`, or `∞` means no ceiling (the default) |
 | `--max-minutes <n>` | Duration limit in minutes |
 | `--max-duration-ms <n>` | Duration limit in milliseconds |
 | `--max-tokens <n>` | Context token limit |
@@ -356,6 +356,7 @@ Examples:
 ```sh
 /goal fix tests --max-turns 20 --max-tokens 400000
 /goal fix tests --max-turns=20 --max-tokens=400000
+/goal fix tests --max-turns unlimited --max-minutes 480
 /goal fix tests --no-progress-threshold 50 --no-progress-turns 2
 /goal fix tests --budget 100k
 ```
@@ -370,9 +371,9 @@ Pass options when registering the plugin to change the defaults for all goals. T
     [
       "opencode-goal-plugin",
       {
-        "maxTurns": 10,
-        "maxDurationMs": 900000,
-        "maxTokens": 200000,
+        "maxTurns": 0,
+        "maxDurationMs": 28800000,
+        "maxTokens": 100000000,
         "minDelayMs": 1500,
         "maxRecentMessages": 50,
         "noProgressTokenThreshold": 50,
@@ -397,7 +398,7 @@ Additional plugin-level options:
 - `noToolCallTurnsBeforePause` — grace window for tool-free continuation turns. The plugin pauses after this many consecutive continuation turns that produced no tool calls (anti self-chat loop). Default `2`; set the plugin option to `0` for legitimate tool-free writing/research workflows.
 - `noInterruptOnUserMessage` — when `true`, a new human message no longer pauses an active goal ("user intervention"); the goal loop keeps running and the message steers the next continuation. Because typing a message no longer stops the loop, `/goal pause` and `/goal stop` become the way to halt it. Default `false`, which pauses for `/goal resume` as before.
 - `noContinueWhileChildrenActive` — when `true`, auto-continue is deferred while the session has active child sessions (subagents, background tasks): the goal stays running but does not prompt the orchestrator until the children finish. A child counts as active only while the host reports a non-idle status for it, and each deferral is reported in `/goal status` and the lifecycle history so a waiting goal is never mistaken for a hung one. Default `false`. Enabling it adds a `children` and a `status` call to each idle the goal loop evaluates. The gate fails open — continuation proceeds — for hosts that cannot report children/status, for sessions with more concurrent children than the plugin can track, and for children that run goals of their own. Note that the gate relies on the child's own idle event to resume, so a host that never emits one leaves the goal waiting; `/goal status` reports the deferral in that case.
-- `warnTurnsRemaining` / `warnDurationMsRemaining` / `warnTokensRemaining` — thresholds at which the auto-continue prompt appends a "limits are near" warning (default `3` turns, `60000` ms, `25000` context tokens). Lower them to warn closer to the limit, or raise them to warn earlier.
+- `warnTurnsRemaining` / `warnDurationMsRemaining` / `warnTokensRemaining` — thresholds at which the auto-continue prompt appends a "limits are near" warning (default `3` turns, `60000` ms, `25000` context tokens). Lower them to warn closer to the limit, or raise them to warn earlier. **With the default unlimited turn budget there is no turn warning at all** — nothing is running out — so `warnTurnsRemaining` only takes effect on a goal that sets an explicit `--max-turns <n>`.
 - `commandName` — the slash command the plugin owns (default `goal`). Set it to e.g. `objective` to drive the workflow with `/objective` instead of `/goal`; a leading slash is tolerated. Remember to register the matching command name in your OpenCode `command` config. User-facing hints (`/goal status`, `/goal resume`, …) follow the configured name.
 - `registerCommand` — whether the plugin installs its `command.execute.before` hook at all (default `true`). Set it to `false` if you only want the auto-continue/persistence behavior driven programmatically and don't want the plugin to own a slash command.
 - `registerTools` — whether the plugin registers the agent-facing goal tools (default `true`). Set to `false` to omit the programmatic tool surface entirely. See [Agent tools](#agent-tools).
@@ -474,10 +475,10 @@ await GoalPlugin(
 Unattended runs are easier to trust when you can see the goal is still alive. The plugin mirrors live goal status into the OpenCode sidebar, which renders the session title:
 
 ```
-▶ ship the release · 2/4 · 3/10 · 2m · 45k/200k · 3/7✓
+▶ ship the release · 2/4 · 3/∞ · 2m/8h · 147k/100m · 3/7✓
 ```
 
-Status icon, objective label, sequence position (only for `/goal sequence`), auto-continues used / limit, elapsed time, context tokens / budget, and verified actions / total. The icon distinguishes running (`▶`), paused (`⏸`), blocked (`⛔`), and completed (`✓`) — blocked outranks paused because it needs you, not just a resume. A paused goal freezes its elapsed clock rather than running on.
+Status icon, objective label, sequence position (only for `/goal sequence`), auto-continues used / limit, elapsed / duration limit, context tokens / budget, and verified actions / total. An unlimited turn budget renders its ceiling as `∞`. Durations of an hour or more render in hours with one decimal and no trailing `.0` (`45m`, `1h`, `1.5h`, `8h`); elapsed and limit are formatted independently, so a fresh 8-hour goal reads `0m/8h` and the same goal 90 minutes in reads `1.5h/8h`. The icon distinguishes running (`▶`), paused (`⏸`), blocked (`⛔`), and completed (`✓`) — blocked outranks paused because it needs you, not just a resume. A paused goal freezes its elapsed clock rather than running on.
 
 When a goal ends, the sidebar switches to one terminal render (`✓ …`, state `completed`) instead of leaving the last running status up; `/goal clear` then hands the title back. A failure is not a separate state: it shows as `blocked` with a `blockedReason`, or `paused` with a `stopReason`, because a failed goal stays resumable.
 
@@ -489,9 +490,9 @@ Alongside the title, the plugin writes a structured payload to the session's `me
   "goalId": "…",
   "state": "active",
   "objective": "ship the release",
-  "turns": { "used": 3, "max": 10 },
-  "minutes": { "used": 2, "max": 30 },
-  "tokens": { "used": 45000, "max": 200000 },
+  "turns": { "used": 3, "max": null, "unlimited": true },
+  "minutes": { "used": 2, "max": 480 },
+  "tokens": { "used": 147000, "max": 100000000 },
   "plan": { "total": 7, "verified": 3, "blocked": 0, "actions": [ … ] },
   "successCriteria": "tests pass and changelog updated",
   "constraints": "do not touch the public API",
@@ -499,6 +500,8 @@ Alongside the title, the plugin writes a structured payload to the session's `me
   "updatedAt": 1767225600000
 }
 ```
+
+The payload stays machine-readable where the title is not: `minutes.used` / `minutes.max` are plain numbers of minutes, and `tokens` is a plain token count. The one budget with a "no ceiling" state is `turns`, which carries `"max": null` plus an explicit `"unlimited": true` — never `Infinity`, which JSON serialises to `null` and would be indistinguishable from a missing field. A bounded goal carries `"turns": { "used": 3, "max": 10 }` with no `unlimited` key.
 
 **Mechanism.** Both halves are one `PATCH /session/{id}` call (`client.session.update`). The session title is what the OpenCode TUI sidebar renders for the current session, and `metadata` is reconciled into the TUI's reactive session store on the `session.updated` event. This half needs no TUI entrypoint and no `@opentui` dependency, so it works on every client that shows a session title — including `opencode run`, the desktop client, and any host reading the session record over HTTP. The [sidebar panel](#sidebar-panel-tui) below renders the same payload as a real panel when the host supports TUI plugins.
 
@@ -531,7 +534,7 @@ The title line is one row. When OpenCode's TUI supports plugin sidebar slots (1.
 ```
 Goal
 ▶ ship the release
-3/10 turns · 2/30m · 45k/200k tokens
+3/∞ turns · 2m/8h · 147k/100m tokens
 step 2/4
 3/7 actions verified, 1 blocked
 ● rebuild dist [pass]

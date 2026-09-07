@@ -20,6 +20,14 @@ import { applyNativeGoalConfig } from "./native-agent-config.js"
 import { serializeCompletionClaim } from "./completion-claim.js"
 import { goalToolFailure, goalToolSuccess, serializeGoalToolResult } from "./goal-tool-result.js"
 import {
+  formatBudgetDuration,
+  formatBudgetMinutes,
+  formatTurnBudget,
+  formatTurnLimit,
+  isUnlimitedTurnBudget,
+  UNLIMITED_WORD,
+} from "./goal-format.js"
+import {
   acquirePersistenceLease,
   isPersistenceLeaseContendedError,
 } from "./persistence-lease.js"
@@ -80,9 +88,14 @@ const ACTIVE_PERSISTENCE_OWNED = Object.freeze({ kind: "active", persistence: "o
 const PLUGIN_DISPOSED = Object.freeze({ kind: "disposed" })
 
 const DEFAULT_OPTIONS = {
-  maxTurns: 10,
-  maxDurationMs: 15 * 60 * 1000,
-  maxTokens: 200000,
+  // `maxTurns: 0` means UNLIMITED, and is the default: with an 8-hour window
+  // and a 100m-token budget, the brakes that actually matter for an unattended
+  // run are the no-tool-call and no-progress pauses, not an arbitrary turn
+  // count. Zero rather than `Infinity` because these options round-trip
+  // through the persisted JSON state and `JSON.stringify(Infinity)` is `null`.
+  maxTurns: 0,
+  maxDurationMs: 8 * 60 * 60 * 1000,
+  maxTokens: 100000000,
   minDelayMs: 1500,
   maxRecentMessages: 50,
   noProgressTokenThreshold: 50,
@@ -209,9 +222,11 @@ const PAUSE_COMMANDS = new Set(["pause"])
 // the parser boundary so existing scripts do not break.
 const SEQUENCE_COMMANDS = ["sequence", "sisyphus"]
 const GOAL_FLAG_SPECS = {
+  // Accepts a positive integer, or any spelling of "no ceiling":
+  // `0`, `unlimited`, `none`, `inf`, `infinite`, `infinity`, `∞`.
   "--max-turns": {
+    type: "turns",
     optionKey: "maxTurns",
-    parse: (value, options) => toPositiveInteger(value, options.maxTurns),
   },
   "--max-duration-ms": {
     optionKey: "maxDurationMs",
@@ -533,17 +548,15 @@ const SIDEBAR_METADATA_VERSION = 1
 const SIDEBAR_METADATA_TEXT_LIMIT = 400
 const SIDEBAR_METADATA_MAX_ACTIONS = 20
 
-// The title sits in a narrow column, so every field is abbreviated hard.
-function formatCompactDuration(ms) {
-  const totalSeconds = Math.max(0, Math.round(ms / 1000))
-  if (totalSeconds < 60) return `${totalSeconds}s`
-  const totalMinutes = Math.floor(totalSeconds / 60)
-  if (totalMinutes < 60) return `${totalMinutes}m`
-  const hours = Math.floor(totalMinutes / 60)
-  const minutes = totalMinutes % 60
-  return minutes ? `${hours}h${minutes}m` : `${hours}h`
+// Prose spelling for history and command output, where "∞ auto-continues"
+// would read as a glyph rather than a sentence.
+function describeTurnLimit(max) {
+  return isUnlimitedTurnBudget(max) ? UNLIMITED_WORD : String(max)
 }
 
+// The title sits in a narrow column, so the token budget is abbreviated hard.
+// Durations and turn budgets use the shared formatters in ./goal-format.js, so
+// the title and the TUI panel cannot drift apart.
 function formatCompactTokens(tokens) {
   const value = toNonNegativeInteger(tokens)
   if (value < 1000) return String(value)
@@ -597,10 +610,11 @@ function buildSidebarTerminal(goal, state, finishedAt) {
 }
 
 // One-line goal status for the session title, e.g.
-// "▶ ship the release · 2/4 · 3/10 · 2m · 45k/200k · 3/7✓".
+// "▶ ship the release · 2/4 · 3/∞ · 2m/8h · 45k/100m · 3/7✓".
 // Fields, in order: state icon + short objective, sequence position (only when
-// `/goal sequence` is driving an ordered set), auto-continues used / limit,
-// elapsed / clock, context tokens / budget, verified plan actions / total.
+// `/goal sequence` is driving an ordered set), auto-continues used / limit
+// (`∞` when turns are unlimited), elapsed / clock, context tokens / budget,
+// verified plan actions / total.
 function buildSessionTitle(goal, now = Date.now(), context = {}) {
   const elapsedMs = Math.max(0, (goal.pausedAt || now) - goal.startedAt)
   const fields = [
@@ -610,8 +624,8 @@ function buildSessionTitle(goal, now = Date.now(), context = {}) {
     fields.push(`${context.sequencePosition}/${context.sequenceTotal}`)
   }
   fields.push(
-    `${goal.turnCount}/${goal.options.maxTurns}`,
-    formatCompactDuration(elapsedMs),
+    formatTurnBudget(goal.turnCount, goal.options.maxTurns),
+    `${formatBudgetDuration(elapsedMs)}/${formatBudgetDuration(goal.options.maxDurationMs)}`,
     `${formatCompactTokens(goal.totalTokens)}/${formatCompactTokens(goal.options.maxTokens)}`,
   )
   const progress = planProgress(goal.plan)
@@ -632,7 +646,12 @@ function buildSidebarMetadata(goal, now = Date.now(), context = {}) {
     goalId: goal.goalId,
     state: sidebarGoalState(goal),
     objective: summarizeText(goalLabel(goal), SESSION_TITLE_OBJECTIVE_LIMIT * 4),
-    turns: { used: goal.turnCount, max: goal.options.maxTurns },
+    // Machine-readable: an unlimited turn budget is `max: null` plus an
+    // explicit `unlimited: true`, never `Infinity` (which JSON drops to null
+    // on its own) and never a sentinel number a consumer could render.
+    turns: isUnlimitedTurnBudget(goal.options.maxTurns)
+      ? { used: goal.turnCount, max: null, unlimited: true }
+      : { used: goal.turnCount, max: goal.options.maxTurns },
     minutes: {
       used: Math.round(elapsedMs / 60000),
       max: Math.round(goal.options.maxDurationMs / 60000),
@@ -981,7 +1000,8 @@ function formatStatus(
   commandName = "goal",
   completionAuditLabel = "evidence gate only (independent verifier off)",
 ) {
-  const elapsed = Math.round((Date.now() - goal.startedAt) / 1000)
+  const elapsedMs = Math.max(0, Date.now() - goal.startedAt)
+  const elapsed = Math.round(elapsedMs / 1000)
   const lastProgress =
     goal.lastProgressAt > 0
       ? `${Math.round((Date.now() - goal.lastProgressAt) / 1000)}s ago`
@@ -1004,10 +1024,10 @@ function formatStatus(
   if (goal.constraints) lines.push(`Constraints: ${goal.constraints}`)
   if (goal.mode && goal.mode !== "normal") lines.push(`Mode: ${goal.mode}`)
   lines.push(
-    `Auto-continues sent: ${goal.turnCount}/${goal.options.maxTurns}`,
+    `Auto-continues sent: ${formatTurnBudget(goal.turnCount, goal.options.maxTurns)}`,
     `Context tokens: ${goal.totalTokens.toLocaleString()}/${goal.options.maxTokens.toLocaleString()}`,
     formatUsage(goal.usage),
-    `Elapsed: ${elapsed}s/${Math.round(goal.options.maxDurationMs / 1000)}s`,
+    `Elapsed: ${elapsed}s (${formatBudgetDuration(elapsedMs)}/${formatBudgetDuration(goal.options.maxDurationMs)})`,
     `Last progress: ${lastProgress}`,
     `No-progress turns: ${goal.noProgressTurns}`,
     `Recent checkpoint: ${lastCheckpoint}`,
@@ -1067,9 +1087,16 @@ function goalIsBlocked(text) {
 }
 
 function stopReason(goal) {
-  if (goal.turnCount >= goal.options.maxTurns) return `max turns reached (${goal.options.maxTurns})`
+  // An unlimited turn budget (`maxTurns: 0`) is never reached, however many
+  // auto-continues have been sent.
+  if (
+    !isUnlimitedTurnBudget(goal.options.maxTurns) &&
+    goal.turnCount >= goal.options.maxTurns
+  ) {
+    return `max turns reached (${goal.options.maxTurns})`
+  }
   if (Date.now() - goal.startedAt >= goal.options.maxDurationMs) {
-    return `max duration reached (${Math.round(goal.options.maxDurationMs / 1000)}s)`
+    return `max duration reached (${formatBudgetDuration(goal.options.maxDurationMs)})`
   }
   if (goal.totalTokens >= goal.options.maxTokens) return `max context tokens reached (${goal.options.maxTokens.toLocaleString()})`
   return null
@@ -1429,6 +1456,25 @@ function parsePositiveIntegerStrict(value) {
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null
 }
 
+// The spellings of "no turn ceiling" the `--max-turns` flag accepts. All of
+// them normalize to 0, the persisted representation of an unlimited budget.
+const UNLIMITED_TURN_WORDS = new Set(["0", "unlimited", "none", "inf", "infinite", "infinity", "∞"])
+
+// Parse a `--max-turns` value: a positive integer, or any unlimited spelling
+// (which yields 0). Returns null for anything else, so the caller can report
+// the error and leave the configured default in place.
+function parseTurnBudget(value) {
+  const raw = String(value).trim().toLowerCase()
+  if (UNLIMITED_TURN_WORDS.has(raw)) return 0
+  return parsePositiveIntegerStrict(raw)
+}
+
+// Like toPositiveInteger, but 0 is a real value (unlimited), not a miss.
+function toTurnBudget(value, fallback) {
+  const parsed = Number(value)
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : fallback
+}
+
 // Parse a token budget that may use a `k` (×1000) or `m` (×1,000,000) suffix,
 // e.g. "100k" -> 100000, "1.5m" -> 1500000, "200000" -> 200000. Returns a
 // positive safe integer or null when the value is not a positive number.
@@ -1454,7 +1500,8 @@ function stripWrappingQuotes(value) {
 
 function normalizeOptions(options = {}) {
   return {
-    maxTurns: toPositiveInteger(options.maxTurns, DEFAULT_OPTIONS.maxTurns),
+    // 0 is kept verbatim: it is the unlimited-turns value, not a missing one.
+    maxTurns: toTurnBudget(options.maxTurns, DEFAULT_OPTIONS.maxTurns),
     maxDurationMs: toPositiveInteger(options.maxDurationMs, DEFAULT_OPTIONS.maxDurationMs),
     maxTokens: toPositiveInteger(options.maxTokens, DEFAULT_OPTIONS.maxTokens),
     minDelayMs: toPositiveInteger(options.minDelayMs, DEFAULT_OPTIONS.minDelayMs),
@@ -2479,6 +2526,16 @@ function parseGoalArguments(args, defaults) {
 
       const rawValue = stripWrappingQuotes(value)
 
+      if (flagSpec.type === "turns") {
+        const turns = parseTurnBudget(rawValue)
+        if (turns === null) {
+          errors.push(`Invalid positive integer for ${flagName}: ${value}`)
+          continue
+        }
+        options[flagSpec.optionKey] = turns
+        continue
+      }
+
       if (flagSpec.type === "tokens") {
         const budget = parseTokenBudget(rawValue)
         if (budget === null) {
@@ -2564,12 +2621,14 @@ function sleep(ms, signal) {
 }
 
 function buildLimitWarning(goal) {
+  const unlimitedTurns = isUnlimitedTurnBudget(goal.options.maxTurns)
   const remainingTurns = goal.options.maxTurns - goal.turnCount
   const remainingMs = goal.options.maxDurationMs - (Date.now() - goal.startedAt)
   const remainingTokens = goal.options.maxTokens - goal.totalTokens
   const warnings = []
 
-  if (remainingTurns <= goal.options.warnTurnsRemaining) {
+  // An unlimited turn budget has nothing to run out of, so it never warns.
+  if (!unlimitedTurns && remainingTurns <= goal.options.warnTurnsRemaining) {
     warnings.push(`${remainingTurns} auto-continue turn(s) remaining`)
   }
   if (remainingMs <= goal.options.warnDurationMsRemaining) {
@@ -2669,7 +2728,9 @@ function buildContinueMessage(
   } = {},
 ) {
   const remainingTokens = Math.max(0, goal.options.maxTokens - goal.totalTokens)
-  const remainingTurns = Math.max(0, goal.options.maxTurns - goal.turnCount)
+  const remainingTurns = isUnlimitedTurnBudget(goal.options.maxTurns)
+    ? UNLIMITED_WORD
+    : Math.max(0, goal.options.maxTurns - goal.turnCount)
   const elapsedSeconds = Math.round((Date.now() - goal.startedAt) / 1000)
   const lines = [
     "<goal_continuation>",
@@ -2783,7 +2844,7 @@ function buildCompactionContext(goal) {
     "The summary below is reconstructed deterministically from the plugin's persisted goal record, not from chat memory.",
     buildGoalBlock(goal),
     `Goal status: ${goal.stopped ? goal.stopReason || "stopped" : "active"}.`,
-    `Auto-continues used: ${goal.turnCount}/${goal.options.maxTurns}. Context tokens: ${goal.totalTokens}/${goal.options.maxTokens}. Elapsed: ${elapsedSeconds}s.`,
+    `Auto-continues used: ${formatTurnBudget(goal.turnCount, goal.options.maxTurns)}. Context tokens: ${goal.totalTokens}/${goal.options.maxTokens}. Elapsed: ${elapsedSeconds}s.`,
     goal.lastCheckpoint ? `Latest checkpoint: ${escapeGoalText(summarizeText(goal.lastCheckpoint.summary, 200))}` : null,
     ...buildCompactionProgressSummary(goal),
     // Plan STATE only. The full plan contract and the CEV rule ride in the
@@ -3649,8 +3710,10 @@ function buildAgentToolHandlers({
 
     // Validate budget args before normalizing: normalizeOptions silently substitutes
     // defaults for non-positive values, giving no feedback to the caller.
-    if (Number.isFinite(args.maxTurns) && args.maxTurns <= 0)
-      return `Invalid maxTurns: ${args.maxTurns} — must be a positive integer.`
+    // 0 is the explicit "unlimited turns" value, so only a negative or
+    // fractional count is a mistake.
+    if (Number.isFinite(args.maxTurns) && !(Number.isSafeInteger(args.maxTurns) && args.maxTurns >= 0))
+      return `Invalid maxTurns: ${args.maxTurns} — must be a positive integer, or 0 for unlimited.`
     if (Number.isFinite(args.maxTokens) && args.maxTokens <= 0)
       return `Invalid maxTokens: ${args.maxTokens} — must be a positive integer.`
     if (Number.isFinite(args.maxDurationMs) && args.maxDurationMs <= 0)
@@ -3672,7 +3735,7 @@ function buildAgentToolHandlers({
     pushHistory(
       goal,
       "set",
-      `Goal created via agent tool with limits: ${options.maxTurns} auto-continues, ${Math.round(options.maxDurationMs / 1000)}s, ${options.maxTokens.toLocaleString()} context tokens.`,
+      `Goal created via agent tool with limits: ${describeTurnLimit(options.maxTurns)} auto-continues, ${formatBudgetDuration(options.maxDurationMs)}, ${options.maxTokens.toLocaleString()} context tokens.`,
     )
     // Mirror the `/goal <condition>` replace path: discard the focused goal and
     // its saved result, drop any ordered sequence, then register + focus the new
@@ -4300,7 +4363,8 @@ function buildAgentTools(
     }),
     goal_set: toolHelper({
       description:
-        "Set or replace the session goal. Call only when the user explicitly asks to set or pursue a goal.",
+        "Set or replace the session goal. Call only when the user explicitly asks to set or pursue a goal. " +
+        "maxTurns 0 means unlimited auto-continue turns, which is the default.",
       args: {
         objective: schema.string(),
         maxTurns: schema.number().optional(),
@@ -4407,7 +4471,7 @@ function buildAgentTools(
     }),
     set_goal: toolHelper({
       description:
-        "Set a new session goal for autonomous auto-continue. ONLY call this when the user explicitly asks you to set, define, or start working toward a goal — never decide to set a goal on your own. Replaces any existing goal.",
+        "Set a new session goal for autonomous auto-continue. ONLY call this when the user explicitly asks you to set, define, or start working toward a goal — never decide to set a goal on your own. Replaces any existing goal. maxTurns 0 means unlimited auto-continue turns, which is the default.",
       args: {
         objective: schema.string(),
         maxTurns: schema.number().optional(),
@@ -6110,7 +6174,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         pushHistory(
           added,
           "set",
-          `Goal added with limits: ${added.options.maxTurns} auto-continues, ${Math.round(added.options.maxDurationMs / 1000)}s, ${added.options.maxTokens.toLocaleString()} context tokens.`,
+          `Goal added with limits: ${describeTurnLimit(added.options.maxTurns)} auto-continues, ${formatBudgetDuration(added.options.maxDurationMs)}, ${added.options.maxTokens.toLocaleString()} context tokens.`,
         )
         registerSessionGoal(added)
         focusGoal(sessionID, added)
@@ -6146,7 +6210,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       pushHistory(
         goal,
         "set",
-        `Goal created with limits: ${goal.options.maxTurns} auto-continues, ${Math.round(goal.options.maxDurationMs / 1000)}s, ${goal.options.maxTokens.toLocaleString()} context tokens.`,
+        `Goal created with limits: ${describeTurnLimit(goal.options.maxTurns)} auto-continues, ${formatBudgetDuration(goal.options.maxDurationMs)}, ${goal.options.maxTokens.toLocaleString()} context tokens.`,
       )
 
       // A goal set while a planning-only agent is active is recorded but held,
@@ -6218,9 +6282,9 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
               ]),
           `Use \`/${commandName} history\` to inspect recent lifecycle events and checkpoints.`,
           "",
-          `Limits: ${goal.options.maxTurns} auto-continues, ${Math.round(
-            goal.options.maxDurationMs / 1000,
-          )}s, ${goal.options.maxTokens.toLocaleString()} context tokens.`,
+          `Limits: ${describeTurnLimit(goal.options.maxTurns)} auto-continues, ${formatBudgetDuration(
+            goal.options.maxDurationMs,
+          )}, ${goal.options.maxTokens.toLocaleString()} context tokens.`,
         ]
           .filter((line) => line !== null)
           .join("\n"),
@@ -7283,7 +7347,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
               budgetWrapup ? "budget-wrapup" : "auto-continue",
               budgetWrapup
                 ? "Sent a final handoff request near the context token budget."
-                : `Sent auto-continue prompt ${activeGoalAfterPrompt.turnCount}/${activeGoalAfterPrompt.options.maxTurns}.`,
+                : `Sent auto-continue prompt ${formatTurnBudget(activeGoalAfterPrompt.turnCount, activeGoalAfterPrompt.options.maxTurns)}.`,
             )
           }
         }
@@ -7609,8 +7673,14 @@ export const testInternals = {
   isPluginContinuationMessage,
   isPlanAgent,
   buildSessionTitle,
-  formatCompactDuration,
   formatCompactTokens,
+  formatBudgetDuration,
+  formatBudgetMinutes,
+  formatTurnBudget,
+  formatTurnLimit,
+  isUnlimitedTurnBudget,
+  describeTurnLimit,
+  parseTurnBudget,
   goalStatusIcon,
   looksLikePluginSessionTitle,
   isRestrictedAgent,

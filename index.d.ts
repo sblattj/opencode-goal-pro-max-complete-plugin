@@ -88,7 +88,13 @@ export interface GoalSidebarStatus {
   state: "active" | "paused" | "blocked" | "completed"
   /** Short label derived from the objective's first line (or `--objective`). */
   objective: string
-  turns: { used: number; max: number }
+  /**
+   * Auto-continue turns used and the ceiling. An unlimited turn budget
+   * (`maxTurns: 0`) is `max: null` with `unlimited: true` — never `Infinity`,
+   * which JSON serialises to `null` on its own and would be indistinguishable
+   * from a missing field.
+   */
+  turns: { used: number; max: number | null; unlimited?: boolean }
   minutes: { used: number; max: number }
   tokens: { used: number; max: number }
   plan: {
@@ -182,24 +188,30 @@ export interface GoalPluginOptions {
 
   /**
    * Maximum number of auto-continue turns sent toward a goal before it is
-   * stopped for exceeding limits. Overridable per-goal with `--max-turns`.
-   * @default 10
+   * stopped for exceeding limits. `0` means **unlimited** and is the default:
+   * with an 8-hour window the binding brakes are the no-tool-call and
+   * no-progress pauses, not a turn count. Overridable per-goal with
+   * `--max-turns`, which also accepts `unlimited`, `none`, `inf`, `infinite`,
+   * and `∞`.
+   * @default 0
    */
   maxTurns?: number
 
   /**
    * Maximum wall-clock duration, in milliseconds, a goal may run before it
-   * is stopped for exceeding limits. Overridable per-goal with
-   * `--max-duration-ms` or `--max-minutes`.
-   * @default 900000
+   * is stopped for exceeding limits. Defaults to 8 hours (28,800,000 ms).
+   * Overridable per-goal with `--max-duration-ms` or `--max-minutes`.
+   * @default 28800000
    */
   maxDurationMs?: number
 
   /**
    * Maximum context token budget a goal may consume before it is stopped
-   * for exceeding limits. Overridable per-goal with `--max-tokens` or the
-   * `--budget` shorthand (accepts a `k`/`m` suffix, e.g. `100k`, `1.5m`).
-   * @default 200000
+   * for exceeding limits. Defaults to 100,000,000 — high enough that the
+   * duration window, not the token budget, ends a long unattended run.
+   * Overridable per-goal with `--max-tokens` or the `--budget` shorthand
+   * (accepts a `k`/`m` suffix, e.g. `100k`, `1.5m`).
+   * @default 100000000
    */
   maxTokens?: number
 

@@ -14583,6 +14583,34 @@ function serializeGoalToolResult(operation, result) {
   });
 }
 
+// src/goal-format.js
+var UNLIMITED_MARK = "∞";
+var UNLIMITED_WORD = "unlimited";
+function isUnlimitedTurnBudget(max) {
+  const parsed = Number(max);
+  return !(Number.isFinite(parsed) && parsed > 0);
+}
+function formatTurnLimit(max) {
+  return isUnlimitedTurnBudget(max) ? UNLIMITED_MARK : String(Math.floor(Number(max)));
+}
+function formatTurnBudget(used, max) {
+  const parsed = Number(used);
+  const count = Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 0;
+  return `${count}/${formatTurnLimit(max)}`;
+}
+function formatBudgetMinutes(minutes) {
+  const parsed = Number(minutes);
+  const whole = Number.isFinite(parsed) && parsed > 0 ? Math.round(parsed) : 0;
+  if (whole < 60)
+    return `${whole}m`;
+  const hours = Math.round(whole / 60 * 10) / 10;
+  return Number.isInteger(hours) ? `${hours}h` : `${hours.toFixed(1)}h`;
+}
+function formatBudgetDuration(ms) {
+  const parsed = Number(ms);
+  return formatBudgetMinutes(Number.isFinite(parsed) ? parsed / 60000 : 0);
+}
+
 // src/persistence-lease.js
 import { randomUUID } from "node:crypto";
 import { constants as fsConstants, promises as fs } from "node:fs";
@@ -15106,9 +15134,9 @@ var ACTIVE_PERSISTENCE_DISABLED = Object.freeze({ kind: "active", persistence: "
 var ACTIVE_PERSISTENCE_OWNED = Object.freeze({ kind: "active", persistence: "owned" });
 var PLUGIN_DISPOSED = Object.freeze({ kind: "disposed" });
 var DEFAULT_OPTIONS = {
-  maxTurns: 10,
-  maxDurationMs: 15 * 60 * 1000,
-  maxTokens: 200000,
+  maxTurns: 0,
+  maxDurationMs: 8 * 60 * 60 * 1000,
+  maxTokens: 1e8,
   minDelayMs: 1500,
   maxRecentMessages: 50,
   noProgressTokenThreshold: 50,
@@ -15197,8 +15225,8 @@ var PAUSE_COMMANDS = new Set(["pause"]);
 var SEQUENCE_COMMANDS = ["sequence", "sisyphus"];
 var GOAL_FLAG_SPECS = {
   "--max-turns": {
-    optionKey: "maxTurns",
-    parse: (value, options) => toPositiveInteger(value, options.maxTurns)
+    type: "turns",
+    optionKey: "maxTurns"
   },
   "--max-duration-ms": {
     optionKey: "maxDurationMs",
@@ -15406,16 +15434,8 @@ var SESSION_TITLE_ICONS = ["▶", "⏸", "⛔", "✓"];
 var SIDEBAR_METADATA_VERSION = 1;
 var SIDEBAR_METADATA_TEXT_LIMIT = 400;
 var SIDEBAR_METADATA_MAX_ACTIONS = 20;
-function formatCompactDuration(ms) {
-  const totalSeconds = Math.max(0, Math.round(ms / 1000));
-  if (totalSeconds < 60)
-    return `${totalSeconds}s`;
-  const totalMinutes = Math.floor(totalSeconds / 60);
-  if (totalMinutes < 60)
-    return `${totalMinutes}m`;
-  const hours = Math.floor(totalMinutes / 60);
-  const minutes = totalMinutes % 60;
-  return minutes ? `${hours}h${minutes}m` : `${hours}h`;
+function describeTurnLimit(max) {
+  return isUnlimitedTurnBudget(max) ? UNLIMITED_WORD : String(max);
 }
 function formatCompactTokens(tokens) {
   const value = toNonNegativeInteger(tokens);
@@ -15473,7 +15493,7 @@ function buildSessionTitle(goal, now = Date.now(), context = {}) {
   if (context.ordered && context.sequenceTotal > 1) {
     fields.push(`${context.sequencePosition}/${context.sequenceTotal}`);
   }
-  fields.push(`${goal.turnCount}/${goal.options.maxTurns}`, formatCompactDuration(elapsedMs), `${formatCompactTokens(goal.totalTokens)}/${formatCompactTokens(goal.options.maxTokens)}`);
+  fields.push(formatTurnBudget(goal.turnCount, goal.options.maxTurns), `${formatBudgetDuration(elapsedMs)}/${formatBudgetDuration(goal.options.maxDurationMs)}`, `${formatCompactTokens(goal.totalTokens)}/${formatCompactTokens(goal.options.maxTokens)}`);
   const progress = planProgress(goal.plan);
   if (progress.total)
     fields.push(`${progress.verified}/${progress.total}✓`);
@@ -15488,7 +15508,7 @@ function buildSidebarMetadata(goal, now = Date.now(), context = {}) {
     goalId: goal.goalId,
     state: sidebarGoalState(goal),
     objective: summarizeText(goalLabel(goal), SESSION_TITLE_OBJECTIVE_LIMIT * 4),
-    turns: { used: goal.turnCount, max: goal.options.maxTurns },
+    turns: isUnlimitedTurnBudget(goal.options.maxTurns) ? { used: goal.turnCount, max: null, unlimited: true } : { used: goal.turnCount, max: goal.options.maxTurns },
     minutes: {
       used: Math.round(elapsedMs / 60000),
       max: Math.round(goal.options.maxDurationMs / 60000)
@@ -15772,7 +15792,8 @@ function goalDisplayState(goal) {
   return goal.stopReason === "blocked" ? "blocked" : "paused";
 }
 function formatStatus(goal, commandName = "goal", completionAuditLabel = "evidence gate only (independent verifier off)") {
-  const elapsed = Math.round((Date.now() - goal.startedAt) / 1000);
+  const elapsedMs = Math.max(0, Date.now() - goal.startedAt);
+  const elapsed = Math.round(elapsedMs / 1000);
   const lastProgress = goal.lastProgressAt > 0 ? `${Math.round((Date.now() - goal.lastProgressAt) / 1000)}s ago` : "none yet";
   const lastCheckpoint = goal.lastCheckpoint ? `${goal.lastCheckpoint.summary} (${formatAge(goal.lastCheckpoint.timestamp)})` : "none yet";
   const lines = [
@@ -15790,7 +15811,7 @@ function formatStatus(goal, commandName = "goal", completionAuditLabel = "eviden
     lines.push(`Constraints: ${goal.constraints}`);
   if (goal.mode && goal.mode !== "normal")
     lines.push(`Mode: ${goal.mode}`);
-  lines.push(`Auto-continues sent: ${goal.turnCount}/${goal.options.maxTurns}`, `Context tokens: ${goal.totalTokens.toLocaleString()}/${goal.options.maxTokens.toLocaleString()}`, formatUsage(goal.usage), `Elapsed: ${elapsed}s/${Math.round(goal.options.maxDurationMs / 1000)}s`, `Last progress: ${lastProgress}`, `No-progress turns: ${goal.noProgressTurns}`, `Recent checkpoint: ${lastCheckpoint}`, `Last status: ${goal.lastStatus || "No assistant turn recorded yet."}`);
+  lines.push(`Auto-continues sent: ${formatTurnBudget(goal.turnCount, goal.options.maxTurns)}`, `Context tokens: ${goal.totalTokens.toLocaleString()}/${goal.options.maxTokens.toLocaleString()}`, formatUsage(goal.usage), `Elapsed: ${elapsed}s (${formatBudgetDuration(elapsedMs)}/${formatBudgetDuration(goal.options.maxDurationMs)})`, `Last progress: ${lastProgress}`, `No-progress turns: ${goal.noProgressTurns}`, `Recent checkpoint: ${lastCheckpoint}`, `Last status: ${goal.lastStatus || "No assistant turn recorded yet."}`);
   lines.push(formatPlanForStatus(goal.plan));
   if (goal.stopped)
     lines.push(`Stopped: ${goal.stopReason || "unknown"}`);
@@ -15842,10 +15863,11 @@ function goalIsBlocked(text) {
   return /(^|\n)\s*(?:\[goal:blocked\]|goal:blocked)\s*$/i.test(text.trimEnd());
 }
 function stopReason(goal) {
-  if (goal.turnCount >= goal.options.maxTurns)
+  if (!isUnlimitedTurnBudget(goal.options.maxTurns) && goal.turnCount >= goal.options.maxTurns) {
     return `max turns reached (${goal.options.maxTurns})`;
+  }
   if (Date.now() - goal.startedAt >= goal.options.maxDurationMs) {
-    return `max duration reached (${Math.round(goal.options.maxDurationMs / 1000)}s)`;
+    return `max duration reached (${formatBudgetDuration(goal.options.maxDurationMs)})`;
   }
   if (goal.totalTokens >= goal.options.maxTokens)
     return `max context tokens reached (${goal.options.maxTokens.toLocaleString()})`;
@@ -16152,6 +16174,17 @@ function parsePositiveIntegerStrict(value) {
   const parsed = Number(value);
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
 }
+var UNLIMITED_TURN_WORDS = new Set(["0", "unlimited", "none", "inf", "infinite", "infinity", "∞"]);
+function parseTurnBudget(value) {
+  const raw = String(value).trim().toLowerCase();
+  if (UNLIMITED_TURN_WORDS.has(raw))
+    return 0;
+  return parsePositiveIntegerStrict(raw);
+}
+function toTurnBudget(value, fallback) {
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : fallback;
+}
 function parseTokenBudget(value) {
   const raw = String(value).trim().toLowerCase();
   const match = raw.match(/^(\d+(?:\.\d+)?)\s*([km])?$/);
@@ -16173,7 +16206,7 @@ function stripWrappingQuotes(value) {
 }
 function normalizeOptions(options = {}) {
   return {
-    maxTurns: toPositiveInteger(options.maxTurns, DEFAULT_OPTIONS.maxTurns),
+    maxTurns: toTurnBudget(options.maxTurns, DEFAULT_OPTIONS.maxTurns),
     maxDurationMs: toPositiveInteger(options.maxDurationMs, DEFAULT_OPTIONS.maxDurationMs),
     maxTokens: toPositiveInteger(options.maxTokens, DEFAULT_OPTIONS.maxTokens),
     minDelayMs: toPositiveInteger(options.minDelayMs, DEFAULT_OPTIONS.minDelayMs),
@@ -16965,6 +16998,15 @@ function parseGoalArguments(args, defaults) {
         continue;
       }
       const rawValue = stripWrappingQuotes(value);
+      if (flagSpec.type === "turns") {
+        const turns = parseTurnBudget(rawValue);
+        if (turns === null) {
+          errors3.push(`Invalid positive integer for ${flagName}: ${value}`);
+          continue;
+        }
+        options[flagSpec.optionKey] = turns;
+        continue;
+      }
       if (flagSpec.type === "tokens") {
         const budget = parseTokenBudget(rawValue);
         if (budget === null) {
@@ -17040,11 +17082,12 @@ function sleep(ms, signal) {
   });
 }
 function buildLimitWarning(goal) {
+  const unlimitedTurns = isUnlimitedTurnBudget(goal.options.maxTurns);
   const remainingTurns = goal.options.maxTurns - goal.turnCount;
   const remainingMs = goal.options.maxDurationMs - (Date.now() - goal.startedAt);
   const remainingTokens = goal.options.maxTokens - goal.totalTokens;
   const warnings = [];
-  if (remainingTurns <= goal.options.warnTurnsRemaining) {
+  if (!unlimitedTurns && remainingTurns <= goal.options.warnTurnsRemaining) {
     warnings.push(`${remainingTurns} auto-continue turn(s) remaining`);
   }
   if (remainingMs <= goal.options.warnDurationMsRemaining) {
@@ -17110,7 +17153,7 @@ function buildContinueMessage(goal, {
   completionRejection = ""
 } = {}) {
   const remainingTokens = Math.max(0, goal.options.maxTokens - goal.totalTokens);
-  const remainingTurns = Math.max(0, goal.options.maxTurns - goal.turnCount);
+  const remainingTurns = isUnlimitedTurnBudget(goal.options.maxTurns) ? UNLIMITED_WORD : Math.max(0, goal.options.maxTurns - goal.turnCount);
   const elapsedSeconds = Math.round((Date.now() - goal.startedAt) / 1000);
   const lines = [
     "<goal_continuation>",
@@ -17172,7 +17215,7 @@ function buildCompactionContext(goal) {
     "The summary below is reconstructed deterministically from the plugin's persisted goal record, not from chat memory.",
     buildGoalBlock(goal),
     `Goal status: ${goal.stopped ? goal.stopReason || "stopped" : "active"}.`,
-    `Auto-continues used: ${goal.turnCount}/${goal.options.maxTurns}. Context tokens: ${goal.totalTokens}/${goal.options.maxTokens}. Elapsed: ${elapsedSeconds}s.`,
+    `Auto-continues used: ${formatTurnBudget(goal.turnCount, goal.options.maxTurns)}. Context tokens: ${goal.totalTokens}/${goal.options.maxTokens}. Elapsed: ${elapsedSeconds}s.`,
     goal.lastCheckpoint ? `Latest checkpoint: ${escapeGoalText(summarizeText(goal.lastCheckpoint.summary, 200))}` : null,
     ...buildCompactionProgressSummary(goal),
     ...formatPlanForPrompt(goal.plan) ? ["<goal_plan>", formatPlanForPrompt(goal.plan), `progress: ${planStatusLabel(goal.plan)}`, "</goal_plan>"] : [],
@@ -17835,8 +17878,8 @@ function buildAgentToolHandlers({
       if (typeof value === "string" && value.length > MAX_GOAL_CRITERIA_LENGTH)
         return `Invalid ${field}: must be ${MAX_GOAL_CRITERIA_LENGTH} characters or fewer.`;
     }
-    if (Number.isFinite(args.maxTurns) && args.maxTurns <= 0)
-      return `Invalid maxTurns: ${args.maxTurns} — must be a positive integer.`;
+    if (Number.isFinite(args.maxTurns) && !(Number.isSafeInteger(args.maxTurns) && args.maxTurns >= 0))
+      return `Invalid maxTurns: ${args.maxTurns} — must be a positive integer, or 0 for unlimited.`;
     if (Number.isFinite(args.maxTokens) && args.maxTokens <= 0)
       return `Invalid maxTokens: ${args.maxTokens} — must be a positive integer.`;
     if (Number.isFinite(args.maxDurationMs) && args.maxDurationMs <= 0)
@@ -17855,7 +17898,7 @@ function buildAgentToolHandlers({
       mode: typeof args.mode === "string" ? args.mode : "normal"
     };
     const goal = buildGoalState(sessionID, objective, options, meta3);
-    pushHistory(goal, "set", `Goal created via agent tool with limits: ${options.maxTurns} auto-continues, ${Math.round(options.maxDurationMs / 1000)}s, ${options.maxTokens.toLocaleString()} context tokens.`);
+    pushHistory(goal, "set", `Goal created via agent tool with limits: ${describeTurnLimit(options.maxTurns)} auto-continues, ${formatBudgetDuration(options.maxDurationMs)}, ${options.maxTokens.toLocaleString()} context tokens.`);
     const replacedGoal = goalStates.get(sessionID);
     sessionOrdered.delete(sessionID);
     cleanupGoal(sessionID);
@@ -18330,7 +18373,7 @@ function buildAgentTools(toolHelper, handlers, ensureSessionLoaded = async () =>
       execute: canonicalRun("status", canonicalHandlers.status)
     }),
     goal_set: toolHelper({
-      description: "Set or replace the session goal. Call only when the user explicitly asks to set or pursue a goal.",
+      description: "Set or replace the session goal. Call only when the user explicitly asks to set or pursue a goal. " + "maxTurns 0 means unlimited auto-continue turns, which is the default.",
       args: {
         objective: schema.string(),
         maxTurns: schema.number().optional(),
@@ -18425,7 +18468,7 @@ function buildAgentTools(toolHelper, handlers, ensureSessionLoaded = async () =>
       execute: run((sessionID) => handlers.getGoalHistory(sessionID))
     }),
     set_goal: toolHelper({
-      description: "Set a new session goal for autonomous auto-continue. ONLY call this when the user explicitly asks you to set, define, or start working toward a goal — never decide to set a goal on your own. Replaces any existing goal.",
+      description: "Set a new session goal for autonomous auto-continue. ONLY call this when the user explicitly asks you to set, define, or start working toward a goal — never decide to set a goal on your own. Replaces any existing goal. maxTurns 0 means unlimited auto-continue turns, which is the default.",
       args: {
         objective: schema.string(),
         maxTurns: schema.number().optional(),
@@ -19628,7 +19671,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           pushHistory(current, "backgrounded", "Backgrounded when a new goal was added.");
         }
         const added = buildGoalState(sessionID, parsed.condition, parsed.options, parsed.meta);
-        pushHistory(added, "set", `Goal added with limits: ${added.options.maxTurns} auto-continues, ${Math.round(added.options.maxDurationMs / 1000)}s, ${added.options.maxTokens.toLocaleString()} context tokens.`);
+        pushHistory(added, "set", `Goal added with limits: ${describeTurnLimit(added.options.maxTurns)} auto-continues, ${formatBudgetDuration(added.options.maxDurationMs)}, ${added.options.maxTokens.toLocaleString()} context tokens.`);
         registerSessionGoal(added);
         focusGoal(sessionID, added);
         await persist(sessionID);
@@ -19651,7 +19694,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       }
       const replacedGoal = goalStates.get(sessionID);
       const goal = buildGoalState(sessionID, parsed.condition, parsed.options, parsed.meta);
-      pushHistory(goal, "set", `Goal created with limits: ${goal.options.maxTurns} auto-continues, ${Math.round(goal.options.maxDurationMs / 1000)}s, ${goal.options.maxTokens.toLocaleString()} context tokens.`);
+      pushHistory(goal, "set", `Goal created with limits: ${describeTurnLimit(goal.options.maxTurns)} auto-continues, ${formatBudgetDuration(goal.options.maxDurationMs)}, ${goal.options.maxTokens.toLocaleString()} context tokens.`);
       const creationRestrictedAgent = await restrictedAgentFor(sessionID);
       if (creationRestrictedAgent) {
         holdGoalForRestrictedAgent(goal, creationRestrictedAgent);
@@ -19690,7 +19733,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         ],
         `Use \`/${commandName} history\` to inspect recent lifecycle events and checkpoints.`,
         "",
-        `Limits: ${goal.options.maxTurns} auto-continues, ${Math.round(goal.options.maxDurationMs / 1000)}s, ${goal.options.maxTokens.toLocaleString()} context tokens.`
+        `Limits: ${describeTurnLimit(goal.options.maxTurns)} auto-continues, ${formatBudgetDuration(goal.options.maxDurationMs)}, ${goal.options.maxTokens.toLocaleString()} context tokens.`
       ].filter((line) => line !== null).join(`
 `), { preserveFiles: true, startsWork: !heldLabel });
     },
@@ -20310,7 +20353,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           const activeGoalAfterPrompt = currentGoal(sessionID, goalID, runID);
           if (activeGoalAfterPrompt?.continuationClaim?.compactionEpoch === claimedCompactionEpoch && activeGoalAfterPrompt?.continuationClaim?.sourceAssistantMessageID === claimedSourceAssistantMessageID) {
             activeGoalAfterPrompt.promptFailures = Math.max(0, activeGoalAfterPrompt.promptFailures - 1);
-            pushHistory(activeGoalAfterPrompt, budgetWrapup ? "budget-wrapup" : "auto-continue", budgetWrapup ? "Sent a final handoff request near the context token budget." : `Sent auto-continue prompt ${activeGoalAfterPrompt.turnCount}/${activeGoalAfterPrompt.options.maxTurns}.`);
+            pushHistory(activeGoalAfterPrompt, budgetWrapup ? "budget-wrapup" : "auto-continue", budgetWrapup ? "Sent a final handoff request near the context token budget." : `Sent auto-continue prompt ${formatTurnBudget(activeGoalAfterPrompt.turnCount, activeGoalAfterPrompt.options.maxTurns)}.`);
           }
         }
         await persist(sessionID);
@@ -20583,8 +20626,14 @@ var testInternals = {
   isPluginContinuationMessage,
   isPlanAgent,
   buildSessionTitle,
-  formatCompactDuration,
   formatCompactTokens,
+  formatBudgetDuration,
+  formatBudgetMinutes,
+  formatTurnBudget,
+  formatTurnLimit,
+  isUnlimitedTurnBudget,
+  describeTurnLimit,
+  parseTurnBudget,
   goalStatusIcon,
   looksLikePluginSessionTitle,
   isRestrictedAgent,

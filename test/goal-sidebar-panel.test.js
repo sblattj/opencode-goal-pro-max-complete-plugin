@@ -15,6 +15,7 @@ import {
   GOAL_PANEL_PAYLOAD_VERSION,
   GOAL_PANEL_TITLE,
 } from "../src/goal-sidebar-view.js"
+import { formatBudgetMinutes, formatTurnBudget, UNLIMITED_MARK } from "../src/goal-format.js"
 
 const THEME = {
   text: "text",
@@ -123,7 +124,7 @@ test("a running goal reduces to its header, budgets, and nothing it was not give
   assert.equal(model.state, "active")
   assert.equal(model.icon, "▶")
   assert.equal(model.objective, "ship the sidebar panel")
-  assert.deepEqual(model.stats, ["3/10 turns", "2/30m", "45k/200k tokens"])
+  assert.deepEqual(model.stats, ["3/10 turns", "2m/30m", "45k/200k tokens"])
   assert.equal(model.sequence, "")
   assert.equal(model.progress, "")
   assert.deepEqual(model.actions, [])
@@ -321,7 +322,7 @@ test("the registered view renders the whole goal for its session", async () => {
     [
       GOAL_PANEL_TITLE,
       "▶ ship the sidebar panel",
-      "3/10 turns · 2/30m · 45k/200k tokens",
+      "3/10 turns · 2m/30m · 45k/200k tokens",
       "step 2/4",
       "1/14 actions verified, 1 blocked",
       "● reproduce [pass]",
@@ -429,15 +430,61 @@ test("the panel re-reads the session instead of freezing the values it first saw
   const lines = collect(runtime, mounted)
   assert.equal(mounted.props.when, true)
   assert.deepEqual(readLine(lines[1]), { fg: THEME.text, text: "▶ ship the sidebar panel" })
-  assert.equal(readLine(lines[2]).text, "3/10 turns · 2/30m · 45k/200k tokens")
+  assert.equal(readLine(lines[2]).text, "3/10 turns · 2m/30m · 45k/200k tokens")
 
   session.metadata = { goal: payload({ state: "completed", turns: { used: 7, max: 10 } }) }
   assert.deepEqual(readLine(lines[1]), { fg: THEME.success, text: "✓ ship the sidebar panel" })
-  assert.equal(readLine(lines[2]).text, "7/10 turns · 2/30m · 45k/200k tokens")
+  assert.equal(readLine(lines[2]).text, "7/10 turns · 2m/30m · 45k/200k tokens")
 
   // And a cleared goal collapses the branch the panel lives in rather than
   // leaving a header with nothing under it.
   session.metadata = { goal: null }
   assert.equal(mounted.props.when, false)
   assert.deepEqual(renderLines(runtime, node), [])
+})
+
+test("an unlimited turn budget renders ∞ instead of vanishing from the stats line", () => {
+  // The server half writes `{ used, max: null, unlimited: true }` for
+  // `maxTurns: 0`. A null ceiling must NOT be dropped the way a genuinely
+  // absent budget is — the count still matters, only the limit is gone.
+  const model = goalPanelModel(
+    payload({ turns: { used: 3, max: null, unlimited: true }, minutes: { used: 1, max: 480 } }),
+  )
+  assert.deepEqual(model.stats, ["3/∞ turns", "1m/8h", "45k/200k tokens"])
+  assert.equal(UNLIMITED_MARK, "\u221e")
+
+  // A payload that carries only the null ceiling (no flag) reads the same way,
+  // because `Infinity` serialises to null and older writers may do just that.
+  assert.equal(goalPanelModel(payload({ turns: { used: 3, max: null } })).stats[0], "3/∞ turns")
+
+  // Control: a bounded budget still renders its real ceiling.
+  assert.equal(goalPanelModel(payload({ turns: { used: 3, max: 10 } })).stats[0], "3/10 turns")
+})
+
+test("the shipped 8-hour window renders in hours, and the elapsed clock follows it in", () => {
+  const stats = (used, max) => goalPanelModel(payload({ minutes: { used, max } })).stats[1]
+  assert.equal(stats(0, 480), "0m/8h")
+  assert.equal(stats(45, 480), "45m/8h")
+  assert.equal(stats(60, 480), "1h/8h")
+  assert.equal(stats(90, 480), "1.5h/8h")
+  assert.equal(stats(480, 480), "8h/8h")
+})
+
+test("the shared budget formatters are the ones the panel and the title both use", () => {
+  // One decimal, trailing .0 dropped. 481 minutes is 8.016 h, which rounds to
+  // 8.0 and must therefore render "8h", not "8.0h".
+  assert.equal(formatBudgetMinutes(0), "0m")
+  assert.equal(formatBudgetMinutes(45), "45m")
+  assert.equal(formatBudgetMinutes(59), "59m")
+  assert.equal(formatBudgetMinutes(60), "1h")
+  assert.equal(formatBudgetMinutes(90), "1.5h")
+  assert.equal(formatBudgetMinutes(480), "8h")
+  assert.equal(formatBudgetMinutes(481), "8h")
+  assert.equal(formatBudgetMinutes(500), "8.3h")
+  assert.equal(formatBudgetMinutes(-5), "0m")
+  assert.equal(formatBudgetMinutes("nope"), "0m")
+
+  assert.equal(formatTurnBudget(3, 10), "3/10")
+  assert.equal(formatTurnBudget(3, 0), "3/∞")
+  assert.equal(formatTurnBudget(3, null), "3/∞")
 })
