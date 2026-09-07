@@ -112,10 +112,16 @@ try {
   await writeFile(join(consumerDirectory, "package.json"), JSON.stringify({ private: true, type: "module" }))
   await writeFile(join(consumerDirectory, "contract.ts"), fixture)
 
-  const packResult = JSON.parse(execNpm(
+  // `npm pack --json` prints the prepack lifecycle's own stdout (the Bun build's
+  // "Bundled N modules …") ahead of the JSON, so the whole stream is not valid
+  // JSON. Parse from the first `[` instead of the first byte.
+  const packOutput = execNpm(
     ["pack", "--json", "--pack-destination", packDirectory],
     { cwd: repository, encoding: "utf8", env: npmEnvironment },
-  ))
+  )
+  const jsonStart = packOutput.indexOf("[")
+  assert.notEqual(jsonStart, -1, `npm pack --json produced no JSON array:\n${packOutput}`)
+  const packResult = JSON.parse(packOutput.slice(jsonStart))
   assert.equal(packResult.length, 1)
   const tarball = join(packDirectory, packResult[0].filename)
   execNpm(

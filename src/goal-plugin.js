@@ -46,7 +46,17 @@ const MAX_STALLED_COMPACTIONS = 2
 const CHILD_WAKE_EVENT_FLAG = Symbol.for("opencode-goal-plugin.childWake")
 const MAX_CHECKPOINTS = 5
 const CHECKPOINT_CHAR_LIMIT = 280
-const MAX_GOAL_OBJECTIVE_LENGTH = 4000
+// A goal's objective is the whole handoff the user pasted, so it is bounded by
+// the command-argument ceiling rather than by a prose-sized cap. The 4,000
+// character cap that used to live here rejected exactly the long handoffs this
+// plugin exists to run.
+const MAX_GOAL_OBJECTIVE_LENGTH = 32 * 1024
+// The short label derived from the objective for the title, sidebar, and lists.
+const MAX_GOAL_LABEL_LENGTH = 200
+// Success criteria and constraints are user prose that can legitimately be long
+// (a pasted acceptance-criteria block). Kept separate from MAX_GOAL_META_LENGTH,
+// which bounds identifiers (session IDs, message IDs) and must stay small.
+const MAX_GOAL_CRITERIA_LENGTH = 32 * 1024
 const MAX_GOAL_META_LENGTH = 2000
 const MAX_GOAL_BLOCKER_LENGTH = 2000
 const MAX_LEGACY_EVIDENCE_LENGTH = 8000
@@ -116,6 +126,10 @@ function createRuntimeState() {
     // render skips the API call).
     sessionTitles: new Map(),
     appliedTitles: new Map(),
+    // The terminal render for a goal that has ended. The goal itself is gone
+    // from `goalStates`, so without this the sidebar would keep advertising a
+    // running goal that finished.
+    sidebarTerminals: new Map(),
     pendingCommandTurns: new Map(),
     activeCommandTurns: new Map(),
     commandOutputs: new WeakMap(),
@@ -177,6 +191,7 @@ const sessionArchive = runtimeCollection("sessionArchive")
 const sessionOrdered = runtimeCollection("sessionOrdered")
 const MAX_ARCHIVED_PER_SESSION = 10
 const lastGoalResults = runtimeCollection("lastGoalResults")
+const sidebarTerminals = runtimeCollection("sidebarTerminals")
 const sessionMutationVersions = runtimeCollection("sessionMutationVersions")
 const seenTokens = runtimeCollection("seenTokens")
 const seenUsage = runtimeCollection("seenUsage")
@@ -233,6 +248,10 @@ const GOAL_FLAG_SPECS = {
   "--constraints": { type: "string", target: "meta", metaKey: "constraints" },
   "--non-goals": { type: "string", target: "meta", metaKey: "constraints" },
   "--mode": { type: "mode", target: "meta", metaKey: "mode" },
+  // Explicit short label for a long handoff. Without it the label is the first
+  // non-empty line of the objective text.
+  "--objective": { type: "string", target: "meta", metaKey: "objective" },
+  "--title": { type: "string", target: "meta", metaKey: "objective" },
   "--no-tool-turns": {
     optionKey: "noToolCallTurnsBeforePause",
     parse: (value, options) =>
@@ -266,7 +285,54 @@ function normalizeMode(value) {
   return GOAL_MODES.has(normalized) ? normalized : null
 }
 
-const GOAL_META_DEFAULTS = { successCriteria: "", constraints: "", mode: "normal" }
+const GOAL_META_DEFAULTS = { successCriteria: "", constraints: "", mode: "normal", objective: "" }
+
+// A `---` on a line of its own ends the flag region. Everything after it is
+// body: never tokenized, never scanned for flags.
+const GOAL_BODY_SEPARATOR = /^[ \t]*---[ \t]*$/m
+
+// Split a `/goal ...` argument string into a flag region and a verbatim body.
+//
+// Flags are read ONLY from the flag region, which is the text before a `---`
+// separator line, or — when there is no separator — the first line. This is the
+// difference between "paste your handoff into /goal" working and not working: a
+// handoff routinely contains `git push --force`, `zsh -s -- --no-opencode`, or a
+// fenced block mentioning `--max-turns`, and tokenizing the whole message turned
+// every one of those into either a stolen option or an "Unsupported flag"
+// rejection that discarded the entire goal.
+function splitGoalCommandText(args) {
+  const text = String(args ?? "")
+  const separator = text.match(GOAL_BODY_SEPARATOR)
+  if (separator) {
+    const head = text.slice(0, separator.index)
+    const rest = text.slice(separator.index + separator[0].length)
+    return { head, body: rest.replace(/^\r?\n/, "") }
+  }
+  const newline = text.indexOf("\n")
+  if (newline === -1) return { head: text, body: "" }
+  return { head: text.slice(0, newline), body: text.slice(newline + 1) }
+}
+
+// The short human label for a goal: an explicit `--objective`, else the first
+// non-empty line of the objective text. Used by the session title, the sidebar,
+// and goal lists, none of which can render a 4,000-character handoff.
+function deriveGoalLabel(condition, explicit = "") {
+  const chosen =
+    String(explicit || "").trim() ||
+    String(condition || "")
+      .split("\n")
+      .map((line) => line.trim())
+      .find(Boolean) ||
+    ""
+  return summarizeText(chosen, MAX_GOAL_LABEL_LENGTH)
+}
+
+// Label for an existing goal or archived result. Derives on the fly when the
+// record predates `objectiveLabel`, so persisted state needs no migration.
+function goalLabel(goal) {
+  const stored = typeof goal?.objectiveLabel === "string" ? goal.objectiveLabel.trim() : ""
+  return stored || deriveGoalLabel(goal?.condition)
+}
 
 function getText(parts) {
   return (parts || [])
@@ -427,12 +493,45 @@ function isPlanAgent(agent) {
   return isRestrictedAgent(agent, DEFAULT_RESTRICTED_AGENTS)
 }
 
-// Session-title status indicator. OpenCode renders the session title
-// persistently, so mirroring goal progress into it gives unattended runs a
-// continuous heartbeat without a TUI plugin entrypoint. Opt-in, because it
-// overwrites a user-visible field.
+// Sidebar goal status.
+//
+// MECHANISM (opencode 1.18.29). The TUI sidebar renders the session title in
+// bold at the top of its title block — packages/tui/src/routes/session/
+// sidebar.tsx:58 renders `session()!.title` — and the whole Session record,
+// including `metadata`, is reconciled into the TUI's reactive store on every
+// `session.updated` event (packages/tui/src/context/sync.tsx:285-297). Both are
+// writable by a SERVER plugin through `PATCH /session/{sessionID}`
+// (packages/opencode/src/server/routes/instance/httpapi/groups/session.ts:227-239),
+// which is `client.session.update`.
+//
+// Two candidates were rejected on evidence:
+//   * The sidebar Todo panel (packages/tui/src/feature-plugins/sidebar/todo.tsx:11)
+//     reads `api.state.session.todo(sessionID)`, and the todo HTTP surface is
+//     GET-only (groups/session.ts:156-165) — only the model's `todowrite` tool
+//     writes it. A plugin cannot drive it.
+//   * `tui.showToast` renders in an absolute-positioned overlay
+//     (packages/tui/src/ui/toast.tsx:24), not the sidebar, and `tui.publish`
+//     accepts only four fixed event types, none of which touch the sidebar.
+//
+// A richer custom panel IS possible via the undocumented `sidebar_content`
+// plugin slot (sidebar.tsx:85), but that requires a separate TUI-kind module
+// with a Solid/OpenTUI JSX renderer — a server module and a TUI module may not
+// be the same file (packages/opencode/src/plugin/shared.ts:293-294). This
+// plugin stays server-only, so it drives the title (rendered) and mirrors the
+// full structured status into `metadata.goal` (reactive, and the documented
+// feed for such a panel).
+//
+// Confirmed against the running binary, not only the source: opencode 1.18.29's
+// own OpenAPI document (GET /doc) declares `PATCH /session/{sessionID}` with a
+// body of `{ title?: string, metadata?: object, ... }` and a `Session` schema
+// carrying `metadata`, and a live isolated run observed both fields on the real
+// session record after a `/goal` command.
 const SESSION_TITLE_OBJECTIVE_LIMIT = 48
-const SESSION_TITLE_ICONS = ["▶", "⏸", "⛔"]
+const SESSION_TITLE_ICONS = ["▶", "⏸", "⛔", "✓"]
+// Bounds for the structured status mirrored into session metadata.
+const SIDEBAR_METADATA_VERSION = 1
+const SIDEBAR_METADATA_TEXT_LIMIT = 400
+const SIDEBAR_METADATA_MAX_ACTIONS = 20
 
 // The title sits in a narrow column, so every field is abbreviated hard.
 function formatCompactDuration(ms) {
@@ -459,21 +558,106 @@ function formatCompactTokens(tokens) {
 // Blocked and paused are distinct to a watching human: one needs input, the
 // other just needs a resume.
 function goalStatusIcon(goal) {
+  if (goal.terminalState === "completed") return "✓"
   if (goal.blockedReason) return "⛔"
   if (goal.stopped) return "⏸"
   return "▶"
 }
 
+// The state word the sidebar shows, and the one `metadata.goal.state` carries.
+function sidebarGoalState(goal) {
+  if (goal.terminalState) return goal.terminalState
+  if (goal.blockedReason || goal.stopReason === "blocked") return "blocked"
+  if (goal.stopped) return "paused"
+  return "active"
+}
+
+// A goal that ends leaves `goalStates`, which would freeze the sidebar on the
+// last *running* render of a goal that is over. This keeps just enough of it to
+// render one terminal status — the same shape the live renderers read, so there
+// is only one render path — until `/goal clear` restores the session's title.
+function buildSidebarTerminal(goal, state, finishedAt) {
+  return {
+    goalId: goal.goalId,
+    condition: goal.condition,
+    objectiveLabel: goal.objectiveLabel,
+    successCriteria: goal.successCriteria,
+    constraints: goal.constraints,
+    options: goal.options,
+    plan: goal.plan,
+    turnCount: goal.turnCount,
+    totalTokens: goal.totalTokens,
+    startedAt: goal.startedAt,
+    pausedAt: finishedAt,
+    stopped: true,
+    stopReason: state === "achieved" ? "" : goal.stopReason,
+    blockedReason: state === "blocked" ? goal.blockedReason : "",
+    terminalState: state === "achieved" ? "completed" : state === "blocked" ? "blocked" : "paused",
+  }
+}
+
 // One-line goal status for the session title, e.g.
-// "▶ ship the release · 3/10 · 2m · 45k/200k".
-function buildSessionTitle(goal, now = Date.now()) {
+// "▶ ship the release · 2/4 · 3/10 · 2m · 45k/200k · 3/7✓".
+// Fields, in order: state icon + short objective, sequence position (only when
+// `/goal sequence` is driving an ordered set), auto-continues used / limit,
+// elapsed / clock, context tokens / budget, verified plan actions / total.
+function buildSessionTitle(goal, now = Date.now(), context = {}) {
   const elapsedMs = Math.max(0, (goal.pausedAt || now) - goal.startedAt)
-  return [
-    `${goalStatusIcon(goal)} ${summarizeText(goal.condition, SESSION_TITLE_OBJECTIVE_LIMIT)}`,
+  const fields = [
+    `${goalStatusIcon(goal)} ${summarizeText(goalLabel(goal), SESSION_TITLE_OBJECTIVE_LIMIT)}`,
+  ]
+  if (context.ordered && context.sequenceTotal > 1) {
+    fields.push(`${context.sequencePosition}/${context.sequenceTotal}`)
+  }
+  fields.push(
     `${goal.turnCount}/${goal.options.maxTurns}`,
     formatCompactDuration(elapsedMs),
     `${formatCompactTokens(goal.totalTokens)}/${formatCompactTokens(goal.options.maxTokens)}`,
-  ].join(" · ")
+  )
+  const progress = planProgress(goal.plan)
+  if (progress.total) fields.push(`${progress.verified}/${progress.total}✓`)
+  return fields.join(" · ")
+}
+
+// The structured goal status mirrored into `session.metadata.goal`. The TUI
+// reconciles the whole Session record into its reactive store, so anything here
+// is readable by a sidebar panel without another round trip. Bounded hard: this
+// rides on every session update.
+function buildSidebarMetadata(goal, now = Date.now(), context = {}) {
+  const elapsedMs = Math.max(0, (goal.pausedAt || now) - goal.startedAt)
+  const progress = planProgress(goal.plan)
+  const bounded = (value) => summarizeText(value, SIDEBAR_METADATA_TEXT_LIMIT) || undefined
+  return {
+    v: SIDEBAR_METADATA_VERSION,
+    goalId: goal.goalId,
+    state: sidebarGoalState(goal),
+    objective: summarizeText(goalLabel(goal), SESSION_TITLE_OBJECTIVE_LIMIT * 4),
+    turns: { used: goal.turnCount, max: goal.options.maxTurns },
+    minutes: {
+      used: Math.round(elapsedMs / 60000),
+      max: Math.round(goal.options.maxDurationMs / 60000),
+    },
+    tokens: { used: goal.totalTokens, max: goal.options.maxTokens },
+    plan: {
+      total: progress.total,
+      verified: progress.verified,
+      blocked: progress.blocked,
+      actions: (goal.plan?.actions || []).slice(0, SIDEBAR_METADATA_MAX_ACTIONS).map((action) => ({
+        id: action.id,
+        title: summarizeText(action.title, 120),
+        status: action.status,
+        verdict: action.verdict,
+      })),
+    },
+    successCriteria: bounded(goal.successCriteria),
+    constraints: bounded(goal.constraints),
+    sequence: context.ordered
+      ? { ordered: true, position: context.sequencePosition, total: context.sequenceTotal }
+      : undefined,
+    stopReason: goal.stopped ? bounded(goal.stopReason) : undefined,
+    blockedReason: bounded(goal.blockedReason),
+    updatedAt: now,
+  }
 }
 
 // Recognize a title this plugin wrote. The captured "original" is what
@@ -806,10 +990,16 @@ function formatStatus(
     ? `${goal.lastCheckpoint.summary} (${formatAge(goal.lastCheckpoint.timestamp)})`
     : "none yet"
   const lines = [
-    `Active goal: ${goal.condition}`,
+    `Active goal: ${goalLabel(goal)}`,
     `State: ${goalDisplayState(goal)}`,
     `Completion audit: ${completionAuditLabel}`,
   ]
+  const objectiveText = String(goal.condition || "").trim()
+  if (objectiveText && objectiveText !== goalLabel(goal)) {
+    lines.push(
+      `Objective text: ${objectiveText.length.toLocaleString()} characters (full handoff retained and injected every turn)`,
+    )
+  }
   if (goal.successCriteria) lines.push(`Success criteria: ${goal.successCriteria}`)
   if (goal.constraints) lines.push(`Constraints: ${goal.constraints}`)
   if (goal.mode && goal.mode !== "normal") lines.push(`Mode: ${goal.mode}`)
@@ -823,6 +1013,7 @@ function formatStatus(
     `Recent checkpoint: ${lastCheckpoint}`,
     `Last status: ${goal.lastStatus || "No assistant turn recorded yet."}`,
   )
+  lines.push(formatPlanForStatus(goal.plan))
   if (goal.stopped) lines.push(`Stopped: ${goal.stopReason || "unknown"}`)
   if (goal.blockedReason) lines.push(`Blocked reason: ${goal.blockedReason}`)
   if (goal.stopped) {
@@ -845,7 +1036,7 @@ function formatGoalResult(result) {
     ? `${result.lastCheckpoint.summary} (${formatTimestamp(result.lastCheckpoint.timestamp)})`
     : "none recorded"
   const lines = [
-    `Last goal: ${result.condition}`,
+    `Last goal: ${goalLabel(result)}`,
     `State: ${result.state}`,
     `Auto-continues sent: ${result.turnCount}`,
     `Context tokens: ${result.totalTokens.toLocaleString()}`,
@@ -1081,6 +1272,7 @@ function pruneGoalResults(options) {
     const oldestSessionID = lastGoalResults.keys().next().value
     if (oldestSessionID === undefined) break
     lastGoalResults.delete(oldestSessionID)
+    sidebarTerminals.delete(oldestSessionID)
   }
 }
 
@@ -1103,6 +1295,7 @@ function rememberGoalResult(sessionID, goal, state, reason = "", evidence = "") 
   }
   lastGoalResults.delete(sessionID)
   lastGoalResults.set(sessionID, result)
+  sidebarTerminals.set(sessionID, buildSidebarTerminal(goal, state, result.finishedAt))
   // Keep a per-session archive so completed goals stay readable via /goal list.
   const archivedResult = { ...result }
   archiveSessionResult(sessionID, archivedResult)
@@ -1490,8 +1683,8 @@ function normalizePersistedGoal(rawGoal) {
   if (
     rawGoal.sessionID.length > MAX_GOAL_META_LENGTH ||
     rawGoal.condition.trim().length > MAX_GOAL_OBJECTIVE_LENGTH ||
-    (typeof rawGoal.successCriteria === "string" && rawGoal.successCriteria.length > MAX_GOAL_META_LENGTH) ||
-    (typeof rawGoal.constraints === "string" && rawGoal.constraints.length > MAX_GOAL_META_LENGTH) ||
+    (typeof rawGoal.successCriteria === "string" && rawGoal.successCriteria.length > MAX_GOAL_CRITERIA_LENGTH) ||
+    (typeof rawGoal.constraints === "string" && rawGoal.constraints.length > MAX_GOAL_CRITERIA_LENGTH) ||
     (typeof rawGoal.blockedReason === "string" && rawGoal.blockedReason.length > MAX_GOAL_BLOCKER_LENGTH)
   ) return null
 
@@ -1508,6 +1701,11 @@ function normalizePersistedGoal(rawGoal) {
         ? rawGoal.runId
         : randomUUID(),
     condition: rawGoal.condition.trim(),
+    objectiveLabel: deriveGoalLabel(
+      rawGoal.condition,
+      typeof rawGoal.objectiveLabel === "string" ? rawGoal.objectiveLabel : "",
+    ),
+    plan: normalizePlan(rawGoal.plan),
     successCriteria: typeof rawGoal.successCriteria === "string" ? rawGoal.successCriteria : "",
     constraints: typeof rawGoal.constraints === "string" ? rawGoal.constraints : "",
     mode: normalizeMode(rawGoal.mode) || "normal",
@@ -2248,7 +2446,8 @@ async function logPluginDebug(client, message, error) {
 }
 
 function parseGoalArguments(args, defaults) {
-  const parts = args.match(/"[^"]*"|'[^']*'|\S+/g) || []
+  const { head, body } = splitGoalCommandText(args)
+  const parts = head.match(/"[^"]*"|'[^']*'|\S+/g) || []
   const condition = []
   const options = { ...defaults }
   const meta = { ...GOAL_META_DEFAULTS }
@@ -2261,10 +2460,11 @@ function parseGoalArguments(args, defaults) {
       const [flagName, inlineValue] = part.split(/=(.*)/s, 2)
       const flagSpec = GOAL_FLAG_SPECS[flagName]
 
+      // An unrecognized `--word` is prose, not a mistake: a goal can legitimately
+      // say "run it with --force". Keep it in the objective verbatim and consume
+      // nothing after it, instead of rejecting the whole command.
       if (!flagSpec) {
-        const next = parts[i + 1]
-        if (inlineValue === undefined && next !== undefined && !next.startsWith("--")) i += 1
-        errors.push(`Unsupported flag: ${flagName}`)
+        condition.push(part)
         continue
       }
 
@@ -2324,17 +2524,23 @@ function parseGoalArguments(args, defaults) {
     condition.push(stripWrappingQuotes(part))
   }
 
-  const parsedCondition = condition.join(" ").trim()
+  // The body is appended verbatim — no tokenization, no quote stripping, no
+  // whitespace collapsing — so a pasted handoff survives byte for byte.
+  const headText = condition.join(" ").trim()
+  const bodyText = body.replace(/\s+$/, "")
+  const parsedCondition = [headText, bodyText].filter((piece) => piece !== "").join("\n").trim()
+
   if (parsedCondition.length > MAX_GOAL_OBJECTIVE_LENGTH) {
     errors.push(`Goal objective must be ${MAX_GOAL_OBJECTIVE_LENGTH} characters or fewer`)
   }
   for (const [field, value] of [["success criteria", meta.successCriteria], ["constraints", meta.constraints]]) {
-    if (value.length > MAX_GOAL_META_LENGTH) {
-      errors.push(`${field} must be ${MAX_GOAL_META_LENGTH} characters or fewer`)
+    if (value.length > MAX_GOAL_CRITERIA_LENGTH) {
+      errors.push(`${field} must be ${MAX_GOAL_CRITERIA_LENGTH} characters or fewer`)
     }
   }
   return {
     condition: parsedCondition,
+    objectiveLabel: deriveGoalLabel(parsedCondition, meta.objective),
     options,
     meta,
     errors,
@@ -2455,7 +2661,12 @@ function buildGoalBlock(goal) {
 
 function buildContinueMessage(
   goal,
-  { budgetWrapup = false, completionUnverified = false, blockerUnstated = false } = {},
+  {
+    budgetWrapup = false,
+    completionUnverified = false,
+    blockerUnstated = false,
+    completionRejection = "",
+  } = {},
 ) {
   const remainingTokens = Math.max(0, goal.options.maxTokens - goal.totalTokens)
   const remainingTurns = Math.max(0, goal.options.maxTurns - goal.turnCount)
@@ -2481,6 +2692,21 @@ function buildContinueMessage(
     )
   }
 
+  // Verified action plan. Injected compactly every turn so the model is always
+  // reasoning against the recorded ledger rather than its memory of it.
+  // Terse here on purpose: the full plan contract and the CEV rule ride in the
+  // system block, which is re-injected on the same turn. Repeating them in the
+  // continuation would double their cost for no extra signal.
+  const planRender = formatPlanForPrompt(goal.plan)
+  lines.push(
+    ...[
+      "<goal_plan>",
+      planRender || "none — call goal_plan_set([{id,title},…]) first.",
+      planRender ? `progress: ${planStatusLabel(goal.plan)}; done needs claim+evidence+verdict=pass.` : "",
+      "</goal_plan>",
+    ].filter(Boolean),
+  )
+
   lines.push(
     "Completion format—consecutive plain lines; no Markdown/backticks/blank line:",
     "[goal:evidence] <proof>",
@@ -2494,7 +2720,8 @@ function buildContinueMessage(
     lines.push(
       "",
       "<evidence_required>",
-      "Previous completion was rejected: evidence was missing. Verify first, then put `[goal:evidence] …` immediately before `[goal:complete]`.",
+      completionRejection ||
+        "Previous completion was rejected: evidence was missing. Verify first, then put `[goal:evidence] …` immediately before `[goal:complete]`.",
       "</evidence_required>",
     )
   }
@@ -2559,6 +2786,12 @@ function buildCompactionContext(goal) {
     `Auto-continues used: ${goal.turnCount}/${goal.options.maxTurns}. Context tokens: ${goal.totalTokens}/${goal.options.maxTokens}. Elapsed: ${elapsedSeconds}s.`,
     goal.lastCheckpoint ? `Latest checkpoint: ${escapeGoalText(summarizeText(goal.lastCheckpoint.summary, 200))}` : null,
     ...buildCompactionProgressSummary(goal),
+    // Plan STATE only. The full plan contract and the CEV rule ride in the
+    // system block, which is re-injected on the first post-compaction turn;
+    // repeating them here would double the cost of every compaction.
+    ...(formatPlanForPrompt(goal.plan)
+      ? ["<goal_plan>", formatPlanForPrompt(goal.plan), `progress: ${planStatusLabel(goal.plan)}`, "</goal_plan>"]
+      : []),
     "After compaction, continue from the next concrete unfinished step while the goal is active. Verify the result against the goal objective before ending; output [goal:complete] (preceded by a [goal:evidence] line) only when fully satisfied, or [goal:blocked] (preceded by a concrete blocker) only if user input is required.",
   ]
     .filter(Boolean)
@@ -2609,8 +2842,9 @@ function formatArgumentErrors(errors) {
     "Goal flags could not be parsed.",
     ...errors.map((error) => `- ${error}`),
     "",
-    "Supported flags: --max-turns, --max-minutes, --max-duration-ms, --max-tokens, --budget, --cooldown-ms, --no-progress-threshold, --no-progress-turns, --no-tool-turns, --success, --constraints, --mode.",
+    "Supported flags: --max-turns, --max-minutes, --max-duration-ms, --max-tokens, --budget, --cooldown-ms, --no-progress-threshold, --no-progress-turns, --no-tool-turns, --success, --constraints, --mode, --objective.",
     "You can pass them as `--flag value` or `--flag=value`. Quote multi-word values, e.g. --success \"tests pass and docs updated\".",
+    "Flags are read only from the first line, or from the text before a `---` separator line. Everything after that is the goal body and is kept verbatim, so a pasted handoff containing --flags is never parsed.",
   ].join("\n")
 }
 
@@ -3083,11 +3317,228 @@ function budgetWrapupNeeded(goal) {
   )
 }
 
+// ---------------------------------------------------------------------------
+// Verified action plan (Claim → Evidence → Verdict)
+//
+// A goal is decomposed into an ordered list of actions that live in the same
+// persisted JSON state as the goal itself. An action may only reach `done` with
+// a recorded claim, the minimum evidence that could have falsified that claim,
+// and a verdict. The goal's completion gate consults the plan, so "I'm done"
+// is no longer self-certifying: it has to be backed by the plan's own ledger.
+// ---------------------------------------------------------------------------
+const PLAN_ACTION_STATUSES = ["pending", "in_progress", "done", "blocked"]
+const PLAN_ACTION_STATUS_SET = new Set(PLAN_ACTION_STATUSES)
+const PLAN_VERDICTS = ["pass", "fail"]
+const PLAN_VERDICT_SET = new Set(PLAN_VERDICTS)
+const MAX_PLAN_ACTIONS = 50
+const MAX_PLAN_ID_LENGTH = 64
+const MAX_PLAN_TITLE_LENGTH = 200
+const MAX_PLAN_TEXT_LENGTH = 2000
+// The CEV rule, verbatim, injected with every plan render. Kept in one place so
+// the prompt, the tool descriptions, and the docs cannot drift apart.
+const CEV_RULE =
+  "CEV rule: Claim → the minimum Evidence sufficient to prove or break it → Verdict (pass/fail). " +
+  "Evidence is an observation the world produced (command output, file content, HTTP response), never the work's own report of itself. " +
+  "Evidence that cannot fail proves nothing."
+
+function emptyPlan() {
+  return { actions: [], updatedAt: 0 }
+}
+
+function planTextField(value, limit = MAX_PLAN_TEXT_LENGTH) {
+  if (typeof value !== "string") return ""
+  const trimmed = value.trim()
+  if (!trimmed) return ""
+  return trimmed.length > limit ? trimmed.slice(0, limit) : trimmed
+}
+
+function normalizePlanActionId(value, index) {
+  const raw = typeof value === "string" ? value.trim() : ""
+  const bounded = raw.slice(0, MAX_PLAN_ID_LENGTH)
+  return bounded || `a${index + 1}`
+}
+
+function normalizePlanAction(raw, index) {
+  if (!isPlainObject(raw)) return null
+  const title = planTextField(raw.title, MAX_PLAN_TITLE_LENGTH)
+  if (!title) return null
+  const status = PLAN_ACTION_STATUS_SET.has(raw.status) ? raw.status : "pending"
+  const verdict = PLAN_VERDICT_SET.has(raw.verdict) ? raw.verdict : null
+  return {
+    id: normalizePlanActionId(raw.id, index),
+    title,
+    status,
+    claim: planTextField(raw.claim),
+    evidence: planTextField(raw.evidence),
+    verdict,
+  }
+}
+
+// Duplicate ids would make `goal_action_update` ambiguous, so later duplicates
+// are renamed rather than dropped: losing an action silently is worse than
+// renaming one.
+function normalizePlan(raw) {
+  if (!isPlainObject(raw)) return emptyPlan()
+  const source = Array.isArray(raw.actions) ? raw.actions : []
+  const seen = new Set()
+  const actions = []
+  for (const candidate of source.slice(0, MAX_PLAN_ACTIONS)) {
+    const action = normalizePlanAction(candidate, actions.length)
+    if (!action) continue
+    if (seen.has(action.id)) {
+      let suffix = 2
+      let candidateId = `${action.id}-${suffix}`
+      while (seen.has(candidateId)) {
+        suffix += 1
+        candidateId = `${action.id}-${suffix}`
+      }
+      action.id = candidateId
+    }
+    seen.add(action.id)
+    actions.push(action)
+  }
+  return { actions, updatedAt: toNonNegativeInteger(raw.updatedAt) }
+}
+
+// An action is verified only when its own ledger is complete. A `done` status
+// with no claim, no evidence, or a failing verdict is exactly the unsubstantiated
+// completion this gate exists to catch.
+function planActionVerified(action) {
+  return (
+    action.status === "done" &&
+    Boolean(action.claim) &&
+    Boolean(action.evidence) &&
+    action.verdict === "pass"
+  )
+}
+
+function planActionBlocked(action) {
+  return action.status === "blocked" && Boolean(action.claim || action.evidence)
+}
+
+function planProgress(plan) {
+  const actions = plan?.actions || []
+  const counts = { pending: 0, in_progress: 0, done: 0, blocked: 0 }
+  let verified = 0
+  for (const action of actions) {
+    counts[action.status] = (counts[action.status] || 0) + 1
+    if (planActionVerified(action)) verified += 1
+  }
+  return {
+    total: actions.length,
+    verified,
+    pending: counts.pending,
+    inProgress: counts.in_progress,
+    done: counts.done,
+    blocked: counts.blocked,
+  }
+}
+
+// Why the plan does not yet authorize completion. Empty array means it does.
+function planCompletionBlockers(plan) {
+  const actions = plan?.actions || []
+  if (!actions.length) return []
+  const blockers = []
+  for (const action of actions) {
+    if (planActionVerified(action) || planActionBlocked(action)) continue
+    if (action.status === "done") {
+      const missing = []
+      if (!action.claim) missing.push("claim")
+      if (!action.evidence) missing.push("evidence")
+      if (action.verdict !== "pass") missing.push(action.verdict === "fail" ? "a passing verdict" : "verdict")
+      blockers.push(`${action.id} is done without ${missing.join(", ")}`)
+      continue
+    }
+    if (action.status === "blocked") {
+      blockers.push(`${action.id} is blocked without a stated reason`)
+      continue
+    }
+    blockers.push(`${action.id} is ${action.status}`)
+  }
+  return blockers
+}
+
+// A plan with no actions never blocks completion: the plan is opt-in, and a
+// goal set before a plan exists must still be completable the old way.
+function planAllowsCompletion(goal) {
+  return planCompletionBlockers(goal?.plan).length === 0
+}
+
+function planStatusLabel(plan) {
+  const progress = planProgress(plan)
+  if (!progress.total) return "no plan recorded"
+  const parts = [`${progress.verified}/${progress.total} actions verified`]
+  if (progress.blocked) parts.push(`${progress.blocked} blocked`)
+  return parts.join(", ")
+}
+
+const PLAN_ACTION_ICONS = { pending: "○", in_progress: "◐", done: "●", blocked: "⛔" }
+
+// Compact plan render for the continuation prompt. Bounded per action so a
+// 50-action plan cannot dominate the context window.
+function formatPlanForPrompt(plan) {
+  const actions = plan?.actions || []
+  if (!actions.length) return ""
+  return actions
+    .map((action) => {
+      const verdict = action.verdict ? ` verdict=${action.verdict}` : ""
+      const claim = action.claim ? ` claim="${summarizeText(action.claim, 120)}"` : ""
+      const evidence = action.evidence ? ` evidence="${summarizeText(action.evidence, 160)}"` : ""
+      return `${action.id} [${action.status}] ${summarizeText(action.title, 120)}${verdict}${claim}${evidence}`
+    })
+    .join("\n")
+}
+
+// Plan lines for the system prompt and the compaction summary. Two states: no
+// plan yet (decompose first) or a plan (work the ledger).
+function buildPlanSystemLines(goal) {
+  const render = formatPlanForPrompt(goal?.plan)
+  if (!render) {
+    return [
+      "<goal_plan>",
+      "No verified action plan recorded for this goal yet. Decompose the objective into an ordered list of actions and record it with goal_plan_set(actions: [{ id, title }, …]) before doing further work.",
+      "Then work one action at a time: goal_action_update(id, status) to start it, and to finish it record claim, evidence, and verdict.",
+      CEV_RULE,
+      "</goal_plan>",
+    ]
+  }
+  return [
+    "<goal_plan>",
+    render,
+    `progress: ${planStatusLabel(goal.plan)}`,
+    "Keep it current with goal_action_update(id, status, claim?, evidence?, verdict?); add or replace the whole list with goal_plan_set.",
+    "An action may only become done with a claim, the evidence that could have falsified it, and verdict=pass. A blocked action must state its reason in claim.",
+    "The goal cannot be completed until every action is done with verdict=pass, or blocked with a stated reason.",
+    CEV_RULE,
+    "</goal_plan>",
+  ]
+}
+
+// Human-readable plan render for `/goal status`.
+function formatPlanForStatus(plan) {
+  const actions = plan?.actions || []
+  if (!actions.length) return "Plan: none recorded."
+  const lines = [`Plan (${planStatusLabel(plan)}):`]
+  for (const action of actions) {
+    const icon = PLAN_ACTION_ICONS[action.status] || "○"
+    const verdict = action.verdict ? ` [${action.verdict}]` : ""
+    lines.push(`  ${icon} ${action.id}: ${summarizeText(action.title, 160)}${verdict}`)
+    if (action.claim) lines.push(`      claim: ${summarizeText(action.claim, 200)}`)
+    if (action.evidence) lines.push(`      evidence: ${summarizeText(action.evidence, 240)}`)
+  }
+  return lines.join("\n")
+}
+
 function buildGoalState(sessionID, condition, options, meta = {}, lastStatus = "Goal set.") {
   return {
     goalId: randomUUID(),
     runId: randomUUID(),
     condition,
+    // Short display label. The condition itself may be a multi-thousand
+    // character handoff; every narrow surface renders this instead.
+    objectiveLabel: deriveGoalLabel(condition, meta.objective),
+    // Verified action plan. Empty until the assistant calls goal_plan_set.
+    plan: emptyPlan(),
     successCriteria: typeof meta.successCriteria === "string" ? meta.successCriteria : "",
     constraints: typeof meta.constraints === "string" ? meta.constraints : "",
     mode: normalizeMode(meta.mode) || "normal",
@@ -3192,8 +3643,8 @@ function buildAgentToolHandlers({
     if (objective.length > MAX_GOAL_OBJECTIVE_LENGTH)
       return `Invalid objective: must be ${MAX_GOAL_OBJECTIVE_LENGTH} characters or fewer.`
     for (const [field, value] of [["successCriteria", args.successCriteria], ["constraints", args.constraints]]) {
-      if (typeof value === "string" && value.length > MAX_GOAL_META_LENGTH)
-        return `Invalid ${field}: must be ${MAX_GOAL_META_LENGTH} characters or fewer.`
+      if (typeof value === "string" && value.length > MAX_GOAL_CRITERIA_LENGTH)
+        return `Invalid ${field}: must be ${MAX_GOAL_CRITERIA_LENGTH} characters or fewer.`
     }
 
     // Validate budget args before normalizing: normalizeOptions silently substitutes
@@ -3272,6 +3723,7 @@ function buildAgentToolHandlers({
         return `Invalid objective: must be ${MAX_GOAL_OBJECTIVE_LENGTH} characters or fewer.`
       }
       goal.condition = args.objective.trim()
+      goal.objectiveLabel = deriveGoalLabel(goal.condition)
       // Deliberately NOT clearing goal.stopped or goal.stopReason: updating the
       // objective does not un-stop a goal. Use status='resumed' to explicitly
       // restart a stopped goal; silently un-stopping would resurrect audit-rejected
@@ -3303,6 +3755,17 @@ function buildAgentToolHandlers({
         if (!evidence) return "Completion evidence is required before a goal can be archived."
         if (evidence.length > MAX_LEGACY_EVIDENCE_LENGTH)
           return `Completion evidence must be ${MAX_LEGACY_EVIDENCE_LENGTH} characters or fewer.`
+        // Plan gate: the same rule the [goal:complete] marker path enforces, so
+        // the tool path cannot archive a goal whose recorded plan says otherwise.
+        const planBlockers = planCompletionBlockers(goal.plan)
+        if (planBlockers.length) {
+          return [
+            `Completion refused: the action plan is not satisfied (${planStatusLabel(goal.plan)}).`,
+            `Outstanding: ${planBlockers.join("; ")}.`,
+            "Finish each action with goal_action_update, or mark it blocked with a stated reason.",
+            CEV_RULE,
+          ].join(" ")
+        }
         const auditedGoalID = goal.goalId
         const auditedRunID = goal.runId
         if (auditMessagesEnabled) {
@@ -3552,6 +4015,107 @@ function buildAgentToolHandlers({
     return messages.join(" ")
   }
 
+  // ---- Verified action plan handlers -------------------------------------
+  // The plan lives inside the goal record, so every mutation persists through
+  // the same chain as the rest of the goal state.
+
+  async function getPlan(sessionID) {
+    const goal = goalStates.get(sessionID)
+    if (!goal) return "No active goal."
+    return formatPlanForStatus(goal.plan)
+  }
+
+  async function setPlan(sessionID, args = {}) {
+    const goal = goalStates.get(sessionID)
+    if (!goal) return "No active goal. Set one first."
+    if (!Array.isArray(args.actions)) {
+      return "Pass `actions` as an array of { id, title } objects."
+    }
+    if (args.actions.length > MAX_PLAN_ACTIONS) {
+      return `A plan may hold at most ${MAX_PLAN_ACTIONS} actions.`
+    }
+    const plan = normalizePlan({ actions: args.actions, updatedAt: Date.now() })
+    if (!plan.actions.length) {
+      return "No usable actions provided. Each action needs a non-empty `title`."
+    }
+    // Preserve recorded evidence across a re-plan: a model that re-submits the
+    // list must not be able to launder a verified action back to unverified, nor
+    // silently drop the ledger of one it kept.
+    const previous = new Map((goal.plan?.actions || []).map((action) => [action.id, action]))
+    for (const action of plan.actions) {
+      const prior = previous.get(action.id)
+      if (!prior) continue
+      if (!action.claim) action.claim = prior.claim
+      if (!action.evidence) action.evidence = prior.evidence
+      if (!action.verdict) action.verdict = prior.verdict
+    }
+    goal.plan = plan
+    goal.lastStatus = `Plan recorded: ${planStatusLabel(plan)}.`
+    pushHistory(goal, "plan-set", `Plan recorded with ${plan.actions.length} action(s).`)
+    await persist(sessionID)
+    return [
+      `Plan recorded (${plan.actions.length} action(s)).`,
+      formatPlanForStatus(goal.plan),
+      CEV_RULE,
+    ].join("\n")
+  }
+
+  async function updateAction(sessionID, args = {}) {
+    const goal = goalStates.get(sessionID)
+    if (!goal) return "No active goal. Set one first."
+    const actions = goal.plan?.actions || []
+    if (!actions.length) return "No plan recorded. Call goal_plan_set first."
+    const id = typeof args.id === "string" ? args.id.trim() : ""
+    if (!id) return "Pass the `id` of the action to update."
+    const action = actions.find((entry) => entry.id === id)
+    if (!action) {
+      return `No action with id "${id}". Known ids: ${actions.map((entry) => entry.id).join(", ")}.`
+    }
+
+    const status = typeof args.status === "string" ? args.status.trim() : ""
+    if (status && !PLAN_ACTION_STATUS_SET.has(status)) {
+      return `Invalid status "${status}". Expected one of: ${PLAN_ACTION_STATUSES.join(", ")}.`
+    }
+    const verdict = typeof args.verdict === "string" ? args.verdict.trim() : ""
+    if (verdict && !PLAN_VERDICT_SET.has(verdict)) {
+      return `Invalid verdict "${verdict}". Expected one of: ${PLAN_VERDICTS.join(", ")}.`
+    }
+
+    const nextClaim = typeof args.claim === "string" ? planTextField(args.claim) : action.claim
+    const nextEvidence =
+      typeof args.evidence === "string" ? planTextField(args.evidence) : action.evidence
+    const nextVerdict = verdict || (args.verdict === null ? null : action.verdict)
+    const nextStatus = status || action.status
+
+    // The gate that makes the ledger mean something: `done` is refused unless
+    // the claim, the falsifying evidence, and the verdict are all present.
+    if (nextStatus === "done") {
+      const missing = []
+      if (!nextClaim) missing.push("claim")
+      if (!nextEvidence) missing.push("evidence")
+      if (nextVerdict !== "pass") missing.push(nextVerdict === "fail" ? "a passing verdict" : "verdict")
+      if (missing.length) {
+        return [
+          `Cannot mark "${id}" done without ${missing.join(", ")}.`,
+          CEV_RULE,
+        ].join(" ")
+      }
+    }
+    if (nextStatus === "blocked" && !nextClaim) {
+      return `Cannot mark "${id}" blocked without a stated reason in \`claim\`.`
+    }
+
+    action.status = nextStatus
+    action.claim = nextClaim
+    action.evidence = nextEvidence
+    action.verdict = nextVerdict || null
+    goal.plan.updatedAt = Date.now()
+    goal.lastStatus = `Action ${id} → ${action.status}; ${planStatusLabel(goal.plan)}.`
+    pushHistory(goal, "plan-action", `Action ${id} set to ${action.status}.`)
+    await persist(sessionID)
+    return [`Action ${id} updated: ${action.status}.`, `Progress: ${planStatusLabel(goal.plan)}.`].join(" ")
+  }
+
   async function clearGoal(sessionID) {
     // Mirror `/goal clear`: drop the ordered flag, ALL backgrounded goals, and the
     // focused goal + result. Without sessionGoals.delete, background goals added via
@@ -3586,7 +4150,7 @@ function buildAgentToolHandlers({
       : "Goal cleared."
   }
 
-  return { getGoal, getGoalHistory, setGoal, updateGoal, clearGoal }
+  return { getGoal, getGoalHistory, setGoal, updateGoal, clearGoal, getPlan, setPlan, updateAction }
 }
 
 function agentToolSessionID(ctx) {
@@ -3785,6 +4349,51 @@ function buildAgentTools(
         return canonicalHandlers.update(sessionID, { status: "complete", evidence: claim.evidence })
       }),
     }),
+    goal_plan_get: toolHelper({
+      description:
+        "Return the goal's verified action plan: every action with its status, claim, evidence, and verdict.",
+      args: {},
+      execute: canonicalRun("plan_get", async (sessionID) => goalToolSuccess(await handlers.getPlan(sessionID))),
+    }),
+    goal_plan_set: toolHelper({
+      description:
+        "Record the ordered action plan for the current goal. Decompose the objective into concrete actions; each needs a stable `id` and a `title`. Replaces the whole plan, preserving already-recorded claim/evidence/verdict for actions you keep by id.",
+      args: {
+        actions: schema.array(
+          schema.object({
+            id: schema.string().optional(),
+            title: schema.string(),
+            status: schema.enum(PLAN_ACTION_STATUSES).optional(),
+            claim: schema.string().optional(),
+            evidence: schema.string().optional(),
+            verdict: schema.enum(PLAN_VERDICTS).optional(),
+          }),
+        ),
+      },
+      execute: canonicalRun("plan_set", async (sessionID, args) => {
+        const message = await handlers.setPlan(sessionID, args)
+        return message.startsWith("Plan recorded")
+          ? goalToolSuccess(message)
+          : goalToolFailure("invalid_plan", message)
+      }),
+    }),
+    goal_action_update: toolHelper({
+      description:
+        "Update one action of the goal plan. An action may only become `done` with a claim, the minimum evidence that could have falsified it (real command output, file content, or response — not your own report), and verdict `pass`. A `blocked` action must state its reason in `claim`.",
+      args: {
+        id: schema.string(),
+        status: schema.enum(PLAN_ACTION_STATUSES).optional(),
+        claim: schema.string().optional(),
+        evidence: schema.string().optional(),
+        verdict: schema.enum(PLAN_VERDICTS).optional(),
+      },
+      execute: canonicalRun("action_update", async (sessionID, args) => {
+        const message = await handlers.updateAction(sessionID, args)
+        return /^Action .+ updated:/.test(message)
+          ? goalToolSuccess(message)
+          : goalToolFailure("action_update_rejected", message)
+      }),
+    }),
     get_goal: toolHelper({
       description:
         "Get the status of the current goal for this session (objective, budget usage, last checkpoint).",
@@ -3850,7 +4459,7 @@ function formatGoalList(sessionID, commandName = "goal") {
           ? goal.stopReason
           : ""
       const reasonText = reason ? ` (${summarizeText(reason, 160)})` : ""
-      lines.push(`${index + 1}. [${marker}] ${goal.condition} — state: ${state}${reasonText}`)
+      lines.push(`${index + 1}. [${marker}] ${goalLabel(goal)} — state: ${state}${reasonText}`)
     })
     lines.push(`Switch with \`/${commandName} focus <number>\`.`)
   } else {
@@ -3860,7 +4469,7 @@ function formatGoalList(sessionID, commandName = "goal") {
   if (archived.length) {
     lines.push("", `Archived (${archived.length}, newest last):`)
     archived.forEach((result) => {
-      lines.push(`- [${result.state}] ${result.condition}`)
+      lines.push(`- [${result.state}] ${goalLabel(result)}`)
     })
   }
 
@@ -4075,19 +4684,59 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
   // agent. Defaults to false: unattended work must not escape Plan mode.
   const allowGoalExecutionFromPlan = pluginOptions.allowGoalExecutionFromPlan === true
 
-  // Opt-in: mirrors live goal status into the OpenCode session title, which the
-  // TUI renders persistently. Off by default because it overwrites a
-  // user-visible field.
-  const sessionTitleStatus = pluginOptions.sessionTitleStatus === true
+  // Sidebar goal status. On by default: an unattended goal you cannot see is
+  // the whole problem this solves. Two kill switches, because the mechanism
+  // writes a user-visible field: `sidebarStatus: false` in plugin options, or
+  // OPENCODE_GOAL_SIDEBAR=0 in the environment. `sessionTitleStatus` is the
+  // pre-0.10.0 spelling and still works.
+  const sidebarEnv = String(
+    (pluginOptions.env || process.env || {}).OPENCODE_GOAL_SIDEBAR ?? "",
+  ).trim().toLowerCase()
+  const sidebarDisabledByEnv = sidebarEnv === "0" || sidebarEnv === "false" || sidebarEnv === "off"
+  const sidebarOption =
+    pluginOptions.sidebarStatus !== undefined
+      ? pluginOptions.sidebarStatus
+      : pluginOptions.sessionTitleStatus
+  // A host without `session.update` has no sidebar to drive. Skip silently
+  // rather than logging a failure on every tick.
+  const sidebarHostCapable = typeof client?.session?.update === "function"
+  const sidebarStatus = sidebarOption !== false && !sidebarDisabledByEnv && sidebarHostCapable
 
-  // Title updates are cosmetic: every path swallows errors after logging at
+  // Sequence position for a `/goal sequence` run: archived results count, so
+  // "3/5" means the third of five objectives, not the third still pending.
+  const sidebarSequenceContext = (sessionID) => {
+    if (!sessionOrdered.has(sessionID)) return { ordered: false }
+    const live = listSessionGoals(sessionID)
+    const done = (sessionArchive.get(sessionID) || []).length
+    const focused = goalStates.get(sessionID)
+    const index = live.findIndex((entry) => entry.goalId === focused?.goalId)
+    // With every objective finished there is no focused goal left, so the
+    // position is the count of completed ones rather than one past the end.
+    const position = index >= 0 ? index + 1 : focused ? 1 : 0
+    return {
+      ordered: true,
+      sequencePosition: done + position,
+      sequenceTotal: done + live.length,
+    }
+  }
+
+  // Sidebar updates are cosmetic: every path swallows errors after logging at
   // debug level so a failure can never interrupt the goal loop.
-  const syncSessionTitle = async (sessionID) => {
-    if (!sessionTitleStatus || !sessionID) return
-    const goal = goalStates.get(sessionID)
+  const syncSidebar = async (sessionID) => {
+    if (!sidebarStatus || !sessionID) return
+    // A finished goal is no longer in `goalStates`; its terminal snapshot keeps
+    // the sidebar honest ("✓ …" / state `completed`) instead of leaving the last
+    // running render up forever.
+    const goal = goalStates.get(sessionID) || sidebarTerminals.get(sessionID)
     if (!goal) return
-    const title = buildSessionTitle(goal)
-    if (currentRuntime().appliedTitles.get(sessionID) === title) return
+    const now = Date.now()
+    const context = sidebarSequenceContext(sessionID)
+    const title = buildSessionTitle(goal, now, context)
+    const metadata = buildSidebarMetadata(goal, now, context)
+    // Idempotence: compare everything except the timestamp, so an idle tick that
+    // changed nothing costs no API round trip.
+    const fingerprint = JSON.stringify([title, { ...metadata, updatedAt: 0 }])
+    if (currentRuntime().appliedTitles.get(sessionID) === fingerprint) return
     try {
       if (!currentRuntime().sessionTitles.has(sessionID)) {
         const session = await sessionApi.get(sessionID)
@@ -4100,27 +4749,54 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           looksLikePluginSessionTitle(existing) ? "" : existing,
         )
       }
-      await sessionApi.update(sessionID, { title })
-      currentRuntime().appliedTitles.set(sessionID, title)
+      await updateSessionSidebar(sessionID, { title, goal: metadata })
+      currentRuntime().appliedTitles.set(sessionID, fingerprint)
     } catch (error) {
-      await logPluginDebug(client, "Failed to update session title", error)
+      await logPluginDebug(client, "Failed to update sidebar goal status", error)
+    }
+  }
+
+  // `metadata` is accepted by PATCH /session/{id} but is absent from the v1 SDK's
+  // declared body type, so a strict host could reject it. One rejection demotes
+  // this process to title-only for the rest of its life rather than losing the
+  // title too.
+  let sidebarMetadataSupported = true
+  const updateSessionSidebar = async (sessionID, { title, goal }) => {
+    if (!sidebarMetadataSupported) {
+      await sessionApi.update(sessionID, { title })
+      return
+    }
+    try {
+      await sessionApi.update(sessionID, { title, metadata: { goal } })
+    } catch (error) {
+      sidebarMetadataSupported = false
+      await logPluginDebug(client, "Session metadata rejected; falling back to title-only sidebar status", error)
+      await sessionApi.update(sessionID, { title })
     }
   }
 
   const restoreSessionTitle = async (sessionID) => {
-    if (!sessionTitleStatus || !sessionID) return
+    if (!sidebarStatus || !sessionID) return
     const runtime = currentRuntime()
-    if (!runtime.sessionTitles.has(sessionID)) return
-    const original = runtime.sessionTitles.get(sessionID)
+    const captured = runtime.sessionTitles.has(sessionID)
+    const original = captured ? runtime.sessionTitles.get(sessionID) : ""
     runtime.sessionTitles.delete(sessionID)
     runtime.appliedTitles.delete(sessionID)
-    // Empty means there was nothing genuine to restore (no title, or the
-    // session only carried a status line from a previous process).
-    if (!original) return
+    runtime.sidebarTerminals.delete(sessionID)
+    // The goal is gone, so the sidebar's structured status must go with it even
+    // when there is no original title worth restoring. `metadata.goal` is this
+    // plugin's own namespace, so it is cleared unconditionally — including after
+    // a restart, where the in-memory original title is lost but a stale status
+    // payload written by the previous process is still on the session record.
+    if (!captured && !sidebarMetadataSupported) return
     try {
-      await sessionApi.update(sessionID, { title: original })
+      if (sidebarMetadataSupported) {
+        await sessionApi.update(sessionID, original ? { title: original, metadata: { goal: null } } : { metadata: { goal: null } })
+      } else if (original) {
+        await sessionApi.update(sessionID, { title: original })
+      }
     } catch (error) {
-      await logPluginDebug(client, "Failed to restore session title", error)
+      await logPluginDebug(client, "Failed to clear sidebar goal status", error)
     }
   }
 
@@ -5987,10 +6663,29 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         // corrective continuation prompt (these flags drive that prompt below).
         let completionUnverified = false
         let blockerUnstated = false
+        // Set when the rejection has a more specific cause than "no evidence
+        // line" — currently an unsatisfied action plan.
+        let completionRejection = ""
 
         if (!terminalBoundary && goalIsComplete(latestText)) {
           const evidence = extractCompletionEvidence(latestText)
-          if (evidence) {
+          // Plan gate: a recorded action plan outranks a "done" message. The
+          // goal completes only when every action is done with verdict=pass or
+          // blocked with a stated reason.
+          const planBlockers = planCompletionBlockers(activeGoalAfterMessages.plan)
+          if (evidence && planBlockers.length) {
+            completionUnverified = true
+            completionRejection =
+              `Previous completion was rejected: the action plan is not satisfied (${planStatusLabel(activeGoalAfterMessages.plan)}). ` +
+              `Outstanding: ${summarizeText(planBlockers.join("; "), 400)}. ` +
+              "Record each action's claim, the evidence that could have falsified it, and verdict=pass with goal_action_update — or mark it blocked with a stated reason — before claiming completion."
+            activeGoalAfterMessages.lastStatus = `Rejected [goal:complete]: action plan not satisfied (${planStatusLabel(activeGoalAfterMessages.plan)}).`
+            pushHistory(
+              activeGoalAfterMessages,
+              "completion-unverified",
+              `Assistant claimed completion with an unsatisfied action plan: ${summarizeText(planBlockers.join("; "), 300)}`,
+            )
+          } else if (evidence) {
             await announceAudit(
               sessionID,
               `Auditing goal completion: verifying "${summarizeText(activeGoalAfterMessages.condition, 120)}" is satisfied before archiving.`,
@@ -6470,7 +7165,9 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         if (!budgetWrapup) {
           if (completionUnverified) {
             activeGoalBeforePrompt.formatFailures += 1
-            activeGoalBeforePrompt.lastStatus = `Rejected an unverified [goal:complete] (no [goal:evidence]); re-prompting for evidence on turn ${activeGoalBeforePrompt.turnCount}.`
+            activeGoalBeforePrompt.lastStatus = completionRejection
+              ? `Rejected a [goal:complete] against an unsatisfied action plan (${planStatusLabel(activeGoalBeforePrompt.plan)}); re-prompting on turn ${activeGoalBeforePrompt.turnCount}.`
+              : `Rejected an unverified [goal:complete] (no [goal:evidence]); re-prompting for evidence on turn ${activeGoalBeforePrompt.turnCount}.`
           } else if (blockerUnstated) {
             activeGoalBeforePrompt.formatFailures += 1
             activeGoalBeforePrompt.lastStatus = `Rejected a [goal:blocked] with no concrete blocker; re-prompting on turn ${activeGoalBeforePrompt.turnCount}.`
@@ -6525,6 +7222,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
                   budgetWrapup,
                   completionUnverified,
                   blockerUnstated,
+                  completionRejection,
                 }),
                 continueToken,
               ),
@@ -6674,6 +7372,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         : [
             `<opencode_goal_plugin id="${goal.goalId}">`,
             buildGoalBlock(goal),
+            ...buildPlanSystemLines(goal),
             "Keep working until the goal is fully satisfied.",
             "When fully satisfied, put a `[goal:evidence]` line summarizing what you verified immediately before `[goal:complete]`. A `[goal:complete]` without evidence is rejected.",
             "If user input is required, explain the concrete blocker in the line immediately before `[goal:blocked]`. A `[goal:blocked]` without a concrete blocker is rejected.",
@@ -6727,12 +7426,14 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
 
   // register_command toggle: when disabled, the plugin does not own
   // a slash command and only the event/transform/compaction hooks remain.
-  // Session-title indicator: rather than threading a sync call through every
+  // Sidebar goal status: rather than threading a sync call through every
   // state-mutating site (a missed one shows the user a stale status), wrap the
-  // two hooks that gate all state change. The sync no-ops when the rendered
-  // title is unchanged, and runs in `finally` so the displayed status matches
-  // the state actually reached even if a hook throws.
-  if (sessionTitleStatus) {
+  // two hooks that gate all state change — goal set, continue, limit change,
+  // pause, resume, completion, failure, cancel, and `/goal sequence` promotion
+  // all pass through one of them. The sync no-ops when the rendered status is
+  // unchanged, and runs in `finally` so what the sidebar shows matches the state
+  // actually reached even if a hook throws.
+  if (sidebarStatus) {
     for (const hookName of ["command.execute.before", "event"]) {
       const original = hooks[hookName]
       if (typeof original !== "function") continue
@@ -6752,7 +7453,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           } else {
             titleSessionID = args[0]?.sessionID
           }
-          await syncSessionTitle(titleSessionID)
+          await syncSidebar(titleSessionID)
         }
       }
     }
@@ -6915,6 +7616,23 @@ export const testInternals = {
   userInterventionDetected,
   outputTokensForMessage,
   parseGoalArguments,
+  buildGoalState,
+  normalizePersistedGoal,
+  normalizePlan,
+  emptyPlan,
+  planProgress,
+  planCompletionBlockers,
+  planAllowsCompletion,
+  planStatusLabel,
+  formatPlanForPrompt,
+  formatPlanForStatus,
+  buildPlanSystemLines,
+  PLAN_ACTION_STATUSES,
+  PLAN_VERDICTS,
+  CEV_RULE,
+  splitGoalCommandText,
+  deriveGoalLabel,
+  goalLabel,
   parsePositiveIntegerStrict,
   parseTokenBudget,
   pruneGoalResults,

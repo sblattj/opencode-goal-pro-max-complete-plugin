@@ -57,6 +57,19 @@ const {
   normalizePersistenceOptions,
   outputTokensForMessage,
   parseGoalArguments,
+  buildGoalState,
+  normalizePersistedGoal,
+  normalizePlan,
+  emptyPlan,
+  planProgress,
+  planCompletionBlockers,
+  planAllowsCompletion,
+  planStatusLabel,
+  buildPlanSystemLines,
+  CEV_RULE,
+  splitGoalCommandText,
+  deriveGoalLabel,
+  goalLabel,
   parseTokenBudget,
   readLedgerEntries,
   reconstructGoalsFromLedger,
@@ -307,6 +320,84 @@ test("supports equals-style per-goal flags", () => {
   assert.equal(parsed.options.noProgressTokenThreshold, 12)
   assert.equal(parsed.options.noProgressTurnsBeforePause, 4)
   assert.deepEqual(parsed.errors, [])
+})
+
+test("a multi-line handoff keeps its body verbatim and never parses flags from it", () => {
+  const body = [
+    "Deploy the release.",
+    "",
+    "Steps:",
+    "1. `git push --force` to the release branch",
+    "2. `curl -fsSL https://example.test/install | zsh -s -- --no-opencode`",
+    "",
+    "```sh",
+    "ferry reload --max-turns 99",
+    "```",
+    "",
+    "Do not stop until the smoke test passes.",
+  ].join("\n")
+  const parsed = parseGoalArguments(`ship the release --max-turns 12\n${body}`, normalizeOptions())
+
+  assert.deepEqual(parsed.errors, [])
+  assert.equal(parsed.options.maxTurns, 12)
+  // The body survives byte for byte: no tokenizing, no quote stripping, no
+  // whitespace collapsing, and none of its `--flags` consumed.
+  assert.equal(parsed.condition, `ship the release\n${body}`)
+  assert.ok(parsed.condition.includes("git push --force"))
+  assert.ok(parsed.condition.includes("zsh -s -- --no-opencode"))
+  assert.ok(parsed.condition.includes("ferry reload --max-turns 99"))
+})
+
+test("a `---` separator ends the flag region, so flags may span several lines", () => {
+  const parsed = parseGoalArguments(
+    ["ship it", "--max-turns 4", "--success \"tests pass\"", "---", "body --max-turns 99", "second line"].join("\n"),
+    normalizeOptions(),
+  )
+  assert.deepEqual(parsed.errors, [])
+  assert.equal(parsed.options.maxTurns, 4)
+  assert.equal(parsed.meta.successCriteria, "tests pass")
+  assert.equal(parsed.condition, "ship it\nbody --max-turns 99\nsecond line")
+})
+
+test("splitGoalCommandText splits on the first newline or a --- separator", () => {
+  assert.deepEqual(splitGoalCommandText("one line only"), { head: "one line only", body: "" })
+  assert.deepEqual(splitGoalCommandText("head\nbody\nmore"), { head: "head", body: "body\nmore" })
+  assert.deepEqual(splitGoalCommandText("a\nb\n---\nc\nd"), { head: "a\nb\n", body: "c\nd" })
+})
+
+test("the goal label is the first non-empty line, or an explicit --objective", () => {
+  const derived = parseGoalArguments("Ship the release\n\nlong handoff body here", normalizeOptions())
+  assert.equal(derived.objectiveLabel, "Ship the release")
+
+  const explicit = parseGoalArguments(
+    'ship it --objective "release 0.10.0"\nlots of context',
+    normalizeOptions(),
+  )
+  assert.equal(explicit.objectiveLabel, "release 0.10.0")
+  assert.equal(explicit.condition, "ship it\nlots of context")
+
+  // deriveGoalLabel bounds the label so a wall of text cannot reach a narrow surface.
+  assert.equal(deriveGoalLabel("x".repeat(400)).length, 200)
+  // A goal persisted before objectiveLabel existed still renders a label.
+  assert.equal(goalLabel({ condition: "legacy goal\nmore" }), "legacy goal")
+})
+
+test("a long handoff renders as a short label in the title, list, and status", async () => {
+  const handoff = `Ship v0.10.0\n\n${"context line\n".repeat(400)}`
+  assert.ok(handoff.length > 4000)
+  const { hooks } = await createHooks()
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "long-handoff", arguments: handoff },
+    { parts: [] },
+  )
+  const goal = currentGoal("long-handoff")
+  assert.ok(goal, "the long handoff was accepted")
+  assert.equal(goal.condition, handoff.trimEnd())
+  assert.equal(goal.objectiveLabel, "Ship v0.10.0")
+  assert.ok(buildSessionTitle(goal).startsWith("▶ Ship v0.10.0 · "))
+  assert.match(formatStatus(goal), /^Active goal: Ship v0\.10\.0$/m)
+  assert.match(formatStatus(goal), /Objective text: [\d,]+ characters/)
+  assert.match(formatGoalList("long-handoff"), /\[focused\] Ship v0\.10\.0 /)
 })
 
 test("parseTokenBudget understands plain numbers and k/m suffixes", () => {
@@ -1057,28 +1148,41 @@ test("registerCommand:false omits the command hook entirely", async () => {
   assert.equal(typeof hooks["experimental.chat.system.transform"], "function")
 })
 
-test("rejects unsupported or malformed flags with explicit errors", () => {
+test("reports malformed known flags and leaves unknown flags in the objective", () => {
   const parsed = parseGoalArguments(
     'fix tests --max-turns nope --bogus 12 --max-tokens',
     normalizeOptions(),
   )
-  assert.equal(parsed.condition, "fix tests")
+  // `--bogus 12` is prose, not a mistake: it survives verbatim instead of
+  // rejecting the whole command.
+  assert.equal(parsed.condition, "fix tests --bogus 12")
   assert.deepEqual(parsed.errors, [
     "Invalid positive integer for --max-turns: nope",
-    "Unsupported flag: --bogus",
     "Missing value for --max-tokens",
   ])
 })
 
-test("rejects oversized goal objectives and metadata before state mutation", async () => {
-  const parsed = parseGoalArguments("x".repeat(4001), normalizeOptions())
-  assert.match(parsed.errors.join(" "), /4000 characters or fewer/)
+test("accepts long handoffs and rejects only text past the command ceiling", async () => {
+  // The old 4,000-character cap rejected exactly the long handoffs this plugin
+  // exists to run.
+  const handoff = "x".repeat(4001)
+  const parsed = parseGoalArguments(handoff, normalizeOptions())
+  assert.deepEqual(parsed.errors, [])
+  assert.equal(parsed.condition, handoff)
+
+  const ceiling = 32 * 1024
+  const oversized = parseGoalArguments("x".repeat(ceiling + 1), normalizeOptions())
+  assert.match(oversized.errors.join(" "), /32768 characters or fewer/)
+
   const { handlers } = makeAgentHandlers()
-  assert.match(await handlers.setGoal("oversized", { objective: "x".repeat(4001) }), /4000 characters or fewer/)
+  assert.match(
+    await handlers.setGoal("oversized", { objective: "x".repeat(ceiling + 1) }),
+    /32768 characters or fewer/,
+  )
   assert.equal(currentGoal("oversized"), null)
   assert.match(
-    await handlers.setGoal("oversized-meta", { objective: "ok", successCriteria: "x".repeat(2001) }),
-    /2000 characters or fewer/,
+    await handlers.setGoal("oversized-meta", { objective: "ok", successCriteria: "x".repeat(ceiling + 1) }),
+    /32768 characters or fewer/,
   )
 })
 
@@ -1229,8 +1333,11 @@ test("prompt builders stay within compact deterministic budgets", () => {
   }
   const block = buildGoalBlock(goal)
   assert.ok(block.length <= 200)
-  assert.ok(buildContinueMessage(goal).length <= 450)
-  assert.ok(buildContinueMessage(goal, { budgetWrapup: true }).length <= 550)
+  // +70 over the pre-0.10.0 budgets: the continuation now carries a compact
+  // <goal_plan> block. The full plan contract and the CEV rule live in the
+  // system block instead, which is re-injected on the same turn.
+  assert.ok(buildContinueMessage(goal).length <= 520)
+  assert.ok(buildContinueMessage(goal, { budgetWrapup: true }).length <= 640)
   assert.ok(buildCompactionContext(goal).length <= block.length + 650)
   assert.ok(buildAuditPrompt(goal, "done").length <= block.length + 700)
 
@@ -4887,15 +4994,22 @@ test("/goal pause with no active goal returns help text", async () => {
   assert.match(output.parts[0].text, /No active goal/)
 })
 
-test("/goal command rejects malformed flags before mutating state", async () => {
+test("/goal command rejects malformed known flags but keeps unknown flags", async () => {
   const { hooks } = await createHooks()
   const output = { parts: [] }
   await hooks["command.execute.before"](
-    { command: "goal", sessionID: "session-bad-flags", arguments: "ship it --bogus 3" },
+    { command: "goal", sessionID: "session-bad-flags", arguments: "ship it --max-turns nope" },
     output,
   )
   assert.match(output.parts[0].text, /Goal flags could not be parsed/)
   assert.equal(currentGoal("session-bad-flags"), null)
+
+  const kept = { parts: [] }
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-unknown-flag", arguments: "ship it --bogus 3" },
+    kept,
+  )
+  assert.equal(currentGoal("session-unknown-flag").condition, "ship it --bogus 3")
 })
 
 test("/goal resume on a running goal is a no-op", async () => {
@@ -7935,9 +8049,12 @@ test("GoalPlugin registers every goal tool by default without an external helper
     "clear_goal",
     "get_goal",
     "get_goal_history",
+    "goal_action_update",
     "goal_block",
     "goal_complete",
     "goal_pause",
+    "goal_plan_get",
+    "goal_plan_set",
     "goal_resume",
     "goal_set",
     "goal_status",
@@ -7947,6 +8064,286 @@ test("GoalPlugin registers every goal tool by default without an external helper
 
   const { hooks: withoutTools } = await createHooks({ options: { registerTools: false } })
   assert.equal(withoutTools.tool, undefined)
+})
+
+// ---------------------------------------------------------------------------
+// Verified action plan (Claim → Evidence → Verdict)
+// ---------------------------------------------------------------------------
+
+test("normalizePlan drops title-less actions, bounds text, and renames duplicate ids", () => {
+  const plan = normalizePlan({
+    actions: [
+      { id: "a1", title: "first" },
+      { title: "" },
+      "not an object",
+      { id: "a1", title: "duplicate id" },
+      { id: "a1", title: "second duplicate" },
+      { id: "x".repeat(200), title: "long id", status: "bogus", verdict: "maybe" },
+    ],
+  })
+  assert.deepEqual(
+    plan.actions.map((action) => action.id),
+    ["a1", "a1-2", "a1-3", "x".repeat(64)],
+  )
+  assert.deepEqual(
+    plan.actions.map((action) => action.title),
+    ["first", "duplicate id", "second duplicate", "long id"],
+  )
+  // Unknown status and verdict fall back rather than poisoning the gate.
+  assert.equal(plan.actions[3].status, "pending")
+  assert.equal(plan.actions[3].verdict, null)
+})
+
+test("normalizePlan caps the action count and survives a non-object", () => {
+  const plan = normalizePlan({
+    actions: Array.from({ length: 80 }, (_, index) => ({ id: `a${index}`, title: `t${index}` })),
+  })
+  assert.equal(plan.actions.length, 50)
+  assert.deepEqual(normalizePlan(null), emptyPlan())
+  assert.deepEqual(normalizePlan({ actions: "nope" }), emptyPlan())
+})
+
+test("planCompletionBlockers names every action that is not verified or blocked-with-reason", () => {
+  const plan = normalizePlan({
+    actions: [
+      { id: "ok", title: "verified", status: "done", claim: "c", evidence: "e", verdict: "pass" },
+      { id: "blocked-ok", title: "blocked with a reason", status: "blocked", claim: "needs a key" },
+      { id: "no-evidence", title: "done, no evidence", status: "done", claim: "c", verdict: "pass" },
+      { id: "failed", title: "done, failing verdict", status: "done", claim: "c", evidence: "e", verdict: "fail" },
+      { id: "blocked-bare", title: "blocked, no reason", status: "blocked" },
+      { id: "todo", title: "not started" },
+    ],
+  })
+  assert.deepEqual(planCompletionBlockers(plan), [
+    "no-evidence is done without evidence",
+    "failed is done without a passing verdict",
+    "blocked-bare is blocked without a stated reason",
+    "todo is pending",
+  ])
+  // An empty plan never blocks: the plan is opt-in.
+  assert.deepEqual(planCompletionBlockers(emptyPlan()), [])
+  assert.equal(planAllowsCompletion({ plan: emptyPlan() }), true)
+  assert.equal(planAllowsCompletion({ plan }), false)
+  assert.deepEqual(planProgress(plan), {
+    total: 6,
+    verified: 1,
+    pending: 1,
+    inProgress: 0,
+    done: 3,
+    blocked: 2,
+  })
+  assert.equal(planStatusLabel(plan), "1/6 actions verified, 2 blocked")
+})
+
+test("goal_plan_set records a plan and preserves recorded evidence across a re-plan", async () => {
+  const { handlers } = makeAgentHandlers()
+  await handlers.setGoal("plan-session", { objective: "ship it" })
+
+  const first = await handlers.setPlan("plan-session", {
+    actions: [{ id: "a1", title: "write the code" }, { id: "a2", title: "run the tests" }],
+  })
+  assert.match(first, /^Plan recorded \(2 action\(s\)\)\./)
+  assert.match(first, /0\/2 actions verified/)
+
+  await handlers.updateAction("plan-session", {
+    id: "a1",
+    status: "done",
+    claim: "the parser keeps the body verbatim",
+    evidence: "node --test printed 419 pass 0 fail",
+    verdict: "pass",
+  })
+  assert.equal(planStatusLabel(currentGoal("plan-session").plan), "1/2 actions verified")
+
+  // Re-planning must not launder a verified action back to unverified.
+  await handlers.setPlan("plan-session", {
+    actions: [{ id: "a1", title: "write the code" }, { id: "a2", title: "run the tests" }, { id: "a3", title: "tag it" }],
+  })
+  const replanned = currentGoal("plan-session").plan
+  assert.equal(replanned.actions.length, 3)
+  assert.equal(replanned.actions[0].evidence, "node --test printed 419 pass 0 fail")
+  assert.equal(replanned.actions[0].verdict, "pass")
+
+  assert.match(await handlers.setPlan("plan-session", { actions: [] }), /No usable actions/)
+  assert.match(await handlers.setPlan("plan-session", {}), /array of \{ id, title \}/)
+  assert.match(await handlers.setPlan("no-goal-session", { actions: [{ title: "x" }] }), /No active goal/)
+})
+
+test("goal_action_update refuses `done` without a claim, evidence, and a passing verdict", async () => {
+  const { handlers } = makeAgentHandlers()
+  await handlers.setGoal("gate-session", { objective: "ship it" })
+  await handlers.setPlan("gate-session", { actions: [{ id: "a1", title: "verify the fix" }] })
+
+  assert.match(
+    await handlers.updateAction("gate-session", { id: "a1", status: "done" }),
+    /Cannot mark "a1" done without claim, evidence, verdict\./,
+  )
+  assert.match(
+    await handlers.updateAction("gate-session", { id: "a1", status: "done", claim: "it works" }),
+    /without evidence, verdict\./,
+  )
+  assert.match(
+    await handlers.updateAction("gate-session", {
+      id: "a1",
+      status: "done",
+      claim: "it works",
+      evidence: "exit 0",
+      verdict: "fail",
+    }),
+    /without a passing verdict/,
+  )
+  // Still pending: none of the refused calls mutated the action.
+  assert.equal(currentGoal("gate-session").plan.actions[0].status, "pending")
+
+  assert.match(
+    await handlers.updateAction("gate-session", { id: "a1", status: "blocked" }),
+    /blocked without a stated reason/,
+  )
+  assert.match(
+    await handlers.updateAction("gate-session", { id: "nope", status: "in_progress" }),
+    /No action with id "nope"\. Known ids: a1\./,
+  )
+  assert.match(
+    await handlers.updateAction("gate-session", { id: "a1", status: "sideways" }),
+    /Invalid status "sideways"/,
+  )
+  assert.match(
+    await handlers.updateAction("gate-session", { id: "a1", verdict: "maybe" }),
+    /Invalid verdict "maybe"/,
+  )
+
+  const accepted = await handlers.updateAction("gate-session", {
+    id: "a1",
+    status: "done",
+    claim: "the gate refuses an unsubstantiated done",
+    evidence: "the four calls above each returned a refusal string",
+    verdict: "pass",
+  })
+  assert.match(accepted, /^Action a1 updated: done\./)
+  assert.equal(planStatusLabel(currentGoal("gate-session").plan), "1/1 actions verified")
+})
+
+test("the completion gate refuses an agent-tool completion while the plan is unsatisfied", async () => {
+  const { handlers } = makeAgentHandlers()
+  await handlers.setGoal("tool-gate", { objective: "ship it" })
+  await handlers.setPlan("tool-gate", {
+    actions: [{ id: "a1", title: "write it" }, { id: "a2", title: "verify it" }],
+  })
+
+  const refused = await handlers.updateGoal("tool-gate", { status: "complete", evidence: "trust me" })
+  assert.match(refused, /Completion refused: the action plan is not satisfied \(0\/2 actions verified\)/)
+  assert.match(refused, /a1 is pending; a2 is pending/)
+  assert.ok(currentGoal("tool-gate"), "the goal was not archived")
+
+  for (const id of ["a1", "a2"]) {
+    await handlers.updateAction("tool-gate", {
+      id,
+      status: "done",
+      claim: `${id} claim`,
+      evidence: `${id} evidence: command exited 0`,
+      verdict: "pass",
+    })
+  }
+  assert.match(
+    await handlers.updateGoal("tool-gate", { status: "complete", evidence: "both actions verified" }),
+    /archived/,
+  )
+  assert.equal(currentGoal("tool-gate"), null)
+})
+
+test("[goal:complete] is rejected while the action plan is unsatisfied, and the prompt says why", async () => {
+  const { calls, hooks } = await createHooks({
+    messages: async () => ({
+      data: [message("Shipped.\n[goal:evidence] the suite is green\n[goal:complete]")],
+    }),
+    options: { minDelayMs: 1 },
+  })
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "marker-plan-gate", arguments: "ship it" },
+    { parts: [] },
+  )
+  const goal = currentGoal("marker-plan-gate")
+  goal.plan = normalizePlan({
+    actions: [
+      { id: "a1", title: "write it", status: "done", claim: "c", evidence: "e", verdict: "pass" },
+      { id: "a2", title: "verify it" },
+    ],
+  })
+
+  await hooks.event({
+    event: {
+      type: "session.status",
+      properties: { sessionID: "marker-plan-gate", status: { type: "idle" } },
+    },
+  })
+
+  // Not archived, and the corrective prompt names the unsatisfied plan.
+  const stillActive = currentGoal("marker-plan-gate")
+  assert.ok(stillActive, "the goal was not archived on an unsatisfied plan")
+  assert.equal(stillActive.stopped, false)
+  assert.equal(calls.length, 1)
+  const prompt = calls[0].body.parts[0].text
+  assert.match(prompt, /<evidence_required>/)
+  assert.match(prompt, /the action plan is not satisfied \(1\/2 actions verified\)/)
+  assert.match(prompt, /a2 is pending/)
+  // The continuation also carries the compact plan state.
+  assert.match(prompt, /<goal_plan>/)
+  assert.match(prompt, /a2 \[pending\] verify it/)
+})
+
+test("[goal:complete] archives once every plan action is verified", async () => {
+  const { hooks } = await createHooks({
+    messages: async () => ({
+      data: [message("Shipped.\n[goal:evidence] the suite is green\n[goal:complete]")],
+    }),
+    options: { minDelayMs: 1 },
+  })
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "marker-plan-pass", arguments: "ship it" },
+    { parts: [] },
+  )
+  currentGoal("marker-plan-pass").plan = normalizePlan({
+    actions: [
+      { id: "a1", title: "write it", status: "done", claim: "c", evidence: "e", verdict: "pass" },
+      { id: "a2", title: "not needed", status: "blocked", claim: "upstream API is down" },
+    ],
+  })
+
+  await hooks.event({
+    event: {
+      type: "session.status",
+      properties: { sessionID: "marker-plan-pass", status: { type: "idle" } },
+    },
+  })
+  assert.equal(currentGoal("marker-plan-pass"), null, "a satisfied plan lets completion through")
+})
+
+test("the plan survives a persistence round-trip and renders in /goal status", async () => {
+  const goal = buildGoalState("persist-plan", "ship it", normalizeOptions())
+  goal.plan = normalizePlan({
+    actions: [{ id: "a1", title: "write it", status: "done", claim: "c", evidence: "e", verdict: "pass" }],
+  })
+  const revived = normalizePersistedGoal(JSON.parse(JSON.stringify(goal)))
+  assert.deepEqual(revived.plan.actions, goal.plan.actions)
+
+  const status = formatStatus(revived)
+  assert.match(status, /Plan \(1\/1 actions verified\):/)
+  assert.match(status, /● a1: write it \[pass\]/)
+  assert.match(status, /evidence: e/)
+  assert.match(formatStatus(buildGoalState("s", "x", normalizeOptions())), /Plan: none recorded\./)
+})
+
+test("the system block tells the model to decompose first, then to work the ledger", () => {
+  const empty = buildPlanSystemLines({ plan: emptyPlan() }).join("\n")
+  assert.match(empty, /goal_plan_set/)
+  assert.match(empty, /Claim → the minimum Evidence sufficient to prove or break it → Verdict/)
+
+  const withPlan = buildPlanSystemLines({
+    plan: normalizePlan({ actions: [{ id: "a1", title: "write it" }] }),
+  }).join("\n")
+  assert.match(withPlan, /a1 \[pending\] write it/)
+  assert.match(withPlan, /progress: 0\/1 actions verified/)
+  assert.match(withPlan, /cannot be completed until every action is done with verdict=pass/)
+  assert.equal(CEV_RULE.includes("Evidence that cannot fail proves nothing"), true)
 })
 
 function makeAgentHandlers(options = {}) {
@@ -8070,7 +8467,7 @@ test("buildAgentTools wraps handlers into OpenCode tool defs and routes by sessi
     number: () => ({ optional: () => "num?" }),
     array: () => ({ optional: () => "array?" }),
     object: () => "object",
-    enum: () => "enum",
+    enum: () => ({ optional: () => "enum?" }),
   }
   const toolHelper = (def) => def
   toolHelper.schema = schema
@@ -8082,9 +8479,12 @@ test("buildAgentTools wraps handlers into OpenCode tool defs and routes by sessi
     "clear_goal",
     "get_goal",
     "get_goal_history",
+    "goal_action_update",
     "goal_block",
     "goal_complete",
     "goal_pause",
+    "goal_plan_get",
+    "goal_plan_set",
     "goal_resume",
     "goal_set",
     "goal_status",
@@ -8107,7 +8507,7 @@ test("canonical goal tools return versioned JSON envelopes and preserve focused 
     number: () => ({ optional: () => "num?" }),
     array: () => ({ optional: () => "array?" }),
     object: () => "object",
-    enum: () => "enum",
+    enum: () => ({ optional: () => "enum?" }),
   }
   const toolHelper = (def) => def
   toolHelper.schema = schema
@@ -8140,7 +8540,7 @@ test("canonical goal tools encode invalid requests and missing sessions", async 
     number: () => ({ optional: () => "num?" }),
     array: () => ({ optional: () => "array?" }),
     object: () => "object",
-    enum: () => "enum",
+    enum: () => ({ optional: () => "enum?" }),
   }
   const toolHelper = (def) => def
   toolHelper.schema = schema
@@ -8213,7 +8613,7 @@ test("canonical goal_complete passes structured evidence through the completion 
     number: () => ({ optional: () => "num?" }),
     array: () => ({ optional: () => "array?" }),
     object: () => "object",
-    enum: () => "enum",
+    enum: () => ({ optional: () => "enum?" }),
   }
   const toolHelper = (definition) => definition
   toolHelper.schema = schema
@@ -8241,7 +8641,7 @@ test("canonical goal_complete returns an error without archiving failed checks",
     number: () => ({ optional: () => "num?" }),
     array: () => ({ optional: () => "array?" }),
     object: () => "object",
-    enum: () => "enum",
+    enum: () => ({ optional: () => "enum?" }),
   }
   const toolHelper = (definition) => definition
   toolHelper.schema = schema
@@ -8264,7 +8664,7 @@ test("canonical errors use state and stable codes instead of parsing legacy pros
     number: () => ({ optional: () => "num?" }),
     array: () => ({ optional: () => "array?" }),
     object: () => "object",
-    enum: () => "enum",
+    enum: () => ({ optional: () => "enum?" }),
   }
   const toolHelper = (definition) => definition
   toolHelper.schema = schema
@@ -8292,7 +8692,7 @@ test("canonical goal_block rejects when its goal changes during terminal persist
     number: () => ({ optional: () => "num?" }),
     array: () => ({ optional: () => "array?" }),
     object: () => "object",
-    enum: () => "enum",
+    enum: () => ({ optional: () => "enum?" }),
   }
   const toolHelper = (definition) => definition
   toolHelper.schema = schema
@@ -9878,7 +10278,7 @@ async function createTitleHooks(overrides = {}) {
   const client = {
     app: { log: async () => {} },
     session: {
-      messages: async () => ({ data: [message("still working")] }),
+      messages: overrides.messages || (async () => ({ data: [message("still working")] })),
       promptAsync: async () => ({}),
       abort: async () => ({}),
       get: overrides.get || (async () => ({ data: { title: "my original title" } })),
@@ -9958,21 +10358,60 @@ test("looksLikePluginSessionTitle recognizes titles this plugin wrote", () => {
   assert.equal(looksLikePluginSessionTitle("play ▶ button work"), false)
 })
 
-test("session-title status is off by default and never touches the title", async () => {
-  // The client here DOES expose session.update, so a call would be recorded;
-  // the assertion is meaningful only because the option is left unset.
-  const { hooks, updates } = await createTitleHooks({
+test("the sidebar goal status is ON by default, and both kill switches turn it off", async () => {
+  // 0.10.0 flips the pre-existing sessionTitleStatus default: an unattended goal
+  // you cannot see is the problem this solves.
+  const { hooks: onByDefault, updates: defaultUpdates } = await createTitleHooks({
     options: { sessionTitleStatus: undefined },
   })
-  await hooks["command.execute.before"](
+  await onByDefault["command.execute.before"](
     { command: "goal", sessionID: "session-1", arguments: "ship it" },
     { parts: [] },
   )
-  await hooks["command.execute.before"](
-    { command: "goal", sessionID: "session-1", arguments: "pause" },
+  assert.ok(defaultUpdates.length >= 1, "the default must publish sidebar status")
+  assert.match(defaultUpdates[0].body.title, /^▶ ship it · /)
+
+  const { hooks: optedOut, updates: optedOutUpdates } = await createTitleHooks({
+    options: { sidebarStatus: false },
+  })
+  await optedOut["command.execute.before"](
+    { command: "goal", sessionID: "session-2", arguments: "ship it" },
     { parts: [] },
   )
-  assert.equal(updates.length, 0, "the default must not rewrite the session title")
+  assert.equal(optedOutUpdates.length, 0, "sidebarStatus:false must silence it")
+
+  const { hooks: envOff, updates: envUpdates } = await createTitleHooks({
+    options: { sessionTitleStatus: undefined, env: { OPENCODE_GOAL_SIDEBAR: "0" } },
+  })
+  await envOff["command.execute.before"](
+    { command: "goal", sessionID: "session-3", arguments: "ship it" },
+    { parts: [] },
+  )
+  assert.equal(envUpdates.length, 0, "OPENCODE_GOAL_SIDEBAR=0 must silence it")
+})
+
+test("a host without session.update gets no sidebar traffic and no error log", async () => {
+  const logs = []
+  const client = {
+    app: { log: async (input) => logs.push(input) },
+    session: {
+      messages: async () => ({ data: [] }),
+      promptAsync: async () => ({}),
+      abort: async () => ({}),
+      get: async () => ({ data: { title: "t" } }),
+    },
+  }
+  const hooks = await GoalPlugin({ client }, { persistState: false, minDelayMs: 1 })
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "no-update-host", arguments: "ship it" },
+    { parts: [] },
+  )
+  assert.ok(currentGoal("no-update-host"), "the goal still runs")
+  assert.deepEqual(
+    logs.filter((entry) => /sidebar/i.test(entry?.body?.message || "")),
+    [],
+    "an incapable host must not be logged at on every tick",
+  )
 })
 
 test("sessionTitleStatus mirrors goal state into the title and restores it on clear", async () => {
@@ -10044,6 +10483,268 @@ test("streaming message.updated events do not trigger session-title writes", asy
   )
 })
 
+test("the sidebar payload carries state, budgets, plan progress, and criteria", async () => {
+  const { hooks, updates } = await createTitleHooks()
+  await hooks["command.execute.before"](
+    {
+      command: "goal",
+      sessionID: "sidebar-payload",
+      arguments: 'Ship v0.10.0 --max-turns 10 --max-minutes 30 --max-tokens 200000 --success "tests green" --constraints "no force push"\n\nlong handoff body',
+    },
+    { parts: [] },
+  )
+  const goal = currentGoal("sidebar-payload")
+  goal.plan = normalizePlan({
+    actions: [
+      { id: "a1", title: "write it", status: "done", claim: "c", evidence: "e", verdict: "pass" },
+      { id: "a2", title: "verify it", status: "in_progress" },
+      { id: "a3", title: "needs a key", status: "blocked", claim: "no credentials" },
+    ],
+  })
+  // Force a re-render: the sync is idempotent on an unchanged fingerprint.
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "sidebar-payload", arguments: "status" },
+    { parts: [] },
+  )
+
+  const latest = updates.at(-1).body
+  assert.match(latest.title, /^▶ Ship v0\.10\.0 · 0\/10 · \d+s · 0\/200k · 1\/3✓$/)
+
+  const status = latest.metadata.goal
+  assert.equal(status.v, 1)
+  assert.equal(status.state, "active")
+  assert.equal(status.objective, "Ship v0.10.0")
+  assert.deepEqual(status.turns, { used: 0, max: 10 })
+  assert.deepEqual(status.minutes, { used: 0, max: 30 })
+  assert.deepEqual(status.tokens, { used: 0, max: 200000 })
+  assert.equal(status.successCriteria, "tests green")
+  assert.equal(status.constraints, "no force push")
+  assert.equal(status.plan.total, 3)
+  assert.equal(status.plan.verified, 1)
+  assert.equal(status.plan.blocked, 1)
+  assert.deepEqual(status.plan.actions.map((action) => [action.id, action.status, action.verdict]), [
+    ["a1", "done", "pass"],
+    ["a2", "in_progress", null],
+    ["a3", "blocked", null],
+  ])
+  assert.equal(status.sequence, undefined, "a single goal is not a sequence")
+  assert.equal(typeof status.updatedAt, "number")
+})
+
+test("the sidebar tracks pause, block, and resume", async () => {
+  const { hooks, updates } = await createTitleHooks()
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "sidebar-states", arguments: "ship it" },
+    { parts: [] },
+  )
+  assert.equal(updates.at(-1).body.metadata.goal.state, "active")
+
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "sidebar-states", arguments: "pause" },
+    { parts: [] },
+  )
+  assert.equal(updates.at(-1).body.metadata.goal.state, "paused")
+  assert.match(updates.at(-1).body.title, /^⏸ ship it/)
+  assert.equal(updates.at(-1).body.metadata.goal.stopReason, "paused")
+
+  const goal = currentGoal("sidebar-states")
+  goal.blockedReason = "needs an API key"
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "sidebar-states", arguments: "status" },
+    { parts: [] },
+  )
+  assert.equal(updates.at(-1).body.metadata.goal.state, "blocked")
+  assert.equal(updates.at(-1).body.metadata.goal.blockedReason, "needs an API key")
+  assert.match(updates.at(-1).body.title, /^⛔ ship it/)
+
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "sidebar-states", arguments: "resume" },
+    { parts: [] },
+  )
+  assert.equal(updates.at(-1).body.metadata.goal.state, "active")
+  assert.match(updates.at(-1).body.title, /^▶ ship it/)
+})
+
+test("an ordered sequence shows its position in the sidebar", async () => {
+  const { hooks, updates } = await createTitleHooks()
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "sidebar-sequence", arguments: "sequence first; second; third" },
+    { parts: [] },
+  )
+  const status = updates.at(-1).body.metadata.goal
+  assert.deepEqual(status.sequence, { ordered: true, position: 1, total: 3 })
+  assert.match(updates.at(-1).body.title, /^▶ first · 1\/3 · /)
+
+  // Focusing the second goal moves the sidebar with it.
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "sidebar-sequence", arguments: "focus 2" },
+    { parts: [] },
+  )
+  assert.deepEqual(updates.at(-1).body.metadata.goal.sequence, { ordered: true, position: 2, total: 3 })
+  assert.match(updates.at(-1).body.title, /^▶ second · 2\/3 · /)
+})
+
+test("an unchanged sidebar render costs no API call", async () => {
+  const { hooks, updates } = await createTitleHooks()
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "sidebar-idempotent", arguments: "ship it" },
+    { parts: [] },
+  )
+  const afterSet = updates.length
+  assert.ok(afterSet >= 1)
+  for (let i = 0; i < 3; i += 1) {
+    await hooks["command.execute.before"](
+      { command: "goal", sessionID: "sidebar-idempotent", arguments: "status" },
+      { parts: [] },
+    )
+  }
+  assert.equal(
+    updates.length,
+    afterSet,
+    `an unchanged render must not write, got ${updates.length - afterSet} extra writes`,
+  )
+})
+
+test("a host that rejects session metadata falls back to a title-only sidebar", async () => {
+  const updates = []
+  let rejections = 0
+  const client = {
+    app: { log: async () => {} },
+    session: {
+      messages: async () => ({ data: [] }),
+      promptAsync: async () => ({}),
+      abort: async () => ({}),
+      get: async () => ({ data: { title: "my original title" } }),
+      update: async (input) => {
+        // The default SDK shape is legacy: { path: { id }, body: { … } }.
+        if (input?.body?.metadata !== undefined) {
+          rejections += 1
+          throw new TypeError("unrecognized key: metadata")
+        }
+        updates.push(input)
+        return {}
+      },
+    },
+  }
+  const hooks = await GoalPlugin({ client }, { persistState: false, minDelayMs: 1 })
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "no-metadata-host", arguments: "ship it" },
+    { parts: [] },
+  )
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "no-metadata-host", arguments: "pause" },
+    { parts: [] },
+  )
+
+  assert.equal(rejections, 1, "one rejection demotes the process for good")
+  assert.ok(updates.length >= 2, "the title still gets written after the demotion")
+  assert.ok(updates.every((input) => input.body.metadata === undefined))
+  assert.match(updates.at(-1).body.title, /^⏸ ship it/)
+  assert.ok(currentGoal("no-metadata-host"), "the goal loop is untouched")
+})
+
+test("a finished goal shows a terminal status instead of a stale running one", async () => {
+  // The archived goal leaves goalStates, so without a terminal render the
+  // sidebar would keep showing "▶ running" for a goal that is over.
+  const { hooks, updates } = await createTitleHooks({
+    messages: async () => ({
+      data: [message("Shipped.\n[goal:evidence] the suite is green\n[goal:complete]")],
+    }),
+  })
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "sidebar-finished", arguments: "ship it" },
+    { parts: [] },
+  )
+  assert.match(updates.at(-1).body.title, /^▶ ship it/)
+
+  await hooks.event({
+    event: {
+      type: "session.status",
+      properties: { sessionID: "sidebar-finished", status: { type: "idle" } },
+    },
+  })
+  assert.equal(currentGoal("sidebar-finished"), null, "the goal was archived")
+
+  const finished = updates.at(-1).body
+  assert.match(finished.title, /^✓ ship it/)
+  assert.equal(finished.metadata.goal.state, "completed")
+  assert.equal(finished.metadata.goal.blockedReason, undefined)
+  assert.equal(finished.metadata.goal.turns.max, 10)
+
+  // The terminal render is itself idempotent: an idle after the goal is gone
+  // must not re-write the same status.
+  const afterFinish = updates.length
+  await hooks.event({
+    event: {
+      type: "session.status",
+      properties: { sessionID: "sidebar-finished", status: { type: "idle" } },
+    },
+  })
+  assert.equal(updates.length, afterFinish, "an unchanged terminal render costs no write")
+
+  // Clearing hands the title back and drops the payload.
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "sidebar-finished", arguments: "clear" },
+    { parts: [] },
+  )
+  assert.equal(updates.at(-1).body.title, "my original title")
+  assert.equal(updates.at(-1).body.metadata.goal, null)
+})
+
+test("a restart clears the sidebar payload the previous process left behind", async () => {
+  // Found on a live opencode 1.18.29 run: after a restart the captured original
+  // title is gone with the old process, so /goal clear wrote nothing at all and
+  // the dead goal's status payload stayed on the session record forever.
+  // `metadata.goal` is this plugin's own namespace, so it is cleared regardless.
+  const dir = await mkdtemp(join(tmpdir(), "goal-plugin-sidebar-restart-"))
+  const stateFilePath = join(dir, "state.json")
+  try {
+    const updates = []
+    const client = {
+      app: { log: async () => {} },
+      session: {
+        messages: async () => ({ data: [message("still working")] }),
+        promptAsync: async () => ({}),
+        get: async () => ({ data: { title: "▶ ship it · 3/10 · 2m · 45k/200k" } }),
+        update: async (input) => {
+          updates.push(input)
+          return {}
+        },
+      },
+    }
+
+    const first = await GoalPlugin({ client }, { persistState: true, stateFilePath, minDelayMs: 1 })
+    await first["command.execute.before"](
+      { command: "goal", sessionID: "restart-sidebar", arguments: "ship it" },
+      { parts: [] },
+    )
+    assert.ok(
+      updates.some((u) => u.body?.metadata?.goal),
+      "the first process wrote a status payload",
+    )
+    await first.dispose()
+    updates.length = 0
+
+    const second = await GoalPlugin({ client }, { persistState: true, stateFilePath, minDelayMs: 1 })
+    await second["command.execute.before"](
+      { command: "goal", sessionID: "restart-sidebar", arguments: "clear" },
+      { parts: [] },
+    )
+    await second.dispose()
+
+    const metadataWrites = updates.filter((u) => u.body?.metadata !== undefined)
+    assert.equal(metadataWrites.length, 1, `expected exactly one clearing write, got ${updates.length}`)
+    assert.equal(metadataWrites[0].body.metadata.goal, null)
+    assert.equal(
+      metadataWrites[0].body.title,
+      undefined,
+      "a title this process never captured is left alone",
+    )
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
 test("a status title left by a killed process is not restored as the user's title", async () => {
   // After a hard kill the session still carries the plugin's own status line.
   // Capturing that as the "original" would make /goal clear promote a stale
@@ -10066,8 +10767,20 @@ test("a status title left by a killed process is not restored as the user's titl
     `clear must never write the stale status line back, got ${JSON.stringify(updates.map((u) => u.body.title))}`,
   )
   assert.ok(
-    updates.every((u) => u.body.title.startsWith("▶ ship it") || u.body.title.startsWith("⏸ ship it")),
+    updates.every(
+      (u) =>
+        // The clear write carries no title at all — only the metadata reset —
+        // precisely because there was no genuine original title to restore.
+        u.body.title === undefined ||
+        u.body.title.startsWith("▶ ship it") ||
+        u.body.title.startsWith("⏸ ship it"),
+    ),
     `only the live goal's own status should be written, got ${JSON.stringify(updates.map((u) => u.body.title))}`,
+  )
+  assert.equal(
+    updates.at(-1).body.metadata.goal,
+    null,
+    "clear must reset the sidebar's structured status",
   )
 })
 
@@ -10161,7 +10874,12 @@ test("a cached execution context is preferred over refetching the session", asyn
       },
     },
   }
-  const hooks = await GoalPlugin({ client }, { persistState: false, minDelayMs: 1 })
+  // sidebarStatus off: this test measures the execution-context cache, and the
+  // sidebar's own status fetch is a separate cost that would mask it.
+  const hooks = await GoalPlugin(
+    { client },
+    { persistState: false, minDelayMs: 1, sidebarStatus: false },
+  )
   // Host reports "build" through the normal signal path first.
   await hooks["chat.message"](
     { sessionID: "session-1", agent: "build" },

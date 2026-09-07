@@ -18,6 +18,8 @@ Compatibility: this plugin relies on experimental OpenCode hooks. Re-test agains
 - Guarded auto-continuation with turn, duration, token, no-progress, and no-tool-call limits.
 - Project-local restart recovery backed by persisted state and a bounded lifecycle ledger.
 - Evidence-gated completion with an optional independent, fail-closed verifier.
+- Decomposition into a verified action plan (Claim → Evidence → Verdict) that gates completion.
+- Live goal status in the OpenCode sidebar: state, budgets, and verified-action progress.
 - Explicit `active`, `paused`, and `blocked` status plus transition-only lifecycle notices.
 - Canonical agent tools, collision-safe goal/verifier agents, multiple goals, and ordered goal sequences.
 
@@ -97,7 +99,28 @@ Add success criteria, constraints / non-goals, and a mode:
 
 `--success` (alias `--success-criteria`) and `--constraints` (alias `--non-goals`) take quoted text and are injected alongside the objective so the assistant keeps them in view. `--mode` is `normal` (default) or `ordered`; `ordered` tells the assistant to preserve step order inside one objective. To queue distinct objectives that auto-promote one at a time, use `/goal sequence`. Multi-word values must be quoted.
 
-Flags accept either `--flag value` or `--flag=value`. If a flag is unknown, missing a value, given a non-positive integer, or (for `--mode`) an unrecognized mode, the plugin rejects the command with a helpful error instead of silently folding the bad flag into the goal text.
+Flags accept either `--flag value` or `--flag=value`. A **known** flag that is missing a value, given a non-positive integer, or (for `--mode`) an unrecognized mode is rejected with a helpful error. An **unknown** `--flag` is never a rejection: it is left in the objective text exactly as typed, because it is far more likely to be part of what you are asking for than a typo.
+
+### Long handoffs
+
+Paste a whole handoff as the goal. There is no prose-sized cap: the objective is bounded only by the command-argument ceiling (32 KiB), and the same applies to `--success` and `--constraints`.
+
+```
+/goal Migrate the billing service off the legacy client --max-turns 40
+The old client is in `src/legacy/billing.ts`. Steps that already failed:
+
+  git push --force origin release   # rejected by the branch protection
+  curl -fsSL https://example.test/install.sh | zsh -s -- --no-opencode
+
+Do not use `--max-turns` inside the migration script itself.
+```
+
+Two rules make that safe:
+
+- **Only the first line is parsed for flags.** Everything after the first newline is body: it is stored verbatim and never tokenised, so `git push --force`, `curl … -s -- --no-opencode`, and a `--max-turns` mentioned inside a fenced code block all survive untouched.
+- **A `---` line on its own ends the flag region.** If your handoff's first line is prose you want kept intact, put the flags above a `---` separator; everything below it is body.
+
+The **full text** is what gets injected into every continuation turn. For the compact surfaces — the session title, the sidebar, `/goal list` — the plugin derives a short **objective label** from the first non-empty line. Override it with `--objective "…"` (alias `--title`) when the first line does not read well as a label.
 
 Check status:
 
@@ -285,6 +308,7 @@ Override any limit for a single goal:
 | `--success <text>` | Success criteria that define when the goal is satisfied (quote multi-word text) |
 | `--constraints <text>` | Constraints / non-goals to respect (alias `--non-goals`) |
 | `--mode <normal\|ordered>` | Prompt mode for one goal; `ordered` preserves step order inside its objective |
+| `--objective <text>` | Short label for the title, sidebar, and goal list (alias `--title`); defaults to the objective's first line |
 | `--no-tool-turns <n>` | Consecutive tool-free continuation turns before pausing |
 
 Examples:
@@ -337,6 +361,7 @@ Additional plugin-level options:
 - `commandName` — the slash command the plugin owns (default `goal`). Set it to e.g. `objective` to drive the workflow with `/objective` instead of `/goal`; a leading slash is tolerated. Remember to register the matching command name in your OpenCode `command` config. User-facing hints (`/goal status`, `/goal resume`, …) follow the configured name.
 - `registerCommand` — whether the plugin installs its `command.execute.before` hook at all (default `true`). Set it to `false` if you only want the auto-continue/persistence behavior driven programmatically and don't want the plugin to own a slash command.
 - `registerTools` — whether the plugin registers the agent-facing goal tools (default `true`). Set to `false` to omit the programmatic tool surface entirely. See [Agent tools](#agent-tools).
+- `sidebarStatus` — mirror live goal status into the OpenCode sidebar (default `true`). Set `false`, or `OPENCODE_GOAL_SIDEBAR=0` in the environment, to leave the session title and metadata alone. See [Sidebar goal status](#sidebar-goal-status).
 - `registerAgents` — whether the config hook adds native `goal` and `goal-verify` agents (default `true`). Existing agents with those names are preserved unchanged; the plugin never changes your default agent.
 - `goalAgentName` / `verifierAgentName` — customize the registered native agent names (defaults `goal` and `goal-verify`). The verifier is a hidden subagent with a default-deny tool policy; only `read`, `glob`, and `grep` are allowed.
 - `sdkShape` — OpenCode session-client argument shape: `legacy` (the default generated `PluginInput` client using `{ path, body, query }`) or `flat` (clients using `{ sessionID, ... }`). Read-only `messages`/`get` calls may probe the alternate shape after an argument/schema `TypeError`; mutating calls are never replayed, so set this option correctly for embedded clients.
@@ -355,6 +380,7 @@ In addition to the `/goal` command, the plugin registers the same workflow as ca
 Registered tools:
 
 - `goal_status`, `goal_set`, `goal_pause`, `goal_resume`, `goal_block`, and `goal_complete` are the canonical narrow operations. They return compact versioned JSON envelopes so agents can branch reliably without parsing prose.
+- `goal_plan_set`, `goal_action_update`, and `goal_plan_get` drive the verified action plan described below.
 - `get_goal`, `get_goal_history`, `set_goal`, `update_goal`, and `clear_goal` remain compatibility aliases with their existing text responses.
 
 `goal_set` and `set_goal` are explicitly constrained to user-requested goals. `goal_complete` accepts a structured claim: a required non-empty `summary`, plus optional criterion/evidence pairs, checks (`passed`, `failed`, or `not-run`), changed files, and known limitations. Failed checks and empty criterion evidence are rejected before archival; accepted claims are serialized deterministically for the configured completion auditor. The legacy `update_goal` tool retains its string `evidence` field for compatibility.
@@ -403,31 +429,87 @@ await GoalPlugin(
 
 `timeoutMs` caps how long the built-in child-session auditor waits for a verdict. `failurePolicy` defaults to `reject`: an unavailable API, missing child-session ID, provider error, or timeout rejects the audit and pauses the goal for review. Set it to `approve` only as an explicit compatibility escape hatch; an actual negative or malformed verifier verdict still rejects. `auditorOptions` is ignored when a custom `auditor` function is supplied.
 
-## Status indicator
+## Sidebar goal status
 
-Unattended runs are easier to trust when you can see the goal is still alive. Set `sessionTitleStatus: true` and the plugin mirrors live goal status into the OpenCode session title, which the TUI renders persistently:
+Unattended runs are easier to trust when you can see the goal is still alive. The plugin mirrors live goal status into the OpenCode sidebar, which renders the session title:
 
 ```
-▶ ship the release · 3/10 · 2m · 45k/200k
+▶ ship the release · 2/4 · 3/10 · 2m · 45k/200k · 3/7✓
 ```
 
-Status icon, objective, auto-continues used / limit, elapsed time, and context tokens / budget. The icon distinguishes running (`▶`), paused (`⏸`), and blocked (`⛔`) — blocked outranks paused because it needs you, not just a resume. A paused goal freezes its elapsed clock rather than running on.
+Status icon, objective label, sequence position (only for `/goal sequence`), auto-continues used / limit, elapsed time, context tokens / budget, and verified actions / total. The icon distinguishes running (`▶`), paused (`⏸`), blocked (`⛔`), and completed (`✓`) — blocked outranks paused because it needs you, not just a resume. A paused goal freezes its elapsed clock rather than running on.
+
+When a goal ends, the sidebar switches to one terminal render (`✓ …`, state `completed`) instead of leaving the last running status up; `/goal clear` then hands the title back. A failure is not a separate state: it shows as `blocked` with a `blockedReason`, or `paused` with a `stopReason`, because a failed goal stays resumable.
+
+Alongside the title, the plugin writes a structured payload to the session's `metadata.goal`, so hosts that surface session metadata get more than a single line can carry:
+
+```json
+{
+  "v": 1,
+  "goalId": "…",
+  "state": "active",
+  "objective": "ship the release",
+  "turns": { "used": 3, "max": 10 },
+  "minutes": { "used": 2, "max": 30 },
+  "tokens": { "used": 45000, "max": 200000 },
+  "plan": { "total": 7, "verified": 3, "blocked": 0, "actions": [ … ] },
+  "successCriteria": "tests pass and changelog updated",
+  "constraints": "do not touch the public API",
+  "sequence": { "ordered": true, "position": 2, "total": 4 },
+  "updatedAt": 1767225600000
+}
+```
+
+**Mechanism.** Both halves are one `PATCH /session/{id}` call (`client.session.update`). The session title is what the OpenCode TUI sidebar renders for the current session, and `metadata` is reconciled into the TUI's reactive session store on the `session.updated` event. This needs no TUI plugin entrypoint, no `@opentui` dependency, and no build step: a server-only plugin module cannot register the richer sidebar slots, which require a precompiled TUI entry, but it can drive what the sidebar already renders.
+
+**Turning it off.** The status is **on by default** — an unattended goal you cannot see is the problem this solves — but it writes a user-visible field, so there are two kill switches:
 
 ```json
 {
   "plugin": [
-    ["opencode-goal-plugin", { "sessionTitleStatus": true }]
+    ["opencode-goal-plugin", { "sidebarStatus": false }]
   ]
 }
 ```
 
-The option is **off by default** because it overwrites a user-visible field. When enabled, the session's original title is captured before the first overwrite and restored by `/goal clear`. A render identical to the last one skips the API call, so `/goal status` and other read-only commands cost nothing. Title updates are cosmetic: a failure is logged at debug level and never interrupts the goal loop.
+```sh
+OPENCODE_GOAL_SIDEBAR=0 opencode   # also accepts "false" and "off"
+```
 
-The indicator refreshes on goal commands and on idle, compaction, and interruption events — **not** on the `message.updated` events that stream during an assistant turn. Streaming refreshes would put an API round-trip in the response path for a cosmetic update, and idle is the cadence a human actually reads the indicator at.
+`sessionTitleStatus` is the pre-0.10.0 spelling and is still honored when `sidebarStatus` is unset.
 
-The captured original title lives in memory only, so a hard process kill leaves the last status line on the session. The plugin recognizes its own status lines and will not mistake one for your title, so `/goal clear` after a restart leaves the host's title alone rather than restoring stale goal status — but it cannot recover the title the session had before the goal started. Rename the session if you want it back.
+The session's original title is captured before the first overwrite and restored by `/goal clear`, which also clears `metadata.goal`. A render identical to the last one skips the API call, so `/goal status` and other read-only commands cost nothing. Updates are cosmetic: a failure is logged at debug level and never interrupts the goal loop, and a host that rejects `metadata` is demoted once to title-only rather than losing the title too.
 
-This needs no TUI plugin entrypoint, no `@opentui` dependencies, and no build step.
+The sidebar refreshes on goal commands and on idle, compaction, and interruption events — **not** on the `message.updated` events that stream during an assistant turn. Streaming refreshes would put an API round-trip in the response path for a cosmetic update, and idle is the cadence a human actually reads the status at.
+
+The captured original title lives in memory only, so a hard process kill leaves the last status line on the session. The plugin recognizes its own status lines and will not mistake one for your title, so `/goal clear` after a restart leaves the host's title alone rather than restoring stale goal status — but it cannot recover the title the session had before the goal started. Rename the session if you want it back. `metadata.goal` is this plugin's own namespace, so a clear does drop it even after a restart.
+
+## Verified action plan (Claim → Evidence → Verdict)
+
+A long handoff is not one action, and "I'm done" is not evidence. When a goal is set, the assistant is told to decompose it into an ordered list of actions that live in the same persisted JSON state as the goal:
+
+```json
+{ "id": "a3", "title": "rebuild dist", "status": "done",
+  "claim": "dist/goal-plugin.js contains the new parser",
+  "evidence": "grep -c splitGoalCommandText dist/goal-plugin.js → 3",
+  "verdict": "pass" }
+```
+
+`status` is `pending`, `in_progress`, `done`, or `blocked`; `verdict` is `pass`, `fail`, or `null`. The plan is exposed as three tools:
+
+| Tool | Purpose |
+|---|---|
+| `goal_plan_set(actions)` | Record or revise the ordered plan. Re-planning preserves the claim, evidence, and verdict already recorded against an action id, so a re-submit cannot launder a verified action back to unverified. |
+| `goal_action_update(id, status, claim?, evidence?, verdict?)` | Move one action. `done` is refused without a claim, evidence, and `verdict: "pass"`; `blocked` is refused without a stated reason in `claim`. |
+| `goal_plan_get()` | Read the current plan and its progress. |
+
+The plan is injected — compactly — into every auto-continue turn along with the rule it enforces:
+
+> **CEV rule:** Claim → the minimum Evidence sufficient to prove or break it → Verdict (pass/fail). Evidence is an observation the world produced (command output, file content, HTTP response), never the work's own report of itself. Evidence that cannot fail proves nothing.
+
+**The completion gate consults the plan.** Once a plan exists, a goal can only complete when every action is `done` with a passing verdict *or* `blocked` with a stated reason. Both completion paths are gated — the `[goal:complete]` marker and the `goal_complete` / `update_goal` tools — and a refusal names the outstanding actions rather than silently continuing. A goal with no plan recorded still completes the old way, so the plan is opt-in for short goals and for existing automation.
+
+`/goal status` renders the plan with per-action claims and evidence, and the sidebar carries `verified/total` (`3/7✓`).
 
 ## Plan-mode safety
 

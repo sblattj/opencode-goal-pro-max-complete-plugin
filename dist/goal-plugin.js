@@ -15081,7 +15081,9 @@ var MAX_STALLED_COMPACTIONS = 2;
 var CHILD_WAKE_EVENT_FLAG = Symbol.for("opencode-goal-plugin.childWake");
 var MAX_CHECKPOINTS = 5;
 var CHECKPOINT_CHAR_LIMIT = 280;
-var MAX_GOAL_OBJECTIVE_LENGTH = 4000;
+var MAX_GOAL_OBJECTIVE_LENGTH = 32 * 1024;
+var MAX_GOAL_LABEL_LENGTH = 200;
+var MAX_GOAL_CRITERIA_LENGTH = 32 * 1024;
 var MAX_GOAL_META_LENGTH = 2000;
 var MAX_GOAL_BLOCKER_LENGTH = 2000;
 var MAX_LEGACY_EVIDENCE_LENGTH = 8000;
@@ -15141,6 +15143,7 @@ function createRuntimeState() {
     sessionExecutionContexts: new Map,
     sessionTitles: new Map,
     appliedTitles: new Map,
+    sidebarTerminals: new Map,
     pendingCommandTurns: new Map,
     activeCommandTurns: new Map,
     commandOutputs: new WeakMap,
@@ -15183,6 +15186,7 @@ var sessionArchive = runtimeCollection("sessionArchive");
 var sessionOrdered = runtimeCollection("sessionOrdered");
 var MAX_ARCHIVED_PER_SESSION = 10;
 var lastGoalResults = runtimeCollection("lastGoalResults");
+var sidebarTerminals = runtimeCollection("sidebarTerminals");
 var sessionMutationVersions = runtimeCollection("sessionMutationVersions");
 var seenTokens = runtimeCollection("seenTokens");
 var seenUsage = runtimeCollection("seenUsage");
@@ -15226,6 +15230,8 @@ var GOAL_FLAG_SPECS = {
   "--constraints": { type: "string", target: "meta", metaKey: "constraints" },
   "--non-goals": { type: "string", target: "meta", metaKey: "constraints" },
   "--mode": { type: "mode", target: "meta", metaKey: "mode" },
+  "--objective": { type: "string", target: "meta", metaKey: "objective" },
+  "--title": { type: "string", target: "meta", metaKey: "objective" },
   "--no-tool-turns": {
     optionKey: "noToolCallTurnsBeforePause",
     parse: (value, options) => toPositiveInteger(value, options.noToolCallTurnsBeforePause)
@@ -15245,7 +15251,31 @@ function normalizeMode(value) {
     return "ordered";
   return GOAL_MODES.has(normalized) ? normalized : null;
 }
-var GOAL_META_DEFAULTS = { successCriteria: "", constraints: "", mode: "normal" };
+var GOAL_META_DEFAULTS = { successCriteria: "", constraints: "", mode: "normal", objective: "" };
+var GOAL_BODY_SEPARATOR = /^[ \t]*---[ \t]*$/m;
+function splitGoalCommandText(args) {
+  const text = String(args ?? "");
+  const separator = text.match(GOAL_BODY_SEPARATOR);
+  if (separator) {
+    const head = text.slice(0, separator.index);
+    const rest = text.slice(separator.index + separator[0].length);
+    return { head, body: rest.replace(/^\r?\n/, "") };
+  }
+  const newline = text.indexOf(`
+`);
+  if (newline === -1)
+    return { head: text, body: "" };
+  return { head: text.slice(0, newline), body: text.slice(newline + 1) };
+}
+function deriveGoalLabel(condition, explicit = "") {
+  const chosen = String(explicit || "").trim() || String(condition || "").split(`
+`).map((line) => line.trim()).find(Boolean) || "";
+  return summarizeText(chosen, MAX_GOAL_LABEL_LENGTH);
+}
+function goalLabel(goal) {
+  const stored = typeof goal?.objectiveLabel === "string" ? goal.objectiveLabel.trim() : "";
+  return stored || deriveGoalLabel(goal?.condition);
+}
 function getText(parts) {
   return (parts || []).filter((part) => part && part.type === "text" && !part.ignored).map((part) => part.text || "").join(`
 `).trim();
@@ -15372,7 +15402,10 @@ function isPlanAgent(agent) {
   return isRestrictedAgent(agent, DEFAULT_RESTRICTED_AGENTS);
 }
 var SESSION_TITLE_OBJECTIVE_LIMIT = 48;
-var SESSION_TITLE_ICONS = ["▶", "⏸", "⛔"];
+var SESSION_TITLE_ICONS = ["▶", "⏸", "⛔", "✓"];
+var SIDEBAR_METADATA_VERSION = 1;
+var SIDEBAR_METADATA_TEXT_LIMIT = 400;
+var SIDEBAR_METADATA_MAX_ACTIONS = 20;
 function formatCompactDuration(ms) {
   const totalSeconds = Math.max(0, Math.round(ms / 1000));
   if (totalSeconds < 60)
@@ -15396,20 +15429,89 @@ function formatCompactTokens(tokens) {
   return `${millions < 10 ? millions.toFixed(1) : Math.round(millions)}m`;
 }
 function goalStatusIcon(goal) {
+  if (goal.terminalState === "completed")
+    return "✓";
   if (goal.blockedReason)
     return "⛔";
   if (goal.stopped)
     return "⏸";
   return "▶";
 }
-function buildSessionTitle(goal, now = Date.now()) {
+function sidebarGoalState(goal) {
+  if (goal.terminalState)
+    return goal.terminalState;
+  if (goal.blockedReason || goal.stopReason === "blocked")
+    return "blocked";
+  if (goal.stopped)
+    return "paused";
+  return "active";
+}
+function buildSidebarTerminal(goal, state, finishedAt) {
+  return {
+    goalId: goal.goalId,
+    condition: goal.condition,
+    objectiveLabel: goal.objectiveLabel,
+    successCriteria: goal.successCriteria,
+    constraints: goal.constraints,
+    options: goal.options,
+    plan: goal.plan,
+    turnCount: goal.turnCount,
+    totalTokens: goal.totalTokens,
+    startedAt: goal.startedAt,
+    pausedAt: finishedAt,
+    stopped: true,
+    stopReason: state === "achieved" ? "" : goal.stopReason,
+    blockedReason: state === "blocked" ? goal.blockedReason : "",
+    terminalState: state === "achieved" ? "completed" : state === "blocked" ? "blocked" : "paused"
+  };
+}
+function buildSessionTitle(goal, now = Date.now(), context = {}) {
   const elapsedMs = Math.max(0, (goal.pausedAt || now) - goal.startedAt);
-  return [
-    `${goalStatusIcon(goal)} ${summarizeText(goal.condition, SESSION_TITLE_OBJECTIVE_LIMIT)}`,
-    `${goal.turnCount}/${goal.options.maxTurns}`,
-    formatCompactDuration(elapsedMs),
-    `${formatCompactTokens(goal.totalTokens)}/${formatCompactTokens(goal.options.maxTokens)}`
-  ].join(" · ");
+  const fields = [
+    `${goalStatusIcon(goal)} ${summarizeText(goalLabel(goal), SESSION_TITLE_OBJECTIVE_LIMIT)}`
+  ];
+  if (context.ordered && context.sequenceTotal > 1) {
+    fields.push(`${context.sequencePosition}/${context.sequenceTotal}`);
+  }
+  fields.push(`${goal.turnCount}/${goal.options.maxTurns}`, formatCompactDuration(elapsedMs), `${formatCompactTokens(goal.totalTokens)}/${formatCompactTokens(goal.options.maxTokens)}`);
+  const progress = planProgress(goal.plan);
+  if (progress.total)
+    fields.push(`${progress.verified}/${progress.total}✓`);
+  return fields.join(" · ");
+}
+function buildSidebarMetadata(goal, now = Date.now(), context = {}) {
+  const elapsedMs = Math.max(0, (goal.pausedAt || now) - goal.startedAt);
+  const progress = planProgress(goal.plan);
+  const bounded = (value) => summarizeText(value, SIDEBAR_METADATA_TEXT_LIMIT) || undefined;
+  return {
+    v: SIDEBAR_METADATA_VERSION,
+    goalId: goal.goalId,
+    state: sidebarGoalState(goal),
+    objective: summarizeText(goalLabel(goal), SESSION_TITLE_OBJECTIVE_LIMIT * 4),
+    turns: { used: goal.turnCount, max: goal.options.maxTurns },
+    minutes: {
+      used: Math.round(elapsedMs / 60000),
+      max: Math.round(goal.options.maxDurationMs / 60000)
+    },
+    tokens: { used: goal.totalTokens, max: goal.options.maxTokens },
+    plan: {
+      total: progress.total,
+      verified: progress.verified,
+      blocked: progress.blocked,
+      actions: (goal.plan?.actions || []).slice(0, SIDEBAR_METADATA_MAX_ACTIONS).map((action) => ({
+        id: action.id,
+        title: summarizeText(action.title, 120),
+        status: action.status,
+        verdict: action.verdict
+      }))
+    },
+    successCriteria: bounded(goal.successCriteria),
+    constraints: bounded(goal.constraints),
+    sequence: context.ordered ? { ordered: true, position: context.sequencePosition, total: context.sequenceTotal } : undefined,
+    stopReason: goal.stopped ? bounded(goal.stopReason) : undefined,
+    blockedReason: bounded(goal.blockedReason),
+    updatedAt: now
+  };
 }
 function looksLikePluginSessionTitle(title) {
   const text = typeof title === "string" ? title.trimStart() : "";
@@ -15674,10 +15776,14 @@ function formatStatus(goal, commandName = "goal", completionAuditLabel = "eviden
   const lastProgress = goal.lastProgressAt > 0 ? `${Math.round((Date.now() - goal.lastProgressAt) / 1000)}s ago` : "none yet";
   const lastCheckpoint = goal.lastCheckpoint ? `${goal.lastCheckpoint.summary} (${formatAge(goal.lastCheckpoint.timestamp)})` : "none yet";
   const lines = [
-    `Active goal: ${goal.condition}`,
+    `Active goal: ${goalLabel(goal)}`,
     `State: ${goalDisplayState(goal)}`,
     `Completion audit: ${completionAuditLabel}`
   ];
+  const objectiveText = String(goal.condition || "").trim();
+  if (objectiveText && objectiveText !== goalLabel(goal)) {
+    lines.push(`Objective text: ${objectiveText.length.toLocaleString()} characters (full handoff retained and injected every turn)`);
+  }
   if (goal.successCriteria)
     lines.push(`Success criteria: ${goal.successCriteria}`);
   if (goal.constraints)
@@ -15685,6 +15791,7 @@ function formatStatus(goal, commandName = "goal", completionAuditLabel = "eviden
   if (goal.mode && goal.mode !== "normal")
     lines.push(`Mode: ${goal.mode}`);
   lines.push(`Auto-continues sent: ${goal.turnCount}/${goal.options.maxTurns}`, `Context tokens: ${goal.totalTokens.toLocaleString()}/${goal.options.maxTokens.toLocaleString()}`, formatUsage(goal.usage), `Elapsed: ${elapsed}s/${Math.round(goal.options.maxDurationMs / 1000)}s`, `Last progress: ${lastProgress}`, `No-progress turns: ${goal.noProgressTurns}`, `Recent checkpoint: ${lastCheckpoint}`, `Last status: ${goal.lastStatus || "No assistant turn recorded yet."}`);
+  lines.push(formatPlanForStatus(goal.plan));
   if (goal.stopped)
     lines.push(`Stopped: ${goal.stopReason || "unknown"}`);
   if (goal.blockedReason)
@@ -15704,7 +15811,7 @@ function formatGoalResult(result) {
   const elapsed = Math.round((result.finishedAt - result.startedAt) / 1000);
   const lastCheckpoint = result.lastCheckpoint ? `${result.lastCheckpoint.summary} (${formatTimestamp(result.lastCheckpoint.timestamp)})` : "none recorded";
   const lines = [
-    `Last goal: ${result.condition}`,
+    `Last goal: ${goalLabel(result)}`,
     `State: ${result.state}`,
     `Auto-continues sent: ${result.turnCount}`,
     `Context tokens: ${result.totalTokens.toLocaleString()}`,
@@ -15915,6 +16022,7 @@ function pruneGoalResults(options) {
     if (oldestSessionID === undefined)
       break;
     lastGoalResults.delete(oldestSessionID);
+    sidebarTerminals.delete(oldestSessionID);
   }
 }
 function rememberGoalResult(sessionID, goal, state, reason = "", evidence = "") {
@@ -15936,6 +16044,7 @@ function rememberGoalResult(sessionID, goal, state, reason = "", evidence = "") 
   };
   lastGoalResults.delete(sessionID);
   lastGoalResults.set(sessionID, result);
+  sidebarTerminals.set(sessionID, buildSidebarTerminal(goal, state, result.finishedAt));
   const archivedResult = { ...result };
   archiveSessionResult(sessionID, archivedResult);
   pruneGoalResults(goal.options);
@@ -16208,7 +16317,7 @@ function normalizePersistedGoal(rawGoal) {
     return null;
   if (typeof rawGoal.condition !== "string" || !rawGoal.condition.trim())
     return null;
-  if (rawGoal.sessionID.length > MAX_GOAL_META_LENGTH || rawGoal.condition.trim().length > MAX_GOAL_OBJECTIVE_LENGTH || typeof rawGoal.successCriteria === "string" && rawGoal.successCriteria.length > MAX_GOAL_META_LENGTH || typeof rawGoal.constraints === "string" && rawGoal.constraints.length > MAX_GOAL_META_LENGTH || typeof rawGoal.blockedReason === "string" && rawGoal.blockedReason.length > MAX_GOAL_BLOCKER_LENGTH)
+  if (rawGoal.sessionID.length > MAX_GOAL_META_LENGTH || rawGoal.condition.trim().length > MAX_GOAL_OBJECTIVE_LENGTH || typeof rawGoal.successCriteria === "string" && rawGoal.successCriteria.length > MAX_GOAL_CRITERIA_LENGTH || typeof rawGoal.constraints === "string" && rawGoal.constraints.length > MAX_GOAL_CRITERIA_LENGTH || typeof rawGoal.blockedReason === "string" && rawGoal.blockedReason.length > MAX_GOAL_BLOCKER_LENGTH)
     return null;
   const checkpoints = normalizeCheckpointEntries(rawGoal.checkpoints);
   const lastCheckpoint = normalizeCheckpointEntry(rawGoal.lastCheckpoint) || checkpoints.at(-1) || null;
@@ -16216,6 +16325,8 @@ function normalizePersistedGoal(rawGoal) {
     goalId: typeof rawGoal.goalId === "string" && rawGoal.goalId.trim() ? rawGoal.goalId : randomUUID2(),
     runId: typeof rawGoal.runId === "string" && rawGoal.runId.trim() ? rawGoal.runId : randomUUID2(),
     condition: rawGoal.condition.trim(),
+    objectiveLabel: deriveGoalLabel(rawGoal.condition, typeof rawGoal.objectiveLabel === "string" ? rawGoal.objectiveLabel : ""),
+    plan: normalizePlan(rawGoal.plan),
     successCriteria: typeof rawGoal.successCriteria === "string" ? rawGoal.successCriteria : "",
     constraints: typeof rawGoal.constraints === "string" ? rawGoal.constraints : "",
     mode: normalizeMode(rawGoal.mode) || "normal",
@@ -16830,7 +16941,8 @@ async function logPluginDebug(client, message, error51) {
   } catch {}
 }
 function parseGoalArguments(args, defaults) {
-  const parts = args.match(/"[^"]*"|'[^']*'|\S+/g) || [];
+  const { head, body } = splitGoalCommandText(args);
+  const parts = head.match(/"[^"]*"|'[^']*'|\S+/g) || [];
   const condition = [];
   const options = { ...defaults };
   const meta3 = { ...GOAL_META_DEFAULTS };
@@ -16841,10 +16953,7 @@ function parseGoalArguments(args, defaults) {
       const [flagName, inlineValue] = part.split(/=(.*)/s, 2);
       const flagSpec = GOAL_FLAG_SPECS[flagName];
       if (!flagSpec) {
-        const next2 = parts[i + 1];
-        if (inlineValue === undefined && next2 !== undefined && !next2.startsWith("--"))
-          i += 1;
-        errors3.push(`Unsupported flag: ${flagName}`);
+        condition.push(part);
         continue;
       }
       const next = parts[i + 1];
@@ -16893,17 +17002,21 @@ function parseGoalArguments(args, defaults) {
     }
     condition.push(stripWrappingQuotes(part));
   }
-  const parsedCondition = condition.join(" ").trim();
+  const headText = condition.join(" ").trim();
+  const bodyText = body.replace(/\s+$/, "");
+  const parsedCondition = [headText, bodyText].filter((piece) => piece !== "").join(`
+`).trim();
   if (parsedCondition.length > MAX_GOAL_OBJECTIVE_LENGTH) {
     errors3.push(`Goal objective must be ${MAX_GOAL_OBJECTIVE_LENGTH} characters or fewer`);
   }
   for (const [field, value] of [["success criteria", meta3.successCriteria], ["constraints", meta3.constraints]]) {
-    if (value.length > MAX_GOAL_META_LENGTH) {
-      errors3.push(`${field} must be ${MAX_GOAL_META_LENGTH} characters or fewer`);
+    if (value.length > MAX_GOAL_CRITERIA_LENGTH) {
+      errors3.push(`${field} must be ${MAX_GOAL_CRITERIA_LENGTH} characters or fewer`);
     }
   }
   return {
     condition: parsedCondition,
+    objectiveLabel: deriveGoalLabel(parsedCondition, meta3.objective),
     options,
     meta: meta3,
     errors: errors3
@@ -16990,7 +17103,12 @@ function buildGoalBlock(goal) {
   return lines.join(`
 `);
 }
-function buildContinueMessage(goal, { budgetWrapup = false, completionUnverified = false, blockerUnstated = false } = {}) {
+function buildContinueMessage(goal, {
+  budgetWrapup = false,
+  completionUnverified = false,
+  blockerUnstated = false,
+  completionRejection = ""
+} = {}) {
   const remainingTokens = Math.max(0, goal.options.maxTokens - goal.totalTokens);
   const remainingTurns = Math.max(0, goal.options.maxTurns - goal.turnCount);
   const elapsedSeconds = Math.round((Date.now() - goal.startedAt) / 1000);
@@ -17007,12 +17125,19 @@ function buildContinueMessage(goal, { budgetWrapup = false, completionUnverified
   } else {
     lines.push("Continue the next concrete step; inspect and repair failures.");
   }
+  const planRender = formatPlanForPrompt(goal.plan);
+  lines.push(...[
+    "<goal_plan>",
+    planRender || "none — call goal_plan_set([{id,title},…]) first.",
+    planRender ? `progress: ${planStatusLabel(goal.plan)}; done needs claim+evidence+verdict=pass.` : "",
+    "</goal_plan>"
+  ].filter(Boolean));
   lines.push("Completion format—consecutive plain lines; no Markdown/backticks/blank line:", "[goal:evidence] <proof>", "[goal:complete]", "Need user input? State why before [goal:blocked].");
   const limitWarning = buildLimitWarning(goal);
   if (limitWarning)
     lines.push(limitWarning.trim());
   if (completionUnverified) {
-    lines.push("", "<evidence_required>", "Previous completion was rejected: evidence was missing. Verify first, then put `[goal:evidence] …` immediately before `[goal:complete]`.", "</evidence_required>");
+    lines.push("", "<evidence_required>", completionRejection || "Previous completion was rejected: evidence was missing. Verify first, then put `[goal:evidence] …` immediately before `[goal:complete]`.", "</evidence_required>");
   }
   if (blockerUnstated) {
     lines.push("", "<evidence_required>", "Previous blocker was rejected: it was not concrete. State what user input is needed and why, immediately before `[goal:blocked]`; otherwise continue.", "</evidence_required>");
@@ -17050,6 +17175,7 @@ function buildCompactionContext(goal) {
     `Auto-continues used: ${goal.turnCount}/${goal.options.maxTurns}. Context tokens: ${goal.totalTokens}/${goal.options.maxTokens}. Elapsed: ${elapsedSeconds}s.`,
     goal.lastCheckpoint ? `Latest checkpoint: ${escapeGoalText(summarizeText(goal.lastCheckpoint.summary, 200))}` : null,
     ...buildCompactionProgressSummary(goal),
+    ...formatPlanForPrompt(goal.plan) ? ["<goal_plan>", formatPlanForPrompt(goal.plan), `progress: ${planStatusLabel(goal.plan)}`, "</goal_plan>"] : [],
     "After compaction, continue from the next concrete unfinished step while the goal is active. Verify the result against the goal objective before ending; output [goal:complete] (preceded by a [goal:evidence] line) only when fully satisfied, or [goal:blocked] (preceded by a concrete blocker) only if user input is required."
   ].filter(Boolean).join(`
 `);
@@ -17092,8 +17218,9 @@ function formatArgumentErrors(errors3) {
     "Goal flags could not be parsed.",
     ...errors3.map((error51) => `- ${error51}`),
     "",
-    "Supported flags: --max-turns, --max-minutes, --max-duration-ms, --max-tokens, --budget, --cooldown-ms, --no-progress-threshold, --no-progress-turns, --no-tool-turns, --success, --constraints, --mode.",
-    'You can pass them as `--flag value` or `--flag=value`. Quote multi-word values, e.g. --success "tests pass and docs updated".'
+    "Supported flags: --max-turns, --max-minutes, --max-duration-ms, --max-tokens, --budget, --cooldown-ms, --no-progress-threshold, --no-progress-turns, --no-tool-turns, --success, --constraints, --mode, --objective.",
+    'You can pass them as `--flag value` or `--flag=value`. Quote multi-word values, e.g. --success "tests pass and docs updated".',
+    "Flags are read only from the first line, or from the text before a `---` separator line. Everything after that is the goal body and is kept verbatim, so a pasted handoff containing --flags is never parsed."
   ].join(`
 `);
 }
@@ -17424,11 +17551,194 @@ function outputTokensForMessage(message) {
 function budgetWrapupNeeded(goal) {
   return !goal.budgetWrapupSent && goal.totalTokens >= Math.floor(goal.options.maxTokens * goal.options.budgetWrapupRatio);
 }
+var PLAN_ACTION_STATUSES = ["pending", "in_progress", "done", "blocked"];
+var PLAN_ACTION_STATUS_SET = new Set(PLAN_ACTION_STATUSES);
+var PLAN_VERDICTS = ["pass", "fail"];
+var PLAN_VERDICT_SET = new Set(PLAN_VERDICTS);
+var MAX_PLAN_ACTIONS = 50;
+var MAX_PLAN_ID_LENGTH = 64;
+var MAX_PLAN_TITLE_LENGTH = 200;
+var MAX_PLAN_TEXT_LENGTH = 2000;
+var CEV_RULE = "CEV rule: Claim → the minimum Evidence sufficient to prove or break it → Verdict (pass/fail). " + "Evidence is an observation the world produced (command output, file content, HTTP response), never the work's own report of itself. " + "Evidence that cannot fail proves nothing.";
+function emptyPlan() {
+  return { actions: [], updatedAt: 0 };
+}
+function planTextField(value, limit = MAX_PLAN_TEXT_LENGTH) {
+  if (typeof value !== "string")
+    return "";
+  const trimmed = value.trim();
+  if (!trimmed)
+    return "";
+  return trimmed.length > limit ? trimmed.slice(0, limit) : trimmed;
+}
+function normalizePlanActionId(value, index) {
+  const raw = typeof value === "string" ? value.trim() : "";
+  const bounded = raw.slice(0, MAX_PLAN_ID_LENGTH);
+  return bounded || `a${index + 1}`;
+}
+function normalizePlanAction(raw, index) {
+  if (!isPlainObject2(raw))
+    return null;
+  const title = planTextField(raw.title, MAX_PLAN_TITLE_LENGTH);
+  if (!title)
+    return null;
+  const status = PLAN_ACTION_STATUS_SET.has(raw.status) ? raw.status : "pending";
+  const verdict = PLAN_VERDICT_SET.has(raw.verdict) ? raw.verdict : null;
+  return {
+    id: normalizePlanActionId(raw.id, index),
+    title,
+    status,
+    claim: planTextField(raw.claim),
+    evidence: planTextField(raw.evidence),
+    verdict
+  };
+}
+function normalizePlan(raw) {
+  if (!isPlainObject2(raw))
+    return emptyPlan();
+  const source = Array.isArray(raw.actions) ? raw.actions : [];
+  const seen = new Set;
+  const actions = [];
+  for (const candidate of source.slice(0, MAX_PLAN_ACTIONS)) {
+    const action = normalizePlanAction(candidate, actions.length);
+    if (!action)
+      continue;
+    if (seen.has(action.id)) {
+      let suffix = 2;
+      let candidateId = `${action.id}-${suffix}`;
+      while (seen.has(candidateId)) {
+        suffix += 1;
+        candidateId = `${action.id}-${suffix}`;
+      }
+      action.id = candidateId;
+    }
+    seen.add(action.id);
+    actions.push(action);
+  }
+  return { actions, updatedAt: toNonNegativeInteger(raw.updatedAt) };
+}
+function planActionVerified(action) {
+  return action.status === "done" && Boolean(action.claim) && Boolean(action.evidence) && action.verdict === "pass";
+}
+function planActionBlocked(action) {
+  return action.status === "blocked" && Boolean(action.claim || action.evidence);
+}
+function planProgress(plan) {
+  const actions = plan?.actions || [];
+  const counts = { pending: 0, in_progress: 0, done: 0, blocked: 0 };
+  let verified = 0;
+  for (const action of actions) {
+    counts[action.status] = (counts[action.status] || 0) + 1;
+    if (planActionVerified(action))
+      verified += 1;
+  }
+  return {
+    total: actions.length,
+    verified,
+    pending: counts.pending,
+    inProgress: counts.in_progress,
+    done: counts.done,
+    blocked: counts.blocked
+  };
+}
+function planCompletionBlockers(plan) {
+  const actions = plan?.actions || [];
+  if (!actions.length)
+    return [];
+  const blockers = [];
+  for (const action of actions) {
+    if (planActionVerified(action) || planActionBlocked(action))
+      continue;
+    if (action.status === "done") {
+      const missing = [];
+      if (!action.claim)
+        missing.push("claim");
+      if (!action.evidence)
+        missing.push("evidence");
+      if (action.verdict !== "pass")
+        missing.push(action.verdict === "fail" ? "a passing verdict" : "verdict");
+      blockers.push(`${action.id} is done without ${missing.join(", ")}`);
+      continue;
+    }
+    if (action.status === "blocked") {
+      blockers.push(`${action.id} is blocked without a stated reason`);
+      continue;
+    }
+    blockers.push(`${action.id} is ${action.status}`);
+  }
+  return blockers;
+}
+function planAllowsCompletion(goal) {
+  return planCompletionBlockers(goal?.plan).length === 0;
+}
+function planStatusLabel(plan) {
+  const progress = planProgress(plan);
+  if (!progress.total)
+    return "no plan recorded";
+  const parts = [`${progress.verified}/${progress.total} actions verified`];
+  if (progress.blocked)
+    parts.push(`${progress.blocked} blocked`);
+  return parts.join(", ");
+}
+var PLAN_ACTION_ICONS = { pending: "○", in_progress: "◐", done: "●", blocked: "⛔" };
+function formatPlanForPrompt(plan) {
+  const actions = plan?.actions || [];
+  if (!actions.length)
+    return "";
+  return actions.map((action) => {
+    const verdict = action.verdict ? ` verdict=${action.verdict}` : "";
+    const claim = action.claim ? ` claim="${summarizeText(action.claim, 120)}"` : "";
+    const evidence = action.evidence ? ` evidence="${summarizeText(action.evidence, 160)}"` : "";
+    return `${action.id} [${action.status}] ${summarizeText(action.title, 120)}${verdict}${claim}${evidence}`;
+  }).join(`
+`);
+}
+function buildPlanSystemLines(goal) {
+  const render = formatPlanForPrompt(goal?.plan);
+  if (!render) {
+    return [
+      "<goal_plan>",
+      "No verified action plan recorded for this goal yet. Decompose the objective into an ordered list of actions and record it with goal_plan_set(actions: [{ id, title }, …]) before doing further work.",
+      "Then work one action at a time: goal_action_update(id, status) to start it, and to finish it record claim, evidence, and verdict.",
+      CEV_RULE,
+      "</goal_plan>"
+    ];
+  }
+  return [
+    "<goal_plan>",
+    render,
+    `progress: ${planStatusLabel(goal.plan)}`,
+    "Keep it current with goal_action_update(id, status, claim?, evidence?, verdict?); add or replace the whole list with goal_plan_set.",
+    "An action may only become done with a claim, the evidence that could have falsified it, and verdict=pass. A blocked action must state its reason in claim.",
+    "The goal cannot be completed until every action is done with verdict=pass, or blocked with a stated reason.",
+    CEV_RULE,
+    "</goal_plan>"
+  ];
+}
+function formatPlanForStatus(plan) {
+  const actions = plan?.actions || [];
+  if (!actions.length)
+    return "Plan: none recorded.";
+  const lines = [`Plan (${planStatusLabel(plan)}):`];
+  for (const action of actions) {
+    const icon = PLAN_ACTION_ICONS[action.status] || "○";
+    const verdict = action.verdict ? ` [${action.verdict}]` : "";
+    lines.push(`  ${icon} ${action.id}: ${summarizeText(action.title, 160)}${verdict}`);
+    if (action.claim)
+      lines.push(`      claim: ${summarizeText(action.claim, 200)}`);
+    if (action.evidence)
+      lines.push(`      evidence: ${summarizeText(action.evidence, 240)}`);
+  }
+  return lines.join(`
+`);
+}
 function buildGoalState(sessionID, condition, options, meta3 = {}, lastStatus = "Goal set.") {
   return {
     goalId: randomUUID2(),
     runId: randomUUID2(),
     condition,
+    objectiveLabel: deriveGoalLabel(condition, meta3.objective),
+    plan: emptyPlan(),
     successCriteria: typeof meta3.successCriteria === "string" ? meta3.successCriteria : "",
     constraints: typeof meta3.constraints === "string" ? meta3.constraints : "",
     mode: normalizeMode(meta3.mode) || "normal",
@@ -17522,8 +17832,8 @@ function buildAgentToolHandlers({
     if (objective.length > MAX_GOAL_OBJECTIVE_LENGTH)
       return `Invalid objective: must be ${MAX_GOAL_OBJECTIVE_LENGTH} characters or fewer.`;
     for (const [field, value] of [["successCriteria", args.successCriteria], ["constraints", args.constraints]]) {
-      if (typeof value === "string" && value.length > MAX_GOAL_META_LENGTH)
-        return `Invalid ${field}: must be ${MAX_GOAL_META_LENGTH} characters or fewer.`;
+      if (typeof value === "string" && value.length > MAX_GOAL_CRITERIA_LENGTH)
+        return `Invalid ${field}: must be ${MAX_GOAL_CRITERIA_LENGTH} characters or fewer.`;
     }
     if (Number.isFinite(args.maxTurns) && args.maxTurns <= 0)
       return `Invalid maxTurns: ${args.maxTurns} — must be a positive integer.`;
@@ -17574,6 +17884,7 @@ function buildAgentToolHandlers({
         return `Invalid objective: must be ${MAX_GOAL_OBJECTIVE_LENGTH} characters or fewer.`;
       }
       goal.condition = args.objective.trim();
+      goal.objectiveLabel = deriveGoalLabel(goal.condition);
       goal.blockedReason = "";
       goal.budgetWrapupSent = false;
       goal.noProgressTurns = 0;
@@ -17601,6 +17912,15 @@ function buildAgentToolHandlers({
           return "Completion evidence is required before a goal can be archived.";
         if (evidence.length > MAX_LEGACY_EVIDENCE_LENGTH)
           return `Completion evidence must be ${MAX_LEGACY_EVIDENCE_LENGTH} characters or fewer.`;
+        const planBlockers = planCompletionBlockers(goal.plan);
+        if (planBlockers.length) {
+          return [
+            `Completion refused: the action plan is not satisfied (${planStatusLabel(goal.plan)}).`,
+            `Outstanding: ${planBlockers.join("; ")}.`,
+            "Finish each action with goal_action_update, or mark it blocked with a stated reason.",
+            CEV_RULE
+          ].join(" ");
+        }
         const auditedGoalID = goal.goalId;
         const auditedRunID = goal.runId;
         if (auditMessagesEnabled) {
@@ -17796,6 +18116,103 @@ function buildAgentToolHandlers({
     }
     return messages.join(" ");
   }
+  async function getPlan(sessionID) {
+    const goal = goalStates.get(sessionID);
+    if (!goal)
+      return "No active goal.";
+    return formatPlanForStatus(goal.plan);
+  }
+  async function setPlan(sessionID, args = {}) {
+    const goal = goalStates.get(sessionID);
+    if (!goal)
+      return "No active goal. Set one first.";
+    if (!Array.isArray(args.actions)) {
+      return "Pass `actions` as an array of { id, title } objects.";
+    }
+    if (args.actions.length > MAX_PLAN_ACTIONS) {
+      return `A plan may hold at most ${MAX_PLAN_ACTIONS} actions.`;
+    }
+    const plan = normalizePlan({ actions: args.actions, updatedAt: Date.now() });
+    if (!plan.actions.length) {
+      return "No usable actions provided. Each action needs a non-empty `title`.";
+    }
+    const previous = new Map((goal.plan?.actions || []).map((action) => [action.id, action]));
+    for (const action of plan.actions) {
+      const prior = previous.get(action.id);
+      if (!prior)
+        continue;
+      if (!action.claim)
+        action.claim = prior.claim;
+      if (!action.evidence)
+        action.evidence = prior.evidence;
+      if (!action.verdict)
+        action.verdict = prior.verdict;
+    }
+    goal.plan = plan;
+    goal.lastStatus = `Plan recorded: ${planStatusLabel(plan)}.`;
+    pushHistory(goal, "plan-set", `Plan recorded with ${plan.actions.length} action(s).`);
+    await persist(sessionID);
+    return [
+      `Plan recorded (${plan.actions.length} action(s)).`,
+      formatPlanForStatus(goal.plan),
+      CEV_RULE
+    ].join(`
+`);
+  }
+  async function updateAction(sessionID, args = {}) {
+    const goal = goalStates.get(sessionID);
+    if (!goal)
+      return "No active goal. Set one first.";
+    const actions = goal.plan?.actions || [];
+    if (!actions.length)
+      return "No plan recorded. Call goal_plan_set first.";
+    const id = typeof args.id === "string" ? args.id.trim() : "";
+    if (!id)
+      return "Pass the `id` of the action to update.";
+    const action = actions.find((entry) => entry.id === id);
+    if (!action) {
+      return `No action with id "${id}". Known ids: ${actions.map((entry) => entry.id).join(", ")}.`;
+    }
+    const status = typeof args.status === "string" ? args.status.trim() : "";
+    if (status && !PLAN_ACTION_STATUS_SET.has(status)) {
+      return `Invalid status "${status}". Expected one of: ${PLAN_ACTION_STATUSES.join(", ")}.`;
+    }
+    const verdict = typeof args.verdict === "string" ? args.verdict.trim() : "";
+    if (verdict && !PLAN_VERDICT_SET.has(verdict)) {
+      return `Invalid verdict "${verdict}". Expected one of: ${PLAN_VERDICTS.join(", ")}.`;
+    }
+    const nextClaim = typeof args.claim === "string" ? planTextField(args.claim) : action.claim;
+    const nextEvidence = typeof args.evidence === "string" ? planTextField(args.evidence) : action.evidence;
+    const nextVerdict = verdict || (args.verdict === null ? null : action.verdict);
+    const nextStatus = status || action.status;
+    if (nextStatus === "done") {
+      const missing = [];
+      if (!nextClaim)
+        missing.push("claim");
+      if (!nextEvidence)
+        missing.push("evidence");
+      if (nextVerdict !== "pass")
+        missing.push(nextVerdict === "fail" ? "a passing verdict" : "verdict");
+      if (missing.length) {
+        return [
+          `Cannot mark "${id}" done without ${missing.join(", ")}.`,
+          CEV_RULE
+        ].join(" ");
+      }
+    }
+    if (nextStatus === "blocked" && !nextClaim) {
+      return `Cannot mark "${id}" blocked without a stated reason in \`claim\`.`;
+    }
+    action.status = nextStatus;
+    action.claim = nextClaim;
+    action.evidence = nextEvidence;
+    action.verdict = nextVerdict || null;
+    goal.plan.updatedAt = Date.now();
+    goal.lastStatus = `Action ${id} → ${action.status}; ${planStatusLabel(goal.plan)}.`;
+    pushHistory(goal, "plan-action", `Action ${id} set to ${action.status}.`);
+    await persist(sessionID);
+    return [`Action ${id} updated: ${action.status}.`, `Progress: ${planStatusLabel(goal.plan)}.`].join(" ");
+  }
   async function clearGoal(sessionID) {
     const goals = listSessionGoals(sessionID);
     const clearedGoal = goalStates.get(sessionID) || goals[0] || null;
@@ -17819,7 +18236,7 @@ function buildAgentToolHandlers({
     }
     return durable === false ? "Goal cleared in memory, but terminal state could not be persisted. It may reappear after restart." : "Goal cleared.";
   }
-  return { getGoal, getGoalHistory, setGoal, updateGoal, clearGoal };
+  return { getGoal, getGoalHistory, setGoal, updateGoal, clearGoal, getPlan, setPlan, updateAction };
 }
 function agentToolSessionID(ctx) {
   return ctx?.sessionID || ctx?.session_id || ctx?.session?.id || ctx?.sessionId || null;
@@ -17961,6 +18378,42 @@ function buildAgentTools(toolHelper, handlers, ensureSessionLoaded = async () =>
         return canonicalHandlers.update(sessionID, { status: "complete", evidence: claim.evidence });
       })
     }),
+    goal_plan_get: toolHelper({
+      description: "Return the goal's verified action plan: every action with its status, claim, evidence, and verdict.",
+      args: {},
+      execute: canonicalRun("plan_get", async (sessionID) => goalToolSuccess(await handlers.getPlan(sessionID)))
+    }),
+    goal_plan_set: toolHelper({
+      description: "Record the ordered action plan for the current goal. Decompose the objective into concrete actions; each needs a stable `id` and a `title`. Replaces the whole plan, preserving already-recorded claim/evidence/verdict for actions you keep by id.",
+      args: {
+        actions: schema.array(schema.object({
+          id: schema.string().optional(),
+          title: schema.string(),
+          status: schema.enum(PLAN_ACTION_STATUSES).optional(),
+          claim: schema.string().optional(),
+          evidence: schema.string().optional(),
+          verdict: schema.enum(PLAN_VERDICTS).optional()
+        }))
+      },
+      execute: canonicalRun("plan_set", async (sessionID, args) => {
+        const message = await handlers.setPlan(sessionID, args);
+        return message.startsWith("Plan recorded") ? goalToolSuccess(message) : goalToolFailure("invalid_plan", message);
+      })
+    }),
+    goal_action_update: toolHelper({
+      description: "Update one action of the goal plan. An action may only become `done` with a claim, the minimum evidence that could have falsified it (real command output, file content, or response — not your own report), and verdict `pass`. A `blocked` action must state its reason in `claim`.",
+      args: {
+        id: schema.string(),
+        status: schema.enum(PLAN_ACTION_STATUSES).optional(),
+        claim: schema.string().optional(),
+        evidence: schema.string().optional(),
+        verdict: schema.enum(PLAN_VERDICTS).optional()
+      },
+      execute: canonicalRun("action_update", async (sessionID, args) => {
+        const message = await handlers.updateAction(sessionID, args);
+        return /^Action .+ updated:/.test(message) ? goalToolSuccess(message) : goalToolFailure("action_update_rejected", message);
+      })
+    }),
     get_goal: toolHelper({
       description: "Get the status of the current goal for this session (objective, budget usage, last checkpoint).",
       args: {},
@@ -18016,7 +18469,7 @@ function formatGoalList(sessionID, commandName = "goal") {
       const state = goalDisplayState(goal);
       const reason = state === "blocked" ? goal.blockedReason || goal.stopReason : goal.stopped ? goal.stopReason : "";
       const reasonText = reason ? ` (${summarizeText(reason, 160)})` : "";
-      lines.push(`${index + 1}. [${marker}] ${goal.condition} — state: ${state}${reasonText}`);
+      lines.push(`${index + 1}. [${marker}] ${goalLabel(goal)} — state: ${state}${reasonText}`);
     });
     lines.push(`Switch with \`/${commandName} focus <number>\`.`);
   } else {
@@ -18025,7 +18478,7 @@ function formatGoalList(sessionID, commandName = "goal") {
   if (archived.length) {
     lines.push("", `Archived (${archived.length}, newest last):`);
     archived.forEach((result) => {
-      lines.push(`- [${result.state}] ${result.condition}`);
+      lines.push(`- [${result.state}] ${goalLabel(result)}`);
     });
   }
   return lines.join(`
@@ -18185,15 +18638,37 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
   const { commandName, registerCommand } = normalizeCommandOptions(pluginOptions);
   const restrictedAgents = normalizeRestrictedAgents(pluginOptions.restrictedAgents);
   const allowGoalExecutionFromPlan = pluginOptions.allowGoalExecutionFromPlan === true;
-  const sessionTitleStatus = pluginOptions.sessionTitleStatus === true;
-  const syncSessionTitle = async (sessionID) => {
-    if (!sessionTitleStatus || !sessionID)
+  const sidebarEnv = String((pluginOptions.env || process.env || {}).OPENCODE_GOAL_SIDEBAR ?? "").trim().toLowerCase();
+  const sidebarDisabledByEnv = sidebarEnv === "0" || sidebarEnv === "false" || sidebarEnv === "off";
+  const sidebarOption = pluginOptions.sidebarStatus !== undefined ? pluginOptions.sidebarStatus : pluginOptions.sessionTitleStatus;
+  const sidebarHostCapable = typeof client?.session?.update === "function";
+  const sidebarStatus = sidebarOption !== false && !sidebarDisabledByEnv && sidebarHostCapable;
+  const sidebarSequenceContext = (sessionID) => {
+    if (!sessionOrdered.has(sessionID))
+      return { ordered: false };
+    const live = listSessionGoals(sessionID);
+    const done = (sessionArchive.get(sessionID) || []).length;
+    const focused = goalStates.get(sessionID);
+    const index = live.findIndex((entry) => entry.goalId === focused?.goalId);
+    const position = index >= 0 ? index + 1 : focused ? 1 : 0;
+    return {
+      ordered: true,
+      sequencePosition: done + position,
+      sequenceTotal: done + live.length
+    };
+  };
+  const syncSidebar = async (sessionID) => {
+    if (!sidebarStatus || !sessionID)
       return;
-    const goal = goalStates.get(sessionID);
+    const goal = goalStates.get(sessionID) || sidebarTerminals.get(sessionID);
     if (!goal)
       return;
-    const title = buildSessionTitle(goal);
-    if (currentRuntime().appliedTitles.get(sessionID) === title)
+    const now = Date.now();
+    const context = sidebarSequenceContext(sessionID);
+    const title = buildSessionTitle(goal, now, context);
+    const metadata = buildSidebarMetadata(goal, now, context);
+    const fingerprint = JSON.stringify([title, { ...metadata, updatedAt: 0 }]);
+    if (currentRuntime().appliedTitles.get(sessionID) === fingerprint)
       return;
     try {
       if (!currentRuntime().sessionTitles.has(sessionID)) {
@@ -18201,27 +18676,45 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         const existing = typeof session?.title === "string" ? session.title : "";
         currentRuntime().sessionTitles.set(sessionID, looksLikePluginSessionTitle(existing) ? "" : existing);
       }
-      await sessionApi.update(sessionID, { title });
-      currentRuntime().appliedTitles.set(sessionID, title);
+      await updateSessionSidebar(sessionID, { title, goal: metadata });
+      currentRuntime().appliedTitles.set(sessionID, fingerprint);
     } catch (error51) {
-      await logPluginDebug(client, "Failed to update session title", error51);
+      await logPluginDebug(client, "Failed to update sidebar goal status", error51);
+    }
+  };
+  let sidebarMetadataSupported = true;
+  const updateSessionSidebar = async (sessionID, { title, goal }) => {
+    if (!sidebarMetadataSupported) {
+      await sessionApi.update(sessionID, { title });
+      return;
+    }
+    try {
+      await sessionApi.update(sessionID, { title, metadata: { goal } });
+    } catch (error51) {
+      sidebarMetadataSupported = false;
+      await logPluginDebug(client, "Session metadata rejected; falling back to title-only sidebar status", error51);
+      await sessionApi.update(sessionID, { title });
     }
   };
   const restoreSessionTitle = async (sessionID) => {
-    if (!sessionTitleStatus || !sessionID)
+    if (!sidebarStatus || !sessionID)
       return;
     const runtime2 = currentRuntime();
-    if (!runtime2.sessionTitles.has(sessionID))
-      return;
-    const original = runtime2.sessionTitles.get(sessionID);
+    const captured = runtime2.sessionTitles.has(sessionID);
+    const original = captured ? runtime2.sessionTitles.get(sessionID) : "";
     runtime2.sessionTitles.delete(sessionID);
     runtime2.appliedTitles.delete(sessionID);
-    if (!original)
+    runtime2.sidebarTerminals.delete(sessionID);
+    if (!captured && !sidebarMetadataSupported)
       return;
     try {
-      await sessionApi.update(sessionID, { title: original });
+      if (sidebarMetadataSupported) {
+        await sessionApi.update(sessionID, original ? { title: original, metadata: { goal: null } } : { metadata: { goal: null } });
+      } else if (original) {
+        await sessionApi.update(sessionID, { title: original });
+      }
     } catch (error51) {
-      await logPluginDebug(client, "Failed to restore session title", error51);
+      await logPluginDebug(client, "Failed to clear sidebar goal status", error51);
     }
   };
   const resolveSessionAgent = async (sessionID) => {
@@ -19461,9 +19954,16 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         }
         let completionUnverified = false;
         let blockerUnstated = false;
+        let completionRejection = "";
         if (!terminalBoundary && goalIsComplete(latestText)) {
           const evidence = extractCompletionEvidence(latestText);
-          if (evidence) {
+          const planBlockers = planCompletionBlockers(activeGoalAfterMessages.plan);
+          if (evidence && planBlockers.length) {
+            completionUnverified = true;
+            completionRejection = `Previous completion was rejected: the action plan is not satisfied (${planStatusLabel(activeGoalAfterMessages.plan)}). ` + `Outstanding: ${summarizeText(planBlockers.join("; "), 400)}. ` + "Record each action's claim, the evidence that could have falsified it, and verdict=pass with goal_action_update — or mark it blocked with a stated reason — before claiming completion.";
+            activeGoalAfterMessages.lastStatus = `Rejected [goal:complete]: action plan not satisfied (${planStatusLabel(activeGoalAfterMessages.plan)}).`;
+            pushHistory(activeGoalAfterMessages, "completion-unverified", `Assistant claimed completion with an unsatisfied action plan: ${summarizeText(planBlockers.join("; "), 300)}`);
+          } else if (evidence) {
             await announceAudit(sessionID, `Auditing goal completion: verifying "${summarizeText(activeGoalAfterMessages.condition, 120)}" is satisfied before archiving.`);
             if (!activeGoal(sessionID, goalID, runID))
               return;
@@ -19744,7 +20244,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         if (!budgetWrapup) {
           if (completionUnverified) {
             activeGoalBeforePrompt.formatFailures += 1;
-            activeGoalBeforePrompt.lastStatus = `Rejected an unverified [goal:complete] (no [goal:evidence]); re-prompting for evidence on turn ${activeGoalBeforePrompt.turnCount}.`;
+            activeGoalBeforePrompt.lastStatus = completionRejection ? `Rejected a [goal:complete] against an unsatisfied action plan (${planStatusLabel(activeGoalBeforePrompt.plan)}); re-prompting on turn ${activeGoalBeforePrompt.turnCount}.` : `Rejected an unverified [goal:complete] (no [goal:evidence]); re-prompting for evidence on turn ${activeGoalBeforePrompt.turnCount}.`;
           } else if (blockerUnstated) {
             activeGoalBeforePrompt.formatFailures += 1;
             activeGoalBeforePrompt.lastStatus = `Rejected a [goal:blocked] with no concrete blocker; re-prompting on turn ${activeGoalBeforePrompt.turnCount}.`;
@@ -19777,7 +20277,8 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
               makeContinuationPart(buildContinueMessage(activeGoalBeforePrompt, {
                 budgetWrapup,
                 completionUnverified,
-                blockerUnstated
+                blockerUnstated,
+                completionRejection
               }), continueToken)
             ]
           });
@@ -19887,6 +20388,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
 `) : [
         `<opencode_goal_plugin id="${goal.goalId}">`,
         buildGoalBlock(goal),
+        ...buildPlanSystemLines(goal),
         "Keep working until the goal is fully satisfied.",
         "When fully satisfied, put a `[goal:evidence]` line summarizing what you verified immediately before `[goal:complete]`. A `[goal:complete]` without evidence is rejected.",
         "If user input is required, explain the concrete blocker in the line immediately before `[goal:blocked]`. A `[goal:blocked]` without a concrete blocker is rejected.",
@@ -19933,7 +20435,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       output.enabled = false;
     }
   };
-  if (sessionTitleStatus) {
+  if (sidebarStatus) {
     for (const hookName of ["command.execute.before", "event"]) {
       const original = hooks[hookName];
       if (typeof original !== "function")
@@ -19950,7 +20452,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           } else {
             titleSessionID = args[0]?.sessionID;
           }
-          await syncSessionTitle(titleSessionID);
+          await syncSidebar(titleSessionID);
         }
       };
     }
@@ -20096,6 +20598,23 @@ var testInternals = {
   userInterventionDetected,
   outputTokensForMessage,
   parseGoalArguments,
+  buildGoalState,
+  normalizePersistedGoal,
+  normalizePlan,
+  emptyPlan,
+  planProgress,
+  planCompletionBlockers,
+  planAllowsCompletion,
+  planStatusLabel,
+  formatPlanForPrompt,
+  formatPlanForStatus,
+  buildPlanSystemLines,
+  PLAN_ACTION_STATUSES,
+  PLAN_VERDICTS,
+  CEV_RULE,
+  splitGoalCommandText,
+  deriveGoalLabel,
+  goalLabel,
   parsePositiveIntegerStrict,
   parseTokenBudget,
   pruneGoalResults,

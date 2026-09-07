@@ -26,9 +26,12 @@ const expectedTools = [
   "clear_goal",
   "get_goal",
   "get_goal_history",
+  "goal_action_update",
   "goal_block",
   "goal_complete",
   "goal_pause",
+  "goal_plan_get",
+  "goal_plan_set",
   "goal_resume",
   "goal_set",
   "goal_status",
@@ -44,10 +47,15 @@ try {
   ])
   await writeFile(join(projectDirectory, "package.json"), JSON.stringify({ private: true, type: "module" }))
 
-  const packResult = JSON.parse(execNpm(
+  // `npm pack --json` prints the prepack lifecycle's own stdout (the bundler's
+  // build log) before its JSON array, so the payload starts at the first `[`.
+  const packOutput = execNpm(
     ["pack", "--json", "--pack-destination", packDirectory],
     { cwd: repository, encoding: "utf8", env: npmEnvironment },
-  ))
+  )
+  const packJsonStart = packOutput.indexOf("[")
+  assert.notEqual(packJsonStart, -1, `npm pack --json produced no JSON array:\n${packOutput}`)
+  const packResult = JSON.parse(packOutput.slice(packJsonStart))
   assert.equal(packResult.length, 1)
   const tarball = join(packDirectory, packResult[0].filename)
 
