@@ -35,7 +35,7 @@ This plugin depends on OpenCode plugin hooks, including experimental hooks. When
 1. Check the current OpenCode plugin and command documentation.
 2. Run `npm run smoke`, `npm run smoke:packed-host`, `npm run smoke:packed-tools`, and `npm run type:check` to verify the source and installed-tarball contracts.
 3. Test against a real OpenCode install when possible.
-4. Update the README compatibility snapshot if the tested surface changes.
+4. Update the compatibility snapshot in [`docs/reference.md`](docs/reference.md#compatibility), and the policy in [`docs/compatibility.md`](docs/compatibility.md), if the tested surface changes.
 
 `npm run smoke` verifies the package export path and `/goal` command hook without invoking a model. The packed-host and packed-tool checks install the npm artifact in isolated consumer projects and verify the public hooks and clean-install default tool contracts. `npm run type:check` compiles installed-package consumers with NodeNext and Bundler resolution. `npm run benchmark:behavior` covers deterministic autonomy and token-efficiency scenarios. None replaces a real OpenCode smoke test after hook, SDK, or command behavior changes.
 

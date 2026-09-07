@@ -5,7 +5,7 @@ Two files, because a full install is **two entries in two different files**:
 hooks, and the sidebar payload), and `tui.json` — beside it, in the same config
 directory — registers the *TUI* half (the sidebar panel). The server half works
 alone; you get the status line and no panel. See
-[Install](../README.md#install) in the README for why a spec must name the
+[Install](../docs/reference.md#install) in the reference for why a spec must name the
 package **before** the source, and what happens silently when it does not.
 
 > **`<tag>` is a placeholder: these files do not install as shipped.** No tag
