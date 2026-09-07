@@ -36,9 +36,12 @@ export interface GoalPanelModel {
   objective: string
   /**
    * Budget summaries, e.g. `["3/∞ turns", "2m/8h", "147k/100m tokens"]`.
-   * An unlimited turn budget (`turns.max === null`, or `turns.unlimited`)
-   * renders its ceiling as `∞`; a duration of an hour or more renders in
-   * hours with one decimal and no trailing `.0`.
+   * An unlimited turn budget (`turns.max === null`, `turns.max === 0`, or
+   * `turns.unlimited`) renders its ceiling as `∞`. Durations render from the
+   * v2 `durationMs` field when present and fall back to v1 `minutes`: under a
+   * minute in whole seconds (`20s`), then minutes, then hours with one decimal
+   * and no trailing `.0`. Every duration is truncated, never rounded up, so
+   * elapsed never reaches the limit's own rendering early.
    */
   stats: string[]
   /** `step 2/4` for an ordered `/goal sequence`, otherwise empty. */
@@ -64,7 +67,11 @@ export function formatPanelTokens(value: number): string
 /** Heading rendered above the panel. */
 export const GOAL_PANEL_TITLE: string
 
-/** Schema version of the `metadata.goal` payload this panel understands. */
+/**
+ * Schema version of the `metadata.goal` payload this panel understands (2 as
+ * of 0.11.0: nullable `turns.max`, plus `durationMs`). A larger version is
+ * rendered on a best-effort basis rather than hidden.
+ */
 export const GOAL_PANEL_PAYLOAD_VERSION: number
 
 /**

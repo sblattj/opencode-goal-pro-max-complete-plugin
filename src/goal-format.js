@@ -46,22 +46,37 @@ export function formatTurnBudget(used, max) {
 /**
  * Render a minute count as a budget field. Minutes up to an hour stay minutes
  * (`0m`, `45m`); an hour or more switches to hours with a single decimal and
- * no trailing `.0` (`1h`, `1.5h`, `8h`). One decimal is the whole rounding
- * rule: 481 minutes is 8.016 hours, which rounds to 8.0 and renders `8h`.
+ * no trailing `.0` (`1h`, `1.5h`, `8h`).
+ *
+ * Every value is TRUNCATED toward zero, never rounded up. Rounding made the
+ * elapsed clock reach the limit's own rendering early — an 8-hour goal read
+ * `8h/8h` from 7h57m, three minutes before it could stop — and made a limit
+ * name a budget the goal does not have. Truncated, 477 minutes is `7.9h`, 480
+ * is `8h`, and 481 (8.016 h) is `8h` too.
  *
  * Elapsed and limit are formatted independently, so a fresh 8-hour goal reads
- * `0m/8h` and the same goal 90 minutes in reads `1.5h/8h`.
+ * `0s/8h` and the same goal 90 minutes in reads `1.5h/8h`.
  */
 export function formatBudgetMinutes(minutes) {
   const parsed = Number(minutes)
-  const whole = Number.isFinite(parsed) && parsed > 0 ? Math.round(parsed) : 0
+  const whole = Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 0
   if (whole < 60) return `${whole}m`
-  const hours = Math.round((whole / 60) * 10) / 10
+  // Tenths of an hour, truncated. The multiply happens before the divide so
+  // the tenth is computed from an integer rather than from `whole / 60`.
+  const hours = Math.floor((whole * 10) / 60) / 10
   return Number.isInteger(hours) ? `${hours}h` : `${hours.toFixed(1)}h`
 }
 
-/** The same rendering from a millisecond duration. */
+/**
+ * The same rendering from a millisecond duration, plus one granularity the
+ * minute scale cannot express: a duration under a minute renders in whole
+ * seconds (`0s`, `20s`, `59s`). Without it a `--max-duration-ms 20000` goal
+ * reported its limit as `0m` and stopped with `max duration reached (0m)`,
+ * and the session title of a 45-second-old goal read `0m` rather than `45s`.
+ */
 export function formatBudgetDuration(ms) {
   const parsed = Number(ms)
-  return formatBudgetMinutes(Number.isFinite(parsed) ? parsed / 60000 : 0)
+  const value = Number.isFinite(parsed) && parsed > 0 ? parsed : 0
+  if (value < 60000) return `${Math.floor(value / 1000)}s`
+  return formatBudgetMinutes(value / 60000)
 }

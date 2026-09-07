@@ -293,15 +293,17 @@ Markers must appear on their own final line. The bracketed form is canonical, bu
 |---|---|
 | Auto-continue turns | unlimited (`0`) |
 | Max duration | 8 hours |
-| Context tokens | 100,000,000 |
+| Context tokens | 100,000,000 (effectively no brake — see below) |
 | Min delay between continues | 1.5 seconds |
 | No-progress pause | < 50 output tokens on a stalled turn (after a 2-turn grace window) |
-| Budget wrap-up threshold | 80% of context token budget |
+| Budget wrap-up threshold | 80% of the duration window or of the context-token budget, whichever comes first (6.4 h with the default 8-hour window) |
 | Auto-continue failure pause | 3 consecutive prompt failures |
 
-**Effective turn count.** Turns are **unlimited by default** (`maxTurns: 0`), and the wall clock is 8 hours. With those defaults neither the turn counter nor the token budget is the brake that normally stops a run: the binding brakes are the **no-tool-call pause** (two consecutive talk-only continuation turns) and the **no-progress pause** (two consecutive stalled low-output turns), with the 8-hour window behind them as the outer bound. That is deliberate — an arbitrary turn count stops a healthy long run for no reason, while a loop that has stopped doing work is caught within two turns either way. Set `--max-turns <n>` when you want a hard ceiling on a single goal, and `--max-minutes` to shorten the window.
+**Effective turn count.** Turns are **unlimited by default** (`maxTurns: 0`), and the wall clock is 8 hours. With those defaults neither the turn counter nor the token budget is the brake that normally stops a run. Two cheaper pauses come first: the **no-tool-call pause** (two consecutive talk-only continuation turns) and the **no-progress pause** (two consecutive stalled turns under 50 output tokens). Both are deliberately skipped for any turn that **calls a tool**, so they catch a loop that has stopped *doing* anything — and they do **not** catch a loop that keeps working uselessly, e.g. an agent re-running the same failing command with real output every turn. For that run the binding brake is the **8-hour window**, with the budget wrap-up handoff at 80% of it (6.4 h) asking for a summary while there is still time to write one. Set `--max-turns <n>` when you want a hard ceiling on a single goal, and `--max-minutes` to shorten the window.
 
-**Token budget.** The plugin tracks the session's context window size (`input + output + reasoning` tokens on the latest message). This matches the token count that OpenCode displays, so the numbers should be consistent. When the context window reaches the `--max-tokens` limit, the plugin sends a wrap-up prompt and stops. In high-context sessions (large codebases, long conversation history), the context can grow quickly — treat the budget as a safety brake.
+**Token budget.** The plugin tracks the session's **context window size** (`input + output + reasoning + cache` on the latest message, kept as the peak), not cumulative API spend. This matches the token count that OpenCode displays. When the context window reaches the `--max-tokens` limit, the plugin sends a wrap-up prompt and stops.
+
+**The default 100,000,000-token budget is deliberately unreachable**, because a context window is bounded by the model (200k–2M): the token brake, the token warning, and the token half of the budget wrap-up are all off by default, so a long run is no longer ended by its first context saturation — which the host handles by compacting. Pass `--max-tokens <n>` or `--budget 200k` to turn that brake back on for one goal, or set `maxTokens` in the plugin options for all of them; then the wrap-up fires at 80% of it, whichever of the token and duration budgets comes first.
 
 **No-progress heuristic.** A low-output turn does not pause immediately anymore. The plugin pauses only after `noProgressTurnsBeforePause` consecutive *stalled* low-output turns — repeated turns with very little output and no meaningful change in the latest assistant checkpoint.
 
@@ -337,7 +339,7 @@ Override any limit for a single goal:
 
 | Flag | Controls |
 |---|---|
-| `--max-turns <n>` | Auto-continue turn limit. `0`, `unlimited`, `none`, `inf`, `infinite`, or `∞` means no ceiling (the default) |
+| `--max-turns <n>` | Auto-continue turn limit. `0`, `unlimited`, `none`, `inf`, `infinite`, `infinity`, or `∞` (case-insensitive) means no ceiling, which is the default |
 | `--max-minutes <n>` | Duration limit in minutes |
 | `--max-duration-ms <n>` | Duration limit in milliseconds |
 | `--max-tokens <n>` | Context token limit |
@@ -398,7 +400,7 @@ Additional plugin-level options:
 - `noToolCallTurnsBeforePause` — grace window for tool-free continuation turns. The plugin pauses after this many consecutive continuation turns that produced no tool calls (anti self-chat loop). Default `2`; set the plugin option to `0` for legitimate tool-free writing/research workflows.
 - `noInterruptOnUserMessage` — when `true`, a new human message no longer pauses an active goal ("user intervention"); the goal loop keeps running and the message steers the next continuation. Because typing a message no longer stops the loop, `/goal pause` and `/goal stop` become the way to halt it. Default `false`, which pauses for `/goal resume` as before.
 - `noContinueWhileChildrenActive` — when `true`, auto-continue is deferred while the session has active child sessions (subagents, background tasks): the goal stays running but does not prompt the orchestrator until the children finish. A child counts as active only while the host reports a non-idle status for it, and each deferral is reported in `/goal status` and the lifecycle history so a waiting goal is never mistaken for a hung one. Default `false`. Enabling it adds a `children` and a `status` call to each idle the goal loop evaluates. The gate fails open — continuation proceeds — for hosts that cannot report children/status, for sessions with more concurrent children than the plugin can track, and for children that run goals of their own. Note that the gate relies on the child's own idle event to resume, so a host that never emits one leaves the goal waiting; `/goal status` reports the deferral in that case.
-- `warnTurnsRemaining` / `warnDurationMsRemaining` / `warnTokensRemaining` — thresholds at which the auto-continue prompt appends a "limits are near" warning (default `3` turns, `60000` ms, `25000` context tokens). Lower them to warn closer to the limit, or raise them to warn earlier. **With the default unlimited turn budget there is no turn warning at all** — nothing is running out — so `warnTurnsRemaining` only takes effect on a goal that sets an explicit `--max-turns <n>`.
+- `warnTurnsRemaining` / `warnDurationMsRemaining` / `warnTokensRemaining` — thresholds at which the auto-continue prompt appends a "limits are near" warning (default `3` turns, `600000` ms = 10 minutes, `25000` context tokens). Lower them to warn closer to the limit, or raise them to warn earlier. The duration threshold is scaled to the 8-hour window; the old 60-second value was 0.2 % of it. **Two of the three are silent under the shipped defaults**: there is no turn warning when the turn budget is unlimited (nothing is running out), and no token warning while the 100,000,000-token budget is out of reach — so `warnTurnsRemaining` needs an explicit `--max-turns <n>` and `warnTokensRemaining` a reachable `--max-tokens`/`--budget`.
 - `commandName` — the slash command the plugin owns (default `goal`). Set it to e.g. `objective` to drive the workflow with `/objective` instead of `/goal`; a leading slash is tolerated. Remember to register the matching command name in your OpenCode `command` config. User-facing hints (`/goal status`, `/goal resume`, …) follow the configured name.
 - `registerCommand` — whether the plugin installs its `command.execute.before` hook at all (default `true`). Set it to `false` if you only want the auto-continue/persistence behavior driven programmatically and don't want the plugin to own a slash command.
 - `registerTools` — whether the plugin registers the agent-facing goal tools (default `true`). Set to `false` to omit the programmatic tool surface entirely. See [Agent tools](#agent-tools).
@@ -478,7 +480,7 @@ Unattended runs are easier to trust when you can see the goal is still alive. Th
 ▶ ship the release · 2/4 · 3/∞ · 2m/8h · 147k/100m · 3/7✓
 ```
 
-Status icon, objective label, sequence position (only for `/goal sequence`), auto-continues used / limit, elapsed / duration limit, context tokens / budget, and verified actions / total. An unlimited turn budget renders its ceiling as `∞`. Durations of an hour or more render in hours with one decimal and no trailing `.0` (`45m`, `1h`, `1.5h`, `8h`); elapsed and limit are formatted independently, so a fresh 8-hour goal reads `0m/8h` and the same goal 90 minutes in reads `1.5h/8h`. The icon distinguishes running (`▶`), paused (`⏸`), blocked (`⛔`), and completed (`✓`) — blocked outranks paused because it needs you, not just a resume. A paused goal freezes its elapsed clock rather than running on.
+Status icon, objective label, sequence position (only for `/goal sequence`), auto-continues used / limit, elapsed / duration limit, context tokens / budget, and verified actions / total. An unlimited turn budget renders its ceiling as `∞`. Durations under a minute render in whole seconds (`45s`), then in minutes, then — from an hour — in hours with one decimal and no trailing `.0` (`45m`, `1h`, `1.5h`, `8h`). Every duration is **truncated, never rounded up**, so elapsed never reaches the limit's own rendering early and a limit never names a budget the goal does not have (7h57m of an 8-hour window reads `7.9h/8h`, and 481 minutes reads `8h`). Elapsed and limit are formatted independently, so a fresh 8-hour goal reads `0s/8h` and the same goal 90 minutes in reads `1.5h/8h`. The icon distinguishes running (`▶`), paused (`⏸`), blocked (`⛔`), and completed (`✓`) — blocked outranks paused because it needs you, not just a resume. A paused goal freezes its elapsed clock rather than running on.
 
 When a goal ends, the sidebar switches to one terminal render (`✓ …`, state `completed`) instead of leaving the last running status up; `/goal clear` then hands the title back. A failure is not a separate state: it shows as `blocked` with a `blockedReason`, or `paused` with a `stopReason`, because a failed goal stays resumable.
 
@@ -486,11 +488,12 @@ Alongside the title, the plugin writes a structured payload to the session's `me
 
 ```json
 {
-  "v": 1,
+  "v": 2,
   "goalId": "…",
   "state": "active",
   "objective": "ship the release",
   "turns": { "used": 3, "max": null, "unlimited": true },
+  "durationMs": { "used": 147000, "max": 28800000 },
   "minutes": { "used": 2, "max": 480 },
   "tokens": { "used": 147000, "max": 100000000 },
   "plan": { "total": 7, "verified": 3, "blocked": 0, "actions": [ … ] },
@@ -501,7 +504,9 @@ Alongside the title, the plugin writes a structured payload to the session's `me
 }
 ```
 
-The payload stays machine-readable where the title is not: `minutes.used` / `minutes.max` are plain numbers of minutes, and `tokens` is a plain token count. The one budget with a "no ceiling" state is `turns`, which carries `"max": null` plus an explicit `"unlimited": true` — never `Infinity`, which JSON serialises to `null` and would be indistinguishable from a missing field. A bounded goal carries `"turns": { "used": 3, "max": 10 }` with no `unlimited` key.
+The payload stays machine-readable where the title is not: `durationMs` and `minutes` are plain numbers (milliseconds and truncated whole minutes for the same duration), and `tokens` is a plain token count. The one budget with a "no ceiling" state is `turns`, which carries `"max": null` plus an explicit `"unlimited": true` — never `Infinity`, which JSON serialises to `null` and would be indistinguishable from a missing field. A bounded goal carries `"turns": { "used": 3, "max": 10 }` with no `unlimited` key.
+
+**Schema `v` is `2` as of 0.11.0**: `turns.max` became nullable and `durationMs` was added; every v1 field is still written, so a v1 consumer keeps working — with one exception worth knowing before you upgrade half of it. The [sidebar panel](#sidebar-panel-tui) ships in the same package but is registered separately (`opencode.json` for the server half, `tui.json` for the TUI half), so the two can skew. A **0.10.x panel reading a 0.11.0 payload drops the turns stat** (it reads the unlimited `"max": null` as a missing budget); the current panel reads either version. Upgrade both entries together.
 
 **Mechanism.** Both halves are one `PATCH /session/{id}` call (`client.session.update`). The session title is what the OpenCode TUI sidebar renders for the current session, and `metadata` is reconciled into the TUI's reactive session store on the `session.updated` event. This half needs no TUI entrypoint and no `@opentui` dependency, so it works on every client that shows a session title — including `opencode run`, the desktop client, and any host reading the session record over HTTP. The [sidebar panel](#sidebar-panel-tui) below renders the same payload as a real panel when the host supports TUI plugins.
 

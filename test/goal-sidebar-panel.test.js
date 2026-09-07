@@ -141,11 +141,30 @@ test("each state carries its own icon and an unknown one degrades to active", ()
   assert.equal(unknown.icon, "▶")
 })
 
-test("a budget with no ceiling is dropped instead of rendering a bare number", () => {
+test("a budget with no ceiling is dropped, except the turn budget, which is unlimited", () => {
+  // `minutes: undefined` and `tokens.max: null` are genuinely absent budgets:
+  // there is no number to render, so the stat is dropped rather than shown as
+  // `10/0`. `turns.max: 0` is NOT absent — 0 is how the whole package spells
+  // "unlimited" (`DEFAULT_OPTIONS.maxTurns`, `--max-turns 0`), and this payload
+  // arrives as arbitrary JSON from another process, so it renders `3/∞`
+  // instead of making the turn count vanish.
   const model = goalPanelModel(
     payload({ turns: { used: 3, max: 0 }, minutes: undefined, tokens: { used: 10, max: null } }),
   )
-  assert.deepEqual(model.stats, [])
+  assert.deepEqual(model.stats, ["3/∞ turns"])
+
+  // Every other spelling of no ceiling reads the same way, and a hostile
+  // fractional ceiling degrades to unlimited rather than to a dropped stat.
+  for (const turns of [{ used: 3, max: null }, { used: 3, max: -1 }, { used: 3 }, { used: 3, max: 0.5 }]) {
+    assert.equal(
+      goalPanelModel(payload({ turns, minutes: undefined, tokens: undefined })).stats[0],
+      "3/∞ turns",
+      `turns ${JSON.stringify(turns)} must render a ceiling, not disappear`,
+    )
+  }
+
+  // Control: a real ceiling still renders as itself.
+  assert.equal(goalPanelModel(payload({ turns: { used: 3, max: 10 } })).stats[0], "3/10 turns")
 })
 
 test("token counts are abbreviated the way the session title abbreviates them", () => {
@@ -468,11 +487,36 @@ test("the shipped 8-hour window renders in hours, and the elapsed clock follows 
   assert.equal(stats(60, 480), "1h/8h")
   assert.equal(stats(90, 480), "1.5h/8h")
   assert.equal(stats(480, 480), "8h/8h")
+  // Truncated, so the panel does not read `8h/8h` three minutes before the
+  // goal can stop: 477 minutes is 7.95 h.
+  assert.equal(stats(477, 480), "7.9h/8h")
+  assert.equal(stats(479, 480), "7.9h/8h")
+})
+
+test("the panel prefers the v2 durationMs field and falls back to v1 minutes", () => {
+  // v2: milliseconds, the same field the session title formats, so a young
+  // goal reads in seconds instead of collapsing to `0m`.
+  const young = goalPanelModel(payload({ durationMs: { used: 45_000, max: 28_800_000 }, minutes: { used: 0, max: 480 } }))
+  assert.equal(young.stats[1], "45s/8h")
+
+  // A budget under a minute: `minutes` can only say `0m/0m`, and a max of 0
+  // made the no-ceiling drop remove the duration stat from the panel entirely.
+  const short = goalPanelModel(payload({ durationMs: { used: 5_000, max: 20_000 }, minutes: { used: 0, max: 0 } }))
+  assert.equal(short.stats[1], "5s/20s")
+  assert.equal(goalPanelModel(payload({ minutes: { used: 0, max: 0 } })).stats.length, 2, "v1 alone still drops it")
+
+  // A v1 payload — no durationMs at all — still renders from minutes.
+  assert.equal(goalPanelModel(payload({ minutes: { used: 90, max: 480 } })).stats[1], "1.5h/8h")
+
+  // A hostile durationMs degrades to the v1 field rather than throwing.
+  assert.equal(goalPanelModel(payload({ durationMs: "soon", minutes: { used: 2, max: 30 } })).stats[1], "2m/30m")
+  assert.equal(goalPanelModel(payload({ durationMs: { used: "x", max: null }, minutes: { used: 2, max: 30 } })).stats[1], "2m/30m")
 })
 
 test("the shared budget formatters are the ones the panel and the title both use", () => {
-  // One decimal, trailing .0 dropped. 481 minutes is 8.016 h, which rounds to
-  // 8.0 and must therefore render "8h", not "8.0h".
+  // One decimal, trailing .0 dropped, and TRUNCATED rather than rounded.
+  // 481 minutes is 8.016 h, which truncates to 8.0 and renders "8h", not "8.0h";
+  // 477 is 7.95 h and must render "7.9h" rather than reaching "8h" early.
   assert.equal(formatBudgetMinutes(0), "0m")
   assert.equal(formatBudgetMinutes(45), "45m")
   assert.equal(formatBudgetMinutes(59), "59m")
@@ -480,6 +524,7 @@ test("the shared budget formatters are the ones the panel and the title both use
   assert.equal(formatBudgetMinutes(90), "1.5h")
   assert.equal(formatBudgetMinutes(480), "8h")
   assert.equal(formatBudgetMinutes(481), "8h")
+  assert.equal(formatBudgetMinutes(477), "7.9h")
   assert.equal(formatBudgetMinutes(500), "8.3h")
   assert.equal(formatBudgetMinutes(-5), "0m")
   assert.equal(formatBudgetMinutes("nope"), "0m")

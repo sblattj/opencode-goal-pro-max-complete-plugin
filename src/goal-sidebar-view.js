@@ -59,14 +59,20 @@
 // own reactive graph and never update.
 // ---------------------------------------------------------------------------
 
-import { formatBudgetMinutes, formatTurnBudget } from "./goal-format.js"
+import {
+  formatBudgetDuration,
+  formatBudgetMinutes,
+  formatTurnBudget,
+  isUnlimitedTurnBudget,
+} from "./goal-format.js"
 
 export const GOAL_PANEL_TITLE = "Goal"
 
 // The payload version this panel understands. `metadata.goal.v` is written by
 // the server half; a future, larger version is rendered on a best-effort basis
-// rather than hidden, because a blank sidebar is worse than a stale one.
-export const GOAL_PANEL_PAYLOAD_VERSION = 1
+// rather than hidden, because a blank sidebar is worse than a stale one. v2
+// (0.11.0) made `turns.max` nullable and added `durationMs`.
+export const GOAL_PANEL_PAYLOAD_VERSION = 2
 
 const STATE_ICONS = {
   active: "▶",
@@ -113,12 +119,19 @@ function budget(raw) {
 // The turn budget is the one budget that has a legitimate "no ceiling" state,
 // carried as `{ used, max: null, unlimited: true }`. It must survive the
 // no-ceiling drop above and render `used/∞` instead of disappearing.
+//
+// `max: 0` gets the same treatment: this payload is arbitrary JSON from
+// another process, and `0` is how the rest of the package spells "unlimited"
+// (`DEFAULT_OPTIONS.maxTurns`, the `--max-turns 0` flag, `isUnlimitedTurnBudget`).
+// Whatever spelling arrives, the stat renders rather than vanishing.
 function turnsBudget(raw) {
   if (!isRecord(raw)) return null
   const used = wholeNumber(raw.used)
-  if (raw.unlimited === true || raw.max === null) return { used, max: null, unlimited: true }
+  if (raw.unlimited === true || isUnlimitedTurnBudget(raw.max)) {
+    return { used, max: null, unlimited: true }
+  }
   const max = wholeNumber(raw.max)
-  if (!max) return null
+  if (!max) return { used, max: null, unlimited: true }
   return { used, max, unlimited: false }
 }
 
@@ -168,12 +181,20 @@ export function goalPanelModel(raw) {
 
   const state = STATE_ICONS[raw.state] ? raw.state : "active"
   const turns = turnsBudget(raw.turns)
+  // v2 carries the duration in milliseconds, which is what the session title
+  // renders from; `minutes` is the v1 fallback and cannot express a budget
+  // under a minute. Preferring `durationMs` keeps panel and title byte-equal.
+  const durationMs = budget(raw.durationMs)
   const minutes = budget(raw.minutes)
   const tokens = budget(raw.tokens)
 
   const stats = []
   if (turns) stats.push(`${formatTurnBudget(turns.used, turns.max)} turns`)
-  if (minutes) stats.push(`${formatBudgetMinutes(minutes.used)}/${formatBudgetMinutes(minutes.max)}`)
+  if (durationMs) {
+    stats.push(`${formatBudgetDuration(durationMs.used)}/${formatBudgetDuration(durationMs.max)}`)
+  } else if (minutes) {
+    stats.push(`${formatBudgetMinutes(minutes.used)}/${formatBudgetMinutes(minutes.max)}`)
+  }
   if (tokens) stats.push(`${formatPanelTokens(tokens.used)}/${formatPanelTokens(tokens.max)} tokens`)
 
   const sequence =

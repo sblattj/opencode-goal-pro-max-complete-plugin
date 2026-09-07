@@ -77,8 +77,12 @@ export interface GoalPlan {
  * See {@link GoalPluginOptions.sidebarStatus}.
  */
 export interface GoalSidebarStatus {
-  /** Schema version of this payload. */
-  v: 1
+  /**
+   * Schema version of this payload. v2 (0.11.0) made {@link
+   * GoalSidebarStatus.turns}`.max` nullable for an unlimited budget and added
+   * {@link GoalSidebarStatus.durationMs}; v1 fields are all still written.
+   */
+  v: 2
   goalId: string
   /**
    * `completed` is the terminal state of an archived goal. A failure surfaces as
@@ -95,6 +99,14 @@ export interface GoalSidebarStatus {
    * from a missing field.
    */
   turns: { used: number; max: number | null; unlimited?: boolean }
+  /**
+   * Elapsed and limit in milliseconds — the precise duration field, added in
+   * v2. The sidebar panel renders from this one, so the panel and the session
+   * title agree even for a budget under a minute (`20s/20s`), which `minutes`
+   * can only render as `0m/0m`.
+   */
+  durationMs: { used: number; max: number }
+  /** The same duration in whole minutes, truncated. Kept for v1 consumers. */
   minutes: { used: number; max: number }
   tokens: { used: number; max: number }
   plan: {
@@ -189,10 +201,12 @@ export interface GoalPluginOptions {
   /**
    * Maximum number of auto-continue turns sent toward a goal before it is
    * stopped for exceeding limits. `0` means **unlimited** and is the default:
-   * with an 8-hour window the binding brakes are the no-tool-call and
-   * no-progress pauses, not a turn count. Overridable per-goal with
+   * an arbitrary turn count stops a healthy long run for no reason. The
+   * no-tool-call and no-progress pauses catch a loop that has stopped doing
+   * anything, but neither catches a loop that keeps calling tools — for that
+   * run the 8-hour window is the brake. Overridable per-goal with
    * `--max-turns`, which also accepts `unlimited`, `none`, `inf`, `infinite`,
-   * and `∞`.
+   * `infinity`, and `∞`.
    * @default 0
    */
   maxTurns?: number
@@ -209,6 +223,10 @@ export interface GoalPluginOptions {
    * Maximum context token budget a goal may consume before it is stopped
    * for exceeding limits. Defaults to 100,000,000 — high enough that the
    * duration window, not the token budget, ends a long unattended run.
+   * The counter is the peak CONTEXT WINDOW size, not cumulative API spend, so
+   * the default is unreachable by design: it disables the token brake and the
+   * token half of the budget wrap-up. Set a reachable number to re-enable
+   * both.
    * Overridable per-goal with `--max-tokens` or the `--budget` shorthand
    * (accepts a `k`/`m` suffix, e.g. `100k`, `1.5m`).
    * @default 100000000
@@ -292,14 +310,18 @@ export interface GoalPluginOptions {
 
   /**
    * Remaining duration, in milliseconds, at which a limit-approaching
-   * warning is included in status output.
-   * @default 60000
+   * warning is included in status output. Ten minutes, scaled to the 8-hour
+   * default window; the old 60-second threshold was 0.2 % of it.
+   * @default 600000
    */
   warnDurationMsRemaining?: number
 
   /**
    * Remaining context tokens at which a limit-approaching warning is
-   * included in status output.
+   * included in status output. With the default 100,000,000-token budget it
+   * never fires — the counter is the peak context-window size, which the model
+   * bounds far below that — so it only takes effect on a goal that sets a
+   * reachable `--max-tokens`/`--budget`.
    * @default 25000
    */
   warnTokensRemaining?: number
@@ -397,7 +419,7 @@ export interface GoalPluginOptions {
   /**
    * Mirror live goal status into the OpenCode sidebar. The plugin writes the
    * session title, which the TUI's sidebar renders
-   * (e.g. `▶ ship the release · 3/10 · 2m · 45k/200k · 3/7✓`), plus a
+   * (e.g. `▶ ship the release · 2/4 · 3/∞ · 2m/8h · 147k/100m · 3/7✓`), plus a
    * structured {@link GoalSidebarStatus} payload under the session's
    * `metadata.goal`. Both go through `PATCH /session/{id}`.
    *
