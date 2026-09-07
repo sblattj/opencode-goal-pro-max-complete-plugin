@@ -32,6 +32,15 @@ import goalPlugin, {
   type GoalPluginOptions,
 } from "opencode-goal-plugin"
 import serverPlugin from "opencode-goal-plugin/server"
+import tuiPlugin, {
+  createGoalSidebar,
+  formatPanelTokens,
+  goalPanelModel,
+  tui,
+  type GoalPanelModel,
+  type GoalSidebarRuntime,
+  type GoalTuiPlugin,
+} from "opencode-goal-plugin/tui"
 
 const options = {
   sdkShape: "flat",
@@ -95,6 +104,33 @@ const sameServer: typeof GoalPlugin = goalPlugin.server
 const sameExport: typeof goalPlugin = serverPlugin
 void sameServer
 void sameExport
+
+// The ./tui target is a separate plugin module: it carries tui() and, per
+// readV1Plugin, must NOT also carry server().
+const sidebarRuntime: GoalSidebarRuntime = {
+  createMemo: (fn) => fn,
+  For: () => {},
+  Show: () => {},
+  jsx: (type, props) => ({ type, props }),
+}
+const sidebar = createGoalSidebar(sidebarRuntime)
+const sameTui: GoalTuiPlugin = sidebar.tui
+const entryTui: GoalTuiPlugin = tuiPlugin.tui
+const exportedTui: GoalTuiPlugin = tui
+const panel: GoalPanelModel | null = goalPanelModel({ objective: "ship it" })
+const marks: string[] = (panel?.actions ?? []).map((action) => action.mark)
+const budget: string = formatPanelTokens(1234)
+void sameTui
+void entryTui
+void exportedTui
+void marks
+void budget
+
+// @ts-expect-error the tui target must not also export server()
+tuiPlugin.server
+// @ts-expect-error the panel model is nullable when there is no goal
+const nonNullPanel: GoalPanelModel = goalPanelModel(null)
+void nonNullPanel
 
 // @ts-expect-error unknown hooks must not be hidden by an index signature
 hooks["experimental.missing.hook"]

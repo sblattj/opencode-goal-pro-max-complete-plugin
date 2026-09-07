@@ -10745,6 +10745,41 @@ test("a restart clears the sidebar payload the previous process left behind", as
   }
 })
 
+test("a goal cleared through the tool does not leave a dead status on the session", async () => {
+  // Found on a live opencode 1.18.29 run: `opencode run "/goal clear"` reaches
+  // the model as text, and the model answers it by calling the `clear_goal`
+  // TOOL rather than the slash command. Only the command path handed the
+  // sidebar back, so the tool path left the dead goal's title and
+  // `metadata.goal` on the session record forever.
+  const { hooks, updates } = await createTitleHooks()
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "ship it" },
+    { parts: [] },
+  )
+  assert.ok(
+    updates.some((update) => update.body?.metadata?.goal),
+    "the goal was rendered before it was cleared",
+  )
+  updates.length = 0
+
+  await hooks.tool.clear_goal.execute({}, { sessionID: "session-1" })
+  // The tool mutates state directly; the sidebar is reconciled on the next hook
+  // tick, which is the same idle event the rest of the loop runs on.
+  await hooks.event({ event: { type: "session.idle", properties: { sessionID: "session-1" } } })
+
+  const metadataWrites = updates.filter((update) => update.body?.metadata !== undefined)
+  assert.equal(metadataWrites.length, 1, `expected exactly one clearing write, got ${updates.length}`)
+  assert.equal(metadataWrites[0].body.metadata.goal, null)
+  assert.equal(metadataWrites[0].body.title, "my original title")
+
+  // Idempotent: a second idle tick must not keep re-clearing a session that
+  // already has no goal.
+  updates.length = 0
+  await hooks.event({ event: { type: "session.idle", properties: { sessionID: "session-1" } } })
+  assert.deepEqual(updates, [])
+  await hooks.dispose()
+})
+
 test("a status title left by a killed process is not restored as the user's title", async () => {
   // After a hard kill the session still carries the plugin's own status line.
   // Capturing that as the "original" would make /goal clear promote a stale
