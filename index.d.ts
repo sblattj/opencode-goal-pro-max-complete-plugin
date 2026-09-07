@@ -1,8 +1,8 @@
 /**
- * Type declarations for opencode-goal-plugin.
+ * Type declarations for opencode-goal-pro-max-complete-plugin.
  *
  * These describe the plugin-level configuration object accepted in
- * `opencode.json` under `plugin: [["opencode-goal-plugin", { ... }]]`,
+ * `opencode.json` under `plugin: [["opencode-goal-pro-max-complete-plugin", { ... }]]`,
  * and the shape of the module's exports.
  */
 
@@ -217,7 +217,7 @@ export interface CompletionAuditorOptions {
 }
 
 /**
- * Configuration options for opencode-goal-plugin. All fields are optional;
+ * Configuration options for opencode-goal-pro-max-complete-plugin. All fields are optional;
  * unset fields fall back to the plugin's built-in defaults. These act as
  * the default limits for every goal set in a session, and most of the
  * budget/behavior fields can be overridden per-goal via `/goal` command
@@ -651,7 +651,7 @@ export const testInternals: Readonly<Record<string, unknown>>
 
 /**
  * Default export consumed by OpenCode's plugin loader:
- * `{ "opencode-goal-plugin": { ... } }` in `opencode.json` resolves `id`
+ * `{ "opencode-goal-pro-max-complete-plugin": { ... } }` in `opencode.json` resolves `id`
  * and calls `server` to obtain the plugin's hooks.
  */
 declare const goalPlugin: {

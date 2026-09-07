@@ -1,6 +1,6 @@
 # Provider / model compatibility
 
-opencode-goal-plugin works with any model OpenCode can talk to, but two things
+opencode-goal-pro-max-complete-plugin works with any model OpenCode can talk to, but two things
 vary by provider and model:
 
 1. **Marker compliance** — whether the model reliably ends its response with
@@ -66,7 +66,7 @@ and any `nvidia`/`google` provider — add rows here as they're verified. See
 Some backends (notably certain Qwen deployments on vLLM, and several
 Llama.cpp/Mistral chat templates) reject a `system` role message that isn't
 the very first message in the conversation, with an error like `"System
-message must be at the beginning."` opencode-goal-plugin's
+message must be at the beginning."` opencode-goal-pro-max-complete-plugin's
 `experimental.chat.system.transform` hook, on hosts that invoke it, merges the
 goal continuation block into the primary system entry instead of appending a
 separate one, which avoids this. OpenCode 1.17.15 and 1.18.10 do not invoke that

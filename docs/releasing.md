@@ -26,7 +26,7 @@ verified npm tarball as a workflow artifact.
 Download that artifact, inspect it, and publish the tarball itself:
 
 ```sh
-npm publish opencode-goal-plugin-X.Y.Z.tgz --access public
+npm publish opencode-goal-pro-max-complete-plugin-X.Y.Z.tgz --access public
 ```
 
 Confirm the registry digest and unpacked contents match the locally reviewed

@@ -6,7 +6,7 @@ import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 
 const repository = fileURLToPath(new URL("..", import.meta.url))
-const root = await mkdtemp(join(tmpdir(), "opencode-goal-plugin-mutations-"))
+const root = await mkdtemp(join(tmpdir(), "opencode-goal-pro-max-complete-plugin-mutations-"))
 
 function matchCheckoutNewlines(value, source) {
   const newline = source.includes("\r\n") ? "\r\n" : "\n"

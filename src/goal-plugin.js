@@ -475,6 +475,11 @@ function makeTextPart(text, extra = {}) {
   return { type: "text", text, ...extra }
 }
 
+// WIRE IDENTIFIER, NOT THE PACKAGE NAME. The npm package is
+// "opencode-goal-pro-max-complete-plugin"; this metadata key — like the plugin
+// `id`, the log `service` field and the ~/.opencode-goal-plugin state paths —
+// deliberately keeps the historical "opencode-goal-plugin" string so an upgrade
+// from the old package keeps its in-flight session markers and its state file.
 function makeCommandPart(text, commandID = "") {
   return makeTextPart(text, {
     synthetic: true,

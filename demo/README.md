@@ -1,4 +1,4 @@
-# opencode-goal-plugin demo
+# opencode-goal-pro-max-complete-plugin demo
 
 A minimal, reproducible demo: a failing test suite and a `/goal` that fixes
 it autonomously, with no supervision after you set the goal.

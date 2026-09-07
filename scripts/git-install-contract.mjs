@@ -82,7 +82,7 @@ assert.ok(
   "bun is required to prove the committed bundles are current; install bun or run this contract on a host that has it",
 )
 
-const scratch = await mkdtemp(join(tmpdir(), "opencode-goal-plugin-dist-freshness-"))
+const scratch = await mkdtemp(join(tmpdir(), "opencode-goal-pro-max-complete-plugin-dist-freshness-"))
 function sha(buffer) {
   return createHash("sha256").update(buffer).digest("hex")
 }

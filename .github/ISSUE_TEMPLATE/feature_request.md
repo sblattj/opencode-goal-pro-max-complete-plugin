@@ -1,6 +1,6 @@
 ---
 name: Feature request
-about: Suggest an improvement for opencode-goal-plugin
+about: Suggest an improvement for opencode-goal-pro-max-complete-plugin
 title: ""
 labels: enhancement
 assignees: ""
@@ -17,7 +17,7 @@ Describe the workflow or pain point, not just the feature itself. -->
 
 ## How this fits the plugin's scope
 
-<!-- opencode-goal-plugin is a session-scoped /goal workflow for OpenCode:
+<!-- opencode-goal-pro-max-complete-plugin is a session-scoped /goal workflow for OpenCode:
 setting one or more persistent objectives (including ordered sequences),
 auto-continuing until they're done or blocked, with configurable safety
 limits, persistence, and an optional independent completion audit.

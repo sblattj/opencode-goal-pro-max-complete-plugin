@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- **Renamed: the npm package is now `opencode-goal-pro-max-complete-plugin`, and the repository moved to <https://github.com/sblattj/opencode-goal-pro-max-complete-plugin>.** Install specs, the `bin` name, the packaged tarball name and every doc, example and packaging contract that names the package change with it. The plugin's **wire and state identifiers are unchanged on purpose** — the part metadata key `metadata["opencode-goal-plugin"]`, the plugin `id`, the log `service` field, the `Symbol.for("opencode-goal-plugin.childWake")` flag, the legacy lease sentinels, and the legacy state paths `~/.opencode-goal-plugin/state.json` and `$XDG_STATE_HOME/opencode-goal-plugin/state.json` all keep the historical string — so an install upgraded from the old package keeps its goals, its persisted state and its in-flight session markers. No behavior change.
+  - Lineage: a fork of <https://github.com/willytop8/OpenCode-goal-plugin> (MIT), continued in <https://github.com/sblattj/OpenCode-goal-plugin> through v0.11.0.
+
 ## 0.11.0 — 2026-09-07
 
 - **New defaults for unattended work: unlimited auto-continue turns, an 8-hour window, and a 100,000,000-token spend budget** (was 10 turns / 15 minutes / 200,000 tokens). The old turn ceiling stopped healthy long runs for no reason. What replaces it, precisely: the no-tool-call and no-progress pauses catch within two turns a loop that has stopped *doing* anything, but **both are skipped for any turn that calls a tool**, so an agent re-running the same failing command with real output every turn trips neither — for that run the binding brakes are the 8-hour clock, the 100,000,000-token spend budget, and the model's own context window, with the budget wrap-up handoff at 80% of whichever arrives first — and that handoff **pauses the goal**, so 80% is the real ceiling and the 100% stop reasons fire only when one turn jumps the whole way. `maxDurationMs` is `28800000` and `maxTokens` is `100000000`; `warnDurationMsRemaining` is rescaled from `60000` to `600000` (10 minutes; 60 seconds is 0.2 % of an 8-hour window). Every other option in the defaults block is unchanged.

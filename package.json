@@ -1,5 +1,5 @@
 {
-  "name": "opencode-goal-plugin",
+  "name": "opencode-goal-pro-max-complete-plugin",
   "version": "0.11.0",
   "description": "Durable, guarded goal workflows for OpenCode.",
   "type": "module",
@@ -23,7 +23,7 @@
     }
   },
   "bin": {
-    "opencode-goal-plugin": "./scripts/verify.mjs"
+    "opencode-goal-pro-max-complete-plugin": "./scripts/verify.mjs"
   },
   "files": [
     "dist",
@@ -74,12 +74,12 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/sblattj/OpenCode-goal-plugin.git"
+    "url": "git+https://github.com/sblattj/opencode-goal-pro-max-complete-plugin.git"
   },
   "bugs": {
-    "url": "https://github.com/sblattj/OpenCode-goal-plugin/issues"
+    "url": "https://github.com/sblattj/opencode-goal-pro-max-complete-plugin/issues"
   },
-  "homepage": "https://github.com/sblattj/OpenCode-goal-plugin#readme",
+  "homepage": "https://github.com/sblattj/opencode-goal-pro-max-complete-plugin#readme",
   "author": {
     "name": "Stephen Blatt"
   },

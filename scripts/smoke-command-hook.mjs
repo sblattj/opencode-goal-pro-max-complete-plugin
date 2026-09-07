@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import pluginModule, { GoalPlugin } from "opencode-goal-plugin"
+import pluginModule, { GoalPlugin } from "opencode-goal-pro-max-complete-plugin"
 
 const expectedTools = [
   "clear_goal",
@@ -100,4 +100,4 @@ assert.match(logCalls[0].body.message, /Goal (?:active|started)/i)
 assert.match(logCalls[1].body.message, /Goal cleared/i)
 assert.ok(logCalls.every((entry) => !entry.body.message.includes("ship a smoke test")))
 
-console.log("opencode-goal-plugin command hook smoke passed")
+console.log("opencode-goal-pro-max-complete-plugin command hook smoke passed")
