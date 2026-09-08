@@ -2012,6 +2012,10 @@ function normalizePersistedGoal(rawGoal) {
     checkpoints: checkpoints.slice(-MAX_CHECKPOINTS),
     lastCheckpoint,
     skipNextTerminalCheck: rawGoal.skipNextTerminalCheck === true,
+    // v1.0.1 todo mirror (T8): a record written before this release carries no
+    // `mirror` key at all; normalizeMirror(undefined) gives it the empty,
+    // never-mirrored default.
+    mirror: normalizeMirror(rawGoal.mirror),
   }
 }
 
@@ -4153,6 +4157,9 @@ function buildGoalState(sessionID, condition, options, meta = {}, lastStatus = "
     checkpoints: [],
     lastCheckpoint: null,
     skipNextTerminalCheck: false,
+    // v1.0.1 todo mirror (T8): a brand-new goal always carries a mirror
+    // record, so callers never have to guard `goal.mirror` before it exists.
+    mirror: normalizeMirror(),
   }
 }
 
@@ -5388,16 +5395,51 @@ function normalizeMirrorMode(value) {
 
 // >>> v101:T8 the persisted mirror record, read side
 /**
+ * Coerces a single mirror row to the T3 `mirrorRow` shape (`{ content, status,
+ * priority }`, all strings, with the same defaults T3 documents: missing
+ * status -> "pending", missing priority -> "medium", empty/missing content ->
+ * "(untitled)"). T3's own `mirrorRow` is a scaffold stub that throws
+ * unconditionally (`throw new Error("v1.0.1 T3: not implemented")`), so it
+ * cannot be called here yet; this coerces inline with `String(...)` instead,
+ * matching T3's documented contract so the two behave identically once T3
+ * lands.
+ */
+function normalizeMirrorRow(raw) {
+  const source = raw && typeof raw === "object" ? raw : {}
+  const content = source.content === undefined || source.content === null || source.content === ""
+    ? "(untitled)"
+    : String(source.content)
+  const status = source.status === undefined || source.status === null || source.status === ""
+    ? "pending"
+    : String(source.status)
+  const priority = source.priority === undefined || source.priority === null || source.priority === ""
+    ? "medium"
+    : String(source.priority)
+  return { content, status, priority }
+}
+
+function normalizeMirrorRows(raw) {
+  return Array.isArray(raw) ? raw.map(normalizeMirrorRow) : []
+}
+
+/**
  * `normalizeMirror(raw)` -> `{ fingerprint: string, at: number, rows: row[], nudges: number,
  * extra: row[] }` with defaults `{ "", 0, [], 0, [] }`, each field coerced; wired into
  * `normalizePersistedGoal` (`goal.mirror = normalizeMirror(rawGoal.mirror)`) and into the in-memory
  * goal record creation. No write-side change (`serializeGoal` spreads the goal).
- * SCAFFOLD STUB: minimal and un-hardened (no per-field coercion, no call sites) so a goal record
- * carrying a mirror field never throws before T8 lands; T8 hardens it and wires it.
  */
 function normalizeMirror(raw) {
   const source = raw && typeof raw === "object" ? raw : {}
-  return { fingerprint: "", at: 0, rows: [], nudges: 0, extra: [], ...source }
+  return {
+    fingerprint:
+      source.fingerprint === undefined || source.fingerprint === null
+        ? ""
+        : String(source.fingerprint),
+    at: toNonNegativeInteger(source.at),
+    rows: normalizeMirrorRows(source.rows),
+    nudges: toNonNegativeInteger(source.nudges),
+    extra: normalizeMirrorRows(source.extra),
+  }
 }
 // <<< v101:T8
 
