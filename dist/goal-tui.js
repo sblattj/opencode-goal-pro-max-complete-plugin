@@ -112,7 +112,7 @@ function normalizeAction(raw) {
     status,
     verdict,
     mark: ACTION_MARKS[status],
-    verified: status === "done" && verdict === "pass"
+    verified: status === "done" && (typeof raw.verified === "boolean" ? raw.verified : verdict === "pass")
   };
 }
 var PANEL_EXCEPTION_GROUPS = [
