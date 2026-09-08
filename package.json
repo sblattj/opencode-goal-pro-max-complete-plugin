@@ -23,12 +23,16 @@
     }
   },
   "bin": {
-    "opencode-goal-pro-max-complete-plugin": "./scripts/verify.mjs"
+    "opencode-goal-pro-max-complete-plugin": "./scripts/cli.mjs"
   },
   "files": [
     "dist",
     "src",
+    "scripts/cli.mjs",
+    "scripts/install.mjs",
     "scripts/verify.mjs",
+    "skills",
+    "install.sh",
     "examples",
     "demo",
     "docs",
@@ -54,6 +58,7 @@
     "smoke:git-install": "node scripts/git-install-contract.mjs",
     "benchmark:behavior": "node scripts/behavior-benchmark.mjs",
     "verify": "node scripts/verify.mjs",
+    "installer": "node scripts/cli.mjs",
     "check": "node -c src/goal-plugin.js && node -c src/goal-tui.js && node -c src/goal-sidebar-view.js && node -c src/goal-format.js && npm test",
     "bundle": "npm run bundle:server && npm run bundle:tui",
     "bundle:server": "bun build ./src/goal-plugin.js --outfile ./dist/goal-plugin.js --target node",
