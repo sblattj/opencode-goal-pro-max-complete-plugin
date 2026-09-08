@@ -20,6 +20,8 @@ const REQUIRED_HOOKS = [
   "chat.message",
   "command.execute.before",
   "tool.execute.before",
+  "tool.execute.after",
+  "tool.definition",
   "event",
   "experimental.chat.system.transform",
   "experimental.compaction.autocontinue",
