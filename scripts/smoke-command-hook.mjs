@@ -105,9 +105,14 @@ assert.match(activeStatus, /Completion audit: evidence gate only \(independent v
 assert.match(await runGoalCommand("clear"), /Goal cleared/)
 assert.match(await runGoalCommand("status"), /No active goal/)
 assert.equal(promptCalls.length, 0)
-assert.deepEqual(logCalls.map((entry) => entry.body.extra.kind), ["goal-lifecycle", "goal-lifecycle"])
-assert.match(logCalls[0].body.message, /Goal (?:active|started)/i)
-assert.match(logCalls[1].body.message, /Goal cleared/i)
+// Lifecycle entries are selected by kind rather than by position: the
+// <existing_todos> probe logs one `warn` on a host whose SDK has no
+// `client.session.todo` (the client above is exactly that host), and a warn
+// carries no `extra`. The leak assertion still covers EVERY entry.
+const lifecycleLogs = logCalls.filter((entry) => entry.body?.extra?.kind === "goal-lifecycle")
+assert.deepEqual(lifecycleLogs.map((entry) => entry.body.extra.kind), ["goal-lifecycle", "goal-lifecycle"])
+assert.match(lifecycleLogs[0].body.message, /Goal (?:active|started)/i)
+assert.match(lifecycleLogs[1].body.message, /Goal cleared/i)
 assert.ok(logCalls.every((entry) => !entry.body.message.includes("ship a smoke test")))
 
 console.log(`${packageName} command hook smoke passed`)
