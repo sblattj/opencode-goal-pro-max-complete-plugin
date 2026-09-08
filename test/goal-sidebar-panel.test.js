@@ -315,6 +315,20 @@ test("the panel registers a sidebar_content view and logs that it did", async ()
 
   assert.equal(registrations.length, 1)
   assert.equal(typeof registrations[0].order, "number")
+  // The direction the registration's own comment claims, asserted rather than
+  // narrated: opencode's builtin Todo section registers order 400
+  // (packages/tui/src/feature-plugins/sidebar/todo.tsx) and @opentui/core 0.4.5
+  // sorts sidebar plugins ASCENDING (getSortedPlugins compares leftOrder minus
+  // rightOrder), so the LARGER order renders further down a column. Lower this
+  // panel's order below 400 and the Goal panel moves above the todos it annotates.
+  const builtinTodoOrder = 400
+  const column = [
+    { name: "todo", order: builtinTodoOrder },
+    { name: "goal", order: registrations[0].order },
+  ]
+    .sort((left, right) => left.order - right.order)
+    .map((entry) => entry.name)
+  assert.deepEqual(column, ["todo", "goal"], "the Goal panel must render below the builtin Todo section")
   assert.deepEqual(Object.keys(registrations[0].slots), ["sidebar_content"])
   assert.equal(logged.length, 1)
   assert.equal(logged[0].body.service, "opencode-goal-plugin")
