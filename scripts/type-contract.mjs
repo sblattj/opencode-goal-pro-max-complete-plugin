@@ -36,6 +36,7 @@ import goalPlugin, {
   type CompletionAuditContext,
   type GoalPluginHooks,
   type GoalPluginOptions,
+  type GoalSidebarStatus,
 } from "${packageName}"
 import serverPlugin from "${packageName}/server"
 import tuiPlugin, {
@@ -74,6 +75,7 @@ const options = {
   registerCommand: true,
   registerTools: true,
   registerAgents: true,
+  mirrorTodos: "plan",
   goalAgentName: "objective",
   verifierAgentName: "objective-check",
   completionAudit: true,
@@ -95,6 +97,10 @@ const options = {
 const invalidLifecycleMessages: GoalPluginOptions = { lifecycleMessages: "yes" }
 void invalidLifecycleMessages
 
+// @ts-expect-error mirrorTodos must be "plan" or "off"
+const invalidMirrorTodos: GoalPluginOptions = { mirrorTodos: "auto" }
+void invalidMirrorTodos
+
 const hooks: GoalPluginHooks = await GoalPlugin({ client: {}, directory: "/tmp" }, options)
 hooks.config({})
 hooks.event({})
@@ -102,9 +108,17 @@ hooks["chat.params"]({})
 hooks["chat.message"]({}, {})
 hooks["experimental.chat.system.transform"]({}, {})
 hooks["tool.execute.before"]({}, {})
+hooks["tool.execute.after"]({}, {})
+hooks["tool.definition"]({}, {})
 hooks["experimental.compaction.autocontinue"]({}, {})
 hooks["experimental.session.compacting"]({}, {})
 await hooks.dispose()
+
+declare const status: GoalSidebarStatus
+const mirrorState: "fresh" | "stale" | "off" = status.plan.mirror.state
+const mirrorRows: number = status.plan.mirror.rows
+void mirrorState
+void mirrorRows
 
 const sameServer: typeof GoalPlugin = goalPlugin.server
 const sameExport: typeof goalPlugin = serverPlugin
@@ -124,6 +138,7 @@ const sameTui: GoalTuiPlugin = sidebar.tui
 const entryTui: GoalTuiPlugin = tuiPlugin.tui
 const exportedTui: GoalTuiPlugin = tui
 const panel: GoalPanelModel | null = goalPanelModel({ objective: "ship it" })
+const panelWithLiveCount: GoalPanelModel | null = goalPanelModel({ objective: "ship it" }, { liveTodoCount: 3 })
 const marks: string[] = (panel?.actions ?? []).map((action) => action.mark)
 const budget: string = formatPanelTokens(1234)
 // The panel forwards the payload's plan.mirror.state verbatim, so the model can
@@ -137,6 +152,7 @@ void entryTui
 void exportedTui
 void marks
 void budget
+void panelWithLiveCount
 void forwardedMirrorState
 
 // @ts-expect-error the tui target must not also export server()
