@@ -12824,7 +12824,159 @@ test("the terminal sidebar render keeps the context ceiling learned from the mod
 
 
 // >>> v101:T5 tests - isMirrorOwnedRow / pickExtras
-// T5 units: 12, 14, 15.
+// T5 units: 12 (picker half), 14, 15, and the pure half of 15b.
+//
+// INTEGRATOR: the four units named in the inventory drive `pickExtras` over rows
+// the model authored, and every kept row goes through `mirrorRow` (T3) and
+// `boundExtraContent` (T6) - both still scaffold stubs that throw. So those four
+// carry `{ todo: T5_TODO_UNTIL_WAVE1 }`: they run, they report the real stub
+// error, and they turn green by DELETING that option once T3 and T6 land. The
+// assertions in them are final; nothing about them is provisional.
+// The three units that need no stub - `isMirrorOwnedRow`, and the `pickExtras`
+// paths where nothing is kept - assert for real today, and the all-owned case is
+// falsifiable evidence for "owned rows are excluded": pick a plan row by mistake
+// and the T3 stub throws.
+// `testInternals` is destructured inside each test rather than at the top of the
+// file so that nine parallel wave-1 regions cannot collide on one module-scope
+// const.
+const T5_TODO_UNTIL_WAVE1 = "lands with wave-1 integration"
+
+function t5MirrorGoal(ids = ["a1", "a2"]) {
+  return { plan: { actions: ids.map((id) => ({ id, title: `action ${id}`, status: "pending" })) } }
+}
+
+test("the plan's own mirrored rows and the overflow row are never picked as extras", () => {
+  const { isMirrorOwnedRow, pickExtras, MIRROR_ID_SEPARATOR } = testInternals
+  const goal = t5MirrorGoal(["a1", "a2"])
+
+  assert.equal(isMirrorOwnedRow(`a1${MIRROR_ID_SEPARATOR}Ship the thing`, goal), true)
+  assert.equal(
+    isMirrorOwnedRow(`a2${MIRROR_ID_SEPARATOR}Ship it — needs claim/evidence/verdict`, goal),
+    true,
+    "a suffix does not stop the id prefix from identifying the row",
+  )
+  assert.equal(isMirrorOwnedRow("+7 more actions — /goal status", goal), true)
+
+  // The controls. An id the plan no longer carries stops being owned, so a row
+  // left over from a replaced plan becomes the model's again instead of being
+  // silently swallowed; and the overflow row is matched on its exact bytes.
+  assert.equal(isMirrorOwnedRow(`a9${MIRROR_ID_SEPARATOR}A deleted action`, goal), false)
+  assert.equal(isMirrorOwnedRow("a1 Ship the thing", goal), false, "no separator, not ours")
+  assert.equal(isMirrorOwnedRow("Run the linter", goal), false)
+  assert.equal(isMirrorOwnedRow("+7 more actions - /goal status", goal), false, "hyphen, not the em dash")
+  assert.equal(isMirrorOwnedRow("+ more actions — /goal status", goal), false, "no count, not ours")
+  assert.equal(isMirrorOwnedRow(undefined, goal), false)
+  assert.equal(isMirrorOwnedRow("", goal), false)
+  assert.equal(isMirrorOwnedRow(`a1${MIRROR_ID_SEPARATOR}Ship it`, undefined), false, "no goal, no ids")
+
+  // And the picker drops exactly those. This is the one pickExtras path that
+  // never reaches the still-stubbed coercion, so it can assert today: keep a
+  // plan row by mistake and the T3 stub throws instead of passing.
+  assert.deepEqual(
+    pickExtras(
+      [
+        { content: `a1${MIRROR_ID_SEPARATOR}Ship the thing`, status: "pending", priority: "high" },
+        { content: `a2${MIRROR_ID_SEPARATOR}Land the follow-up`, status: "completed", priority: "low" },
+        { content: "+7 more actions — /goal status", status: "pending", priority: "low" },
+      ],
+      goal,
+    ),
+    { extra: [], dropped: 0 },
+  )
+})
+
+test("a todowrite carrying no usable todos list leaves the extras empty and drops nothing", () => {
+  const { pickExtras } = testInternals
+  const goal = t5MirrorGoal()
+  for (const incoming of [undefined, null, [], "todos", 7, { length: 1, 0: { content: "mine" } }]) {
+    assert.deepEqual(pickExtras(incoming, goal), { extra: [], dropped: 0 }, `for ${JSON.stringify(incoming)}`)
+  }
+})
+
+test("pickExtras never mutates the incoming todos array the host still holds", () => {
+  const { pickExtras, MIRROR_ID_SEPARATOR } = testInternals
+  const goal = t5MirrorGoal(["a1"])
+  const row = { content: `a1${MIRROR_ID_SEPARATOR}Ship it`, status: "pending", priority: "high" }
+  const incoming = [row]
+  const before = structuredClone(incoming)
+  const result = pickExtras(incoming, goal)
+  assert.deepEqual(incoming, before, "the array the host reads back is untouched")
+  assert.equal(incoming[0], row, "and it still holds the caller's own row object")
+  assert.deepEqual(result, { extra: [], dropped: 0 })
+})
+
+test("rows the model authored are kept after the plan rows and capped", { todo: T5_TODO_UNTIL_WAVE1 }, () => {
+  const { pickExtras, MIRROR_MAX_EXTRAS, MIRROR_ID_SEPARATOR } = testInternals
+  const goal = t5MirrorGoal(["a1", "a2"])
+  const mine = Array.from({ length: MIRROR_MAX_EXTRAS + 4 }, (_, i) => ({
+    content: `mine ${i + 1}`,
+    status: "pending",
+    priority: "medium",
+  }))
+  const incoming = [
+    { content: `a1${MIRROR_ID_SEPARATOR}Ship the thing`, status: "pending", priority: "high" },
+    ...mine,
+    { content: "+7 more actions — /goal status", status: "pending", priority: "low" },
+  ]
+
+  const { extra, dropped } = pickExtras(incoming, goal)
+  assert.equal(extra.length, MIRROR_MAX_EXTRAS)
+  assert.equal(dropped, 4)
+  assert.deepEqual(
+    extra.map((r) => r.content),
+    mine.slice(0, MIRROR_MAX_EXTRAS).map((r) => r.content),
+    "the kept rows are the non-owned ones, in the order the model sent them",
+  )
+})
+
+test("a non-empty todowrite redefines the extras from that call", { todo: T5_TODO_UNTIL_WAVE1 }, () => {
+  const { pickExtras } = testInternals
+  const goal = t5MirrorGoal(["a1"])
+
+  const first = pickExtras([{ content: "read the ADR" }, { content: "ask about the cap" }], goal)
+  assert.deepEqual(first.extra.map((r) => r.content), ["read the ADR", "ask about the cap"])
+
+  const second = pickExtras([{ content: "only this one now" }], goal)
+  assert.deepEqual(second.extra.map((r) => r.content), ["only this one now"])
+  assert.equal(second.dropped, 0)
+
+  // The picker is pure: the second call defines the extras on its own, and it
+  // did not reach back into the first call's answer.
+  assert.deepEqual(first.extra.map((r) => r.content), ["read the ADR", "ask about the cap"])
+})
+
+test("an incoming row missing priority is coerced rather than passed through", { todo: T5_TODO_UNTIL_WAVE1 }, () => {
+  const { pickExtras } = testInternals
+  const goal = t5MirrorGoal(["a1"])
+  const { extra } = pickExtras(
+    [{ content: "no priority on this one" }, { content: "", status: "in_progress" }, { content: "  spaced  out  " }],
+    goal,
+  )
+  assert.deepEqual(extra, [
+    { content: "no priority on this one", status: "pending", priority: "medium" },
+    { content: "(untitled)", status: "in_progress", priority: "medium" },
+    { content: "spaced out", status: "pending", priority: "medium" },
+  ])
+  for (const row of extra) {
+    for (const [field, value] of Object.entries(row)) {
+      assert.equal(typeof value, "string", `${field} reaches the host as a string`)
+    }
+  }
+})
+
+test("pickExtras reports how many model rows the cap dropped", { todo: T5_TODO_UNTIL_WAVE1 }, () => {
+  const { pickExtras, MIRROR_MAX_EXTRAS } = testInternals
+  const goal = t5MirrorGoal(["a1"])
+  const rows = (n) => Array.from({ length: n }, (_, i) => ({ content: `mine ${i + 1}` }))
+
+  assert.equal(pickExtras(rows(MIRROR_MAX_EXTRAS), goal).dropped, 0, "a full list at the cap drops nothing")
+  assert.equal(pickExtras(rows(MIRROR_MAX_EXTRAS + 1), goal).dropped, 1)
+
+  const over = pickExtras(rows(MIRROR_MAX_EXTRAS + 14), goal)
+  assert.equal(over.dropped, 14)
+  assert.equal(over.extra.length, MIRROR_MAX_EXTRAS)
+  assert.equal(over.extra.at(-1).content, `mine ${MIRROR_MAX_EXTRAS}`, "the cap keeps the first rows, not the last")
+})
 // <<< v101:T5
 
 

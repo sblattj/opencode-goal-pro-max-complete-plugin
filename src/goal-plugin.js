@@ -5337,7 +5337,23 @@ function mirrorFingerprint(rows) {
  * `^\+\d+ more actions — \/goal status$`.
  */
 function isMirrorOwnedRow(content, goal) {
-  throw new Error("v1.0.1 T5: not implemented")
+  // Only a string can be a row this plugin wrote: every projected row's content
+  // comes out of a template literal. A row with a non-string content is by
+  // definition the model's own, so it is NOT owned and survives as an extra.
+  if (typeof content !== "string" || content === "") return false
+  // The one synthetic row the projector emits for a plan longer than the cap
+  // (T2). It carries no action id, so only its exact shape identifies it; miss
+  // it and every refresh would append a fresh copy of it as a model row.
+  if (/^\+\d+ more actions — \/goal status$/.test(content)) return true
+  const actions = goal?.plan?.actions
+  if (!Array.isArray(actions)) return false
+  // "currently in the plan": an action deleted by a goal_plan_set no longer owns
+  // its old row, so that row becomes an extra rather than a ghost the projector
+  // silently drops.
+  return actions.some((action) => {
+    const id = action?.id
+    return typeof id === "string" && id !== "" && content.startsWith(`${id}${MIRROR_ID_SEPARATOR}`)
+  })
 }
 
 /**
@@ -5347,7 +5363,23 @@ function isMirrorOwnedRow(content, goal) {
  * `{ extra: [], dropped: 0 }`.
  */
 function pickExtras(incoming, goal) {
-  throw new Error("v1.0.1 T5: not implemented")
+  // A missing or malformed args.todos is not an error here: the caller still
+  // needs a shape to spread, and "the model contributed nothing" is the right
+  // reading of a call that carried no list.
+  if (!Array.isArray(incoming)) return { extra: [], dropped: 0 }
+  const candidates = incoming.filter((row) => !isMirrorOwnedRow(row?.content, goal))
+  const kept = candidates.slice(0, MIRROR_MAX_EXTRAS)
+  // Bound first, then coerce: boundExtraContent (T6) maps a missing content to
+  // "", which mirrorRow (T3) turns into "(untitled)" rather than "undefined".
+  // `incoming` itself is never touched - the host reads that same array back.
+  const extra = kept.map((row) =>
+    mirrorRow({
+      content: boundExtraContent(row?.content),
+      status: row?.status,
+      priority: row?.priority,
+    }),
+  )
+  return { extra, dropped: candidates.length - kept.length }
 }
 // <<< v101:T5
 
