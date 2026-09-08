@@ -172,6 +172,39 @@ try {
     assert.ok(info?.isFile(), `${kind} entrypoint ${entry} is missing from the tarball`)
   }
 
+  // 2b. The easy installer and the skill must be IN the tarball. `npx -y
+  //     github:sblattj/<pkg> install` runs the bin out of exactly these bytes,
+  //     and the skill is the file the installer copies into the OpenCode config
+  //     directory — a `files` list that forgets either one ships a package
+  //     whose documented install command does nothing.
+  const shipped = [
+    "scripts/cli.mjs",
+    "scripts/install.mjs",
+    "scripts/verify.mjs",
+    "install.sh",
+    "docs/install.md",
+    "skills/using-the-goal-plugin/SKILL.md",
+  ]
+  for (const relative of shipped) {
+    const info = await stat(join(installedRoot, relative)).catch(() => undefined)
+    assert.ok(info?.isFile(), `${relative} is missing from the tarball (package.json "files")`)
+  }
+  assert.equal(manifest.bin?.[packageName], "./scripts/cli.mjs", "the package bin must be the installer CLI")
+
+  const packedSkillPath = join(installedRoot, "skills", "using-the-goal-plugin", "SKILL.md")
+  const packedSkill = await readFile(packedSkillPath, "utf8")
+  const frontmatter = /^---\n([\s\S]*?)\n---\n/.exec(packedSkill)
+  assert.ok(frontmatter, "the packed SKILL.md must open with frontmatter or opencode will not list it")
+  assert.match(frontmatter[1], /^name: using-the-goal-plugin$/m)
+  const skillDescription = /^description:\s*(.+)$/m.exec(frontmatter[1])
+  assert.ok(skillDescription, "the packed SKILL.md must declare a description")
+  assert.ok(skillDescription[1].trim().length > 40, "the description is what makes the skill fire")
+  const [sourceSkill, tarballSkill] = await Promise.all([
+    readFile(new URL("skills/using-the-goal-plugin/SKILL.md", repository)),
+    readFile(packedSkillPath),
+  ])
+  assert.ok(sourceSkill.equals(tarballSkill), "the packed skill must be the working tree's bytes")
+
   // 3. Host runtime modules the TUI plugin imports, stubbed. These must resolve
   //    from the consumer's node_modules, which only works if the bundle kept
   //    them external.
