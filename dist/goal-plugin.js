@@ -20013,6 +20013,8 @@ ${note}`;
         return;
       if (!output || typeof output.description !== "string")
         return;
+      if (output.description.includes(TODOWRITE_MIRROR_DESCRIPTION))
+        return;
       output.description = `${output.description}
 
 ${TODOWRITE_MIRROR_DESCRIPTION}`;

@@ -14964,6 +14964,30 @@ test("the todowrite description carries the mirror clause whenever mirrorTodos i
   assert.deepEqual(offOutput.parameters, { todos: {} })
 })
 
+test("the todowrite description suffix is stamped at most once against a reused definition object", async () => {
+  const { hooks } = await createHooks()
+
+  // The exposure this guards (H-F3): a host that hands the SAME description
+  // object back, or this plugin registered twice in one directory, would
+  // otherwise append the paragraph again. OpenCode itself rebuilds the object
+  // per `tools()` call, so this is defensive only. The clause opens with
+  // `GOAL PLUGIN:`, so counting that head counts stamps.
+  const reused = { description: "Base todowrite text", parameters: {} }
+  await hooks["tool.definition"]({ toolID: "todowrite" }, reused)
+  await hooks["tool.definition"]({ toolID: "todowrite" }, reused)
+  assert.equal(reused.description.split("GOAL PLUGIN:").length - 1, 1)
+  assert.equal(reused.description.split(T22_MIRROR_CLAUSE).length - 1, 1)
+  assert.equal(reused.description, `Base todowrite text\n\n${T22_MIRROR_CLAUSE}`)
+
+  // The control: the guard suppresses the second stamp on ONE object, not every
+  // stamp after the first call — a fresh object off the same plugin instance
+  // still gets exactly one.
+  const fresh = { description: "Base todowrite text", parameters: {} }
+  await hooks["tool.definition"]({ toolID: "todowrite" }, fresh)
+  assert.equal(fresh.description.split("GOAL PLUGIN:").length - 1, 1)
+  assert.equal(fresh.description, `Base todowrite text\n\n${T22_MIRROR_CLAUSE}`)
+})
+
 test("the description suffix is appended, not substituted", async () => {
   const { hooks } = await createHooks()
   const multilineHostText = `${T22_HOST_DESCRIPTION}\n\nUsage notes:\n- Mark exactly one task in_progress at a time.\n- Complete tasks as you finish them.`

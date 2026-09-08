@@ -810,6 +810,22 @@ const mutants = [
     test: "test/goal-plugin.test.js",
   },
   {
+    name: "the todowrite description suffix is stamped once per object",
+    file: "src/goal-plugin.js",
+    // Gap left open by the kill-switch record above: it proves the suffix obeys
+    // "off", not that it lands at most once. Drop this idempotence guard and a
+    // host that hands the SAME description object back — or a second
+    // registration of this plugin in one directory — appends the mirror
+    // paragraph again, so the model reads the clause twice. The whole line is
+    // anchored (indent and newline included) so the mutant deletes it cleanly,
+    // the same shape the modelContextTokens record above uses. Killed by "the
+    // todowrite description suffix is stamped at most once against a reused
+    // definition object".
+    from: "      if (output.description.includes(TODOWRITE_MIRROR_DESCRIPTION)) return\n",
+    to: "",
+    test: "test/goal-plugin.test.js",
+  },
+  {
     name: "the panel's exception list is ordered by what a human must act on first",
     file: "src/goal-sidebar-view.js",
     // Gap left open by wave 4: this contract had no record for the panel file at
