@@ -2977,6 +2977,15 @@ function buildContinueMessage(
     completionUnverified = false,
     blockerUnstated = false,
     completionRejection = "",
+    // v1.0.1 T19: the todo-mirror mode, so the continuation can carry the
+    // staleness nudge (T14) when the mirror has drifted from the plan. Both
+    // production call sites build-and-send in the same step (no preview/probe
+    // path), so computing it here — once per actual continuation — is safe.
+    // Defaults to "off" (not `normalizeMirrorMode`'s "plan" default) so every
+    // OTHER caller of this function — direct unit tests, and any future one
+    // that does not thread mirrorMode through — reproduces the pre-T19,
+    // byte-for-byte continuation unless it explicitly opts in.
+    mirrorMode = "off",
   } = {},
 ) {
   const remainingTokens = Math.max(0, goal.options.maxTokens - goalSpendTokens(goal))
@@ -3017,11 +3026,17 @@ function buildContinueMessage(
   // system block, which is re-injected on the same turn. Repeating them in the
   // continuation would double their cost for no extra signal.
   const planRender = formatPlanForPrompt(goal.plan)
+  // v1.0.1 T19: the mirror nudge (T14) is a plain continuation line, not part
+  // of the <goal_plan> block's own contract text — it lives inside the array
+  // so the existing `.filter(Boolean)` drops it when mirrorNudgeLine returns
+  // "" (mode off, no plan, mirror fresh, or budget exhausted), keeping the
+  // steady-state continuation byte-for-byte what it is today.
   lines.push(
     ...[
       "<goal_plan>",
       planRender || "none — call goal_plan_set([{id,title},…]) first.",
       planRender ? `progress: ${planStatusLabel(goal.plan)}; done needs claim+evidence+verdict=pass.` : "",
+      mirrorNudgeLine(goal, mirrorMode),
       "</goal_plan>",
     ].filter(Boolean),
   )
@@ -8396,7 +8411,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
                 ...continuationContextInput(claimedGoal),
                 parts: [
                   makeContinuationPart(
-                    buildContinueMessage(claimedGoal, { budgetWrapup: true }),
+                    buildContinueMessage(claimedGoal, { budgetWrapup: true, mirrorMode }),
                     continueToken,
                   ),
                 ],
@@ -8699,6 +8714,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
                   completionUnverified,
                   blockerUnstated,
                   completionRejection,
+                  mirrorMode,
                 }),
                 continueToken,
               ),
