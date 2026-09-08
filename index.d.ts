@@ -82,9 +82,12 @@ export interface GoalSidebarStatus {
    * GoalSidebarStatus.turns}`.max` nullable for an unlimited budget, added
    * {@link GoalSidebarStatus.durationMs} and {@link GoalSidebarStatus.context},
    * and redefined {@link GoalSidebarStatus.tokens}`.used` as cumulative token
-   * spend rather than context size; v1 fields are all still written.
+   * spend rather than context size; v1 fields are all still written. v3
+   * (v1.0.1) added {@link GoalSidebarStatus.plan}`.mirror` (the todo-mirror
+   * state/rows/extra/at snapshot); every v2 field is still written, and a
+   * consumer pinned to v2 simply never reads the new key.
    */
-  v: 2
+  v: 3
   goalId: string
   /**
    * `completed` is the terminal state of an archived goal. A failure surfaces as
@@ -133,6 +136,20 @@ export interface GoalSidebarStatus {
     total: number
     verified: number
     blocked: number
+    /**
+     * The todo-mirror snapshot, added in v3. Reflects
+     * {@link GoalPluginOptions.mirrorTodos}, not a separate per-goal switch:
+     * `state` is `"off"` for the whole payload's lifetime when the plugin
+     * option is `"off"`, and otherwise `"fresh"` when the OpenCode session's
+     * native Todo list currently matches a fresh projection of this plan
+     * (plus any kept rows of the model's own), or `"stale"` when it does
+     * not (or has never been written). `rows` and `extra` are the row
+     * counts last stamped into the Todo list — the plan rows and the
+     * model-authored rows kept alongside them, respectively — and `at` is
+     * the epoch-millisecond time of that stamp, or `0` if the Todo list has
+     * never been written for this goal.
+     */
+    mirror: { state: "fresh" | "stale" | "off"; rows: number; extra: number; at: number }
     actions: Array<Pick<GoalPlanAction, "id" | "title" | "status" | "verdict">>
   }
   successCriteria?: string
@@ -489,6 +506,25 @@ export interface GoalPluginOptions {
 
   /** Register collision-safe native `goal` and `goal-verify` agents through OpenCode's config hook. */
   registerAgents?: boolean
+
+  /**
+   * Whether the plugin redraws the OpenCode session's native Todo list from
+   * the goal's verified action plan on every `todowrite` call: `"plan"`
+   * projects the plan's actions as rows (plus, below them, up to 10 rows the
+   * model wrote itself), keeping the panel and the plan from drifting apart;
+   * `"off"` restores stock v1.0.0 `todowrite` behavior exactly, on every
+   * surface: the tool call itself, its result, the continuation prompt, the
+   * system block, the compaction context, the `todowrite` tool description,
+   * and the `goal_plan_set`/`goal_action_update` tool descriptions are all
+   * byte-identical to v1.0.0 — the mirror hooks return before touching
+   * anything and every prompt surface is gated on this option. The live mirror
+   * state, row count, extra-row count, and last-stamped
+   * time are published in {@link GoalSidebarStatus.plan}`.mirror` and
+   * rendered by the sidebar panel; an unrecognized value falls back to
+   * `"plan"`.
+   * @default "plan"
+   */
+  mirrorTodos?: "plan" | "off"
 
   /**
    * Mirror live goal status into the OpenCode sidebar. The plugin writes the
