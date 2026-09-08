@@ -6766,8 +6766,47 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
 
 
       // >>> v101:T11 todowrite mirror: the empty-call interception (X1)
-      // Reserved. T11 fills this with the A1 ladder, placed BEFORE the `!goal` return and AFTER
-      // the `mirrorMode === "off"` return that T10 writes.
+      // `todowrite({todos: []})` is the refresh idiom the plugin teaches, so an
+      // empty list is never a native "clear my todo list" instruction: it is a
+      // request to redraw. Letting it reach the host would wipe the panel — the
+      // single worst failure this feature can produce — so the ladder below
+      // guarantees the host never sees `[]` when there is anything to re-emit.
+      //
+      // Order matters (addendum A1). A live plan RE-PROJECTS rather than
+      // re-emitting `goal.mirror.rows`: the rows last written are stale by
+      // definition after a goal_action_update, so re-emitting them would make
+      // the taught refresh idiom incapable of ever picking up a plan change.
+      if (isEmptyList(output?.args?.todos)) {
+        if (goal && !goal.stopped && goal.plan.actions.length > 0) {
+          // The extras are carried over UNCHANGED: `pickExtras` is deliberately
+          // not called here, because an empty list carries no rows of the
+          // model's own to re-derive them from. Only a NON-EMPTY call redefines
+          // the extras (T10's path below); an empty one keeps them.
+          output.args.todos = projectPlanToTodos(goal.plan, goal.mirror.extra)
+          // Nothing was offered, so nothing was trimmed: the after-hook note
+          // must not repeat a drop count from an earlier, non-empty call.
+          goal.mirror.lastDropped = 0
+          return
+        }
+        // No live plan to project. Re-emit whatever this session last saw, so a
+        // refresh after the plan is gone still restores the list rather than
+        // clearing it: first the goal's own last-written rows (a stopped goal,
+        // or a goal whose plan has not been recorded yet)...
+        if (goal?.mirror?.at > 0) {
+          output.args.todos = goal.mirror.rows
+          return
+        }
+        // ...then the terminal snapshot taken when the goal record itself was
+        // deleted (stop/clear/completion), which outlives the goal.
+        const terminal = readMirrorTerminal(sessionID)
+        if (terminal) {
+          output.args.todos = terminal.rows
+          return
+        }
+        // Native pass-through: nothing was ever mirrored into this session, so
+        // the empty list is the model's own and the host may honour it.
+        return
+      }
       // <<< v101:T11
 
 
