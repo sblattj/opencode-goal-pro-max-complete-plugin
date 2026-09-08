@@ -12807,6 +12807,143 @@ test("the terminal sidebar render keeps the context ceiling learned from the mod
 
 // >>> v101:T2 tests - projectPlanToTodos
 // T2 units: 1, 5, 6.
+function t2PlanAction(overrides = {}) {
+  return { id: "a1", title: "Ship the thing", status: "pending", claim: "", evidence: "", verdict: null, ...overrides }
+}
+
+function t2Plan(count, overrides = () => ({})) {
+  return {
+    actions: Array.from({ length: count }, (_, i) =>
+      t2PlanAction({ id: `a${i + 1}`, title: `Action ${i + 1}`, ...overrides(i) }),
+    ),
+    updatedAt: 0,
+  }
+}
+
+// T1 (`mirrorRowStatus`/`mirrorRowSuffix`) and T3 (`mirrorRow`/`mirrorRowPriority`) are stubs that
+// throw until wave 1 integrates. The projector is contractually required to route every plan row
+// through them, so before they land there is exactly one falsifiable row-level claim available:
+// that the projector delegates instead of inlining the row rules. These units assert THAT while the
+// stubs are dead and the full CONTRACTS row shape once they are live; nothing here re-implements a
+// sibling region's rules.
+const t2RowRulesLive = (() => {
+  const probe = t2PlanAction()
+  try {
+    testInternals.mirrorRowStatus(probe)
+    testInternals.mirrorRowSuffix(probe)
+    testInternals.mirrorRowPriority(probe, 0)
+    testInternals.mirrorRow({ content: "probe", status: "pending", priority: "low" })
+    return true
+  } catch {
+    return false
+  }
+})()
+
+function t2AssertDelegatesToRowRules(plan, extras) {
+  assert.throws(
+    () => testInternals.projectPlanToTodos(plan, extras),
+    /not implemented/,
+    "every plan row must be built by the T1/T3 helpers, not inline",
+  )
+}
+
+test("the plan projects onto native rows carrying exactly content, status and priority", () => {
+  const plan = {
+    actions: [
+      t2PlanAction({ id: "a1", title: "First", status: "in_progress" }),
+      t2PlanAction({ id: "a2", title: "Second", status: "done", claim: "c", evidence: "e", verdict: "pass" }),
+      t2PlanAction({ id: "a3", title: "Third", status: "blocked", claim: "the API key is missing" }),
+    ],
+    updatedAt: 0,
+  }
+  if (!t2RowRulesLive) {
+    t2AssertDelegatesToRowRules(plan, [])
+    return
+  }
+  const rows = testInternals.projectPlanToTodos(plan, [])
+  assert.equal(rows.length, 3)
+  for (const row of rows) {
+    // F3/F2: the host schema takes these three keys and nothing else, and an
+    // absent `priority` is an InvalidArgumentsError rather than a default.
+    assert.deepEqual(Object.keys(row).sort(), ["content", "priority", "status"])
+    assert.equal(typeof row.content, "string")
+    assert.equal(typeof row.status, "string")
+    assert.equal(typeof row.priority, "string")
+    assert.ok(row.content.length > 0)
+  }
+})
+
+test("a plan longer than the mirror cap ends in one counted overflow row", () => {
+  const cap = testInternals.MIRROR_MAX_TODOS
+  const over = t2Plan(cap + 5)
+  if (!t2RowRulesLive) {
+    t2AssertDelegatesToRowRules(over, [])
+    return
+  }
+  const rows = testInternals.projectPlanToTodos(over, [])
+  assert.equal(rows.length, cap, "plan rows never exceed the cap, overflow row included")
+  assert.deepEqual(rows.at(-1), {
+    content: "+6 more actions — /goal status",
+    status: "pending",
+    priority: "low",
+  })
+  assert.ok(
+    rows.at(-2).content.startsWith(`a${cap - 1}${testInternals.MIRROR_ID_SEPARATOR}`),
+    "the last real row is the (cap - 1)th action",
+  )
+  // The control: a plan exactly at the cap is shown whole, with no synthetic row.
+  const exact = testInternals.projectPlanToTodos(t2Plan(cap), [])
+  assert.equal(exact.length, cap)
+  assert.ok(exact.at(-1).content.startsWith(`a${cap}${testInternals.MIRROR_ID_SEPARATOR}`))
+  assert.ok(!exact.some((row) => /^\+\d+ more actions/.test(row.content)))
+})
+
+test("mirrored rows carry the action id as a content prefix", () => {
+  const plan = {
+    actions: [
+      t2PlanAction({ id: "auth-1", title: "Rotate the token" }),
+      t2PlanAction({ id: "auth-2", title: "Prove the rotation" }),
+    ],
+    updatedAt: 0,
+  }
+  if (!t2RowRulesLive) {
+    t2AssertDelegatesToRowRules(plan, [])
+    return
+  }
+  const rows = testInternals.projectPlanToTodos(plan, [])
+  // F7: a native todo has no id field, so the id can only survive as a content
+  // prefix - and `isMirrorOwnedRow` parses it back out of exactly these bytes.
+  assert.equal(testInternals.MIRROR_ID_SEPARATOR, " · ")
+  assert.ok(rows[0].content.startsWith("auth-1 · "))
+  assert.ok(rows[1].content.startsWith("auth-2 · "))
+  assert.ok(rows[0].content.includes("Rotate the token"))
+})
+
+test("the projector appends extras after the plan rows without re-bounding them", () => {
+  // `pickExtras` has already coerced and bounded these; the projector must copy
+  // them through untouched, or a stored row and its rendered twin would drift.
+  const long = "x".repeat(200)
+  const extras = [
+    { content: long, status: "pending", priority: "medium" },
+    { content: "a note of my own", status: "in_progress", priority: "high" },
+  ]
+  const noPlan = testInternals.projectPlanToTodos(undefined, extras)
+  assert.deepEqual(noPlan, extras)
+  assert.equal(noPlan[0].content.length, 200, "the projector does not re-bound an extra")
+  assert.notEqual(noPlan, extras, "the projector returns its own array")
+  assert.deepEqual(testInternals.projectPlanToTodos({ actions: [], updatedAt: 0 }, extras), extras)
+  assert.deepEqual(testInternals.projectPlanToTodos(undefined, undefined), [])
+
+  const plan = t2Plan(2)
+  if (!t2RowRulesLive) {
+    t2AssertDelegatesToRowRules(plan, extras)
+    return
+  }
+  const rows = testInternals.projectPlanToTodos(plan, extras)
+  assert.equal(rows.length, 4)
+  assert.deepEqual(rows.slice(2), extras)
+  assert.ok(rows[0].content.startsWith("a1 · "))
+})
 // <<< v101:T2
 
 
