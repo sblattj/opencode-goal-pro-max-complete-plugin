@@ -1479,15 +1479,16 @@ test("prompt builders stay within compact deterministic budgets", () => {
   // are the whole point of splitting spend from context pressure.
   assert.ok(buildContinueMessage(goal).length <= 560)
   assert.ok(buildContinueMessage(goal, { budgetWrapup: true }).length <= 680)
-  // v1.0.1 T20: this fixture carries no `goal.mirror`/`goal.plan`, so it is
-  // truthfully "never mirrored" (stale) under the default "plan" mode; pin the
-  // pre-existing, mirror-unrelated budget with an explicit "off" so this stays
-  // a check on the core compaction context, not a second copy of unit 50.
-  assert.ok(buildCompactionContext(goal, { mirrorMode: "off" }).length <= block.length + 650)
+  // v1.0.1 wave-3 integration: this fixture carries no `goal.mirror`/`goal.plan`,
+  // so it would read "never mirrored" = stale if the mirror mode defaulted to
+  // "plan". Every prompt builder that gained a `mirrorMode` option defaults it to
+  // "off" instead, so this pre-existing, mirror-unrelated budget stays a check on
+  // the core compaction context AND doubles as the control on that default.
+  assert.ok(buildCompactionContext(goal).length <= block.length + 650)
   assert.ok(buildAuditPrompt(goal, "done").length <= block.length + 700)
 
   goal.lastCheckpoint = { summary: "a".repeat(10_000), timestamp: now }
-  assert.ok(buildCompactionContext(goal, { mirrorMode: "off" }).length <= block.length + 900)
+  assert.ok(buildCompactionContext(goal).length <= block.length + 900)
 })
 
 test("blocked reason is extracted from line before marker", () => {
@@ -15297,4 +15298,277 @@ test("the taught refresh idiom really clears staleness across the wave-2 seats",
 // <<< v101:INT2
 
 
+// >>> v101:INT3 wave-3 integration - the off-mode seam no single seat could test
+// Written by the wave-3 integrator, not by a seat. Unit 24 is a claim about SIX
+// surfaces at once - T10/T11's before-hook, T18's system block, T19's continuation,
+// T20's compaction context, T22's tool.definition and T23's payload - and every seat
+// branched from the same base, so no seat's worktree held more than its own surface.
+// Design §4.6's claim for the kill switch is that `"off"` "restores today's behaviour
+// exactly"; that is only checkable once all six are in one tree.
+//
+// Structure note (a trap this unit was written into once): every `GoalPlugin(...)` call
+// makes a fresh runtime and publishes it as `lastRuntime` (`src/goal-plugin.js:9165
+// (createGoalPlugin)`, read back through `currentRuntime`, `:230`), so a SECOND
+// `createHooks()` cannot see a goal the first one's runtime holds. The single-factor
+// comparison - one goal object, mode the only thing that varies - is therefore made
+// against the PURE builders, which take the goal and the mode as arguments; the hook
+// arms each drive their own instance and are asserted on the mirror text they emit.
+const INT3_MIRROR_WORDS = ["Todo", "todowrite"]
+const INT3_SYSTEM_SENTENCE =
+  "The session's Todo list is drawn from this plan: while a plan exists, todowrite redraws it from the plan's actions and keeps any items of your own below them. Change the work with goal_plan_set/goal_action_update, and call todowrite({todos: []}) to refresh the panel."
+// The stale line, the nudge line and the todowrite clause are already module-scope
+// literals in this file (`T20_STALE_LINE`, `T14_NUDGE_LINE`, `T22_MIRROR_CLAUSE`), so
+// this region reuses them rather than pasting a fourth copy of the same bytes.
 
+function int3AssertNoMirrorWords(text, label) {
+  for (const word of INT3_MIRROR_WORDS) {
+    assert.equal(
+      text.includes(word),
+      false,
+      `${label} must not mention ${word} under mirrorTodos "off"; got: ${text}`,
+    )
+  }
+}
+
+const INT3_PLAN_ACTIONS = [
+  { id: "a1", title: "write the code" },
+  { id: "a2", title: "run the suite" },
+  { id: "a3", title: "cut the tag" },
+]
+
+// Every key the v2 payload documented (docs/reference.md, "metadata.goal payload,
+// schema v: 2"), plus the two reason keys that section says carry a value only once
+// there is one - `buildSidebarMetadata` writes both as own properties regardless.
+const INT3_V2_KEYS = [
+  "v",
+  "goalId",
+  "state",
+  "objective",
+  "turns",
+  "durationMs",
+  "minutes",
+  "tokens",
+  "context",
+  "plan",
+  "successCriteria",
+  "constraints",
+  "sequence",
+  "stopReason",
+  "blockedReason",
+  "updatedAt",
+]
+const INT3_V2_PLAN_KEYS = ["total", "verified", "blocked", "actions"]
+
+test("mirrorTodos off leaves a NON-EMPTY todowrite, the prompts, the description and the payload exactly as before", async () => {
+  const { hooks: offHooks } = await createHooks({ options: { mirrorTodos: "off" } })
+  const { handlers: offHandlers } = makeAgentHandlers({ mirrorMode: "off" })
+  const sessionID = "int3-mirror-off"
+  await offHandlers.setGoal(sessionID, { objective: "ship the release" })
+  await offHandlers.setPlan(sessionID, { actions: INT3_PLAN_ACTIONS })
+  const goal = currentGoal(sessionID)
+  assert.equal(goal.plan.actions.length, 3)
+  // A known context ceiling, so the conditional `context` key is written and the
+  // v2-key sweep below covers the whole documented payload, not 15/16 of it.
+  goal.modelContextTokens = 200_000
+  goal.peakContextTokens = 1_000
+
+  // ---- surface 1: a NON-EMPTY todowrite reaches the host untouched.
+  const sent = [
+    { content: "my own note", status: "pending", priority: "medium" },
+    { content: "another of mine", status: "in_progress", priority: "high" },
+  ]
+  const sentSnapshot = structuredClone(sent)
+  const call = { args: { todos: sent } }
+  await offHooks["tool.execute.before"](
+    { tool: "todowrite", sessionID, callID: "int3-off-write" },
+    call,
+  )
+  assert.equal(call.args.todos, sent, "the SAME array object must reach the host")
+  assert.deepEqual(call.args.todos, sentSnapshot, "and its contents must be unchanged")
+
+  // The other half of "untouched": the after-hook appends no result note and stamps
+  // nothing, so the goal record stays exactly what a v1.0.0 record would be.
+  const afterOutput = { title: "todowrite", output: "ok", metadata: {} }
+  await offHooks["tool.execute.after"](
+    { tool: "todowrite", sessionID, callID: "int3-off-write", args: call.args },
+    afterOutput,
+  )
+  assert.equal(afterOutput.output, "ok", "no mirror result note under off")
+  assert.equal(goal.mirror.at, 0)
+  assert.deepEqual(goal.mirror.rows, [])
+  assert.deepEqual(goal.mirror.extra, [])
+
+  // ---- surface 2: the three prompt surfaces name neither Todo nor todowrite,
+  // through the production hooks where the plugin's own closure decides the mode.
+  const offSystemOutput = { system: [] }
+  await offHooks["experimental.chat.system.transform"]({ sessionID }, offSystemOutput)
+  const offSystem = offSystemOutput.system.join("\n")
+  assert.ok(offSystem.includes("write the code"), "the plan really is in the system block")
+  int3AssertNoMirrorWords(offSystem, "the system block")
+
+  const offCompactOutput = { context: [] }
+  await offHooks["experimental.session.compacting"]({ sessionID }, offCompactOutput)
+  const offCompaction = offCompactOutput.context.join("\n")
+  assert.ok(offCompaction.includes("write the code"), "the plan really is in the compaction context")
+  int3AssertNoMirrorWords(offCompaction, "the compaction context")
+
+  const offContinuation = buildContinueMessage(goal, { mirrorMode: "off" })
+  assert.ok(offContinuation.includes("write the code"), "the plan really is in the continuation")
+  int3AssertNoMirrorWords(offContinuation, "the continuation")
+
+  // ---- surface 3: the host's todowrite description is stock.
+  const hostDescription =
+    "Use this tool to create and manage a structured task list.\n\nRules:\n- one in_progress at a time"
+  const offDefinition = { description: hostDescription, parameters: { type: "object" } }
+  await offHooks["tool.definition"]({ toolID: "todowrite" }, offDefinition)
+  assert.equal(offDefinition.description, hostDescription, "the description is byte-identical")
+
+  // ---- surface 4: the payload keeps every v2 key and reports the mode.
+  const now = Date.now()
+  const offPayload = buildSidebarMetadata(goal, now, { mirrorMode: "off" })
+  for (const key of INT3_V2_KEYS) {
+    assert.ok(key in offPayload, `the v3 payload must still write the v2 key ${key}`)
+  }
+  for (const key of INT3_V2_PLAN_KEYS) {
+    assert.ok(key in offPayload.plan, `the v3 payload must still write plan.${key}`)
+  }
+  assert.equal(offPayload.v, 3)
+  assert.equal(offPayload.plan.total, 3)
+  assert.equal(offPayload.plan.mirror.state, "off")
+
+  // ============ control A: the SAME goal object, mode the only variable ============
+  // Nothing above changed the goal record, so these four calls differ from their
+  // "off" counterparts in exactly one input. Without them the assertions above
+  // would be green for a goal that simply had nothing to say.
+  const offSystemLines = buildPlanSystemLines(goal, { mirrorMode: "off" }).join("\n")
+  const planSystemLines = buildPlanSystemLines(goal, { mirrorMode: "plan" }).join("\n")
+  assert.notEqual(planSystemLines, offSystemLines, "the system lines must differ")
+  assert.ok(planSystemLines.includes(INT3_SYSTEM_SENTENCE))
+  assert.ok(offSystem.includes(offSystemLines), "the off hook really emitted these lines")
+
+  const planContinuation = buildContinueMessage(goal, { mirrorMode: "plan" })
+  assert.notEqual(planContinuation, offContinuation, "the continuation must differ")
+  assert.ok(planContinuation.includes(T14_NUDGE_LINE))
+
+  const offCompactionPure = buildCompactionContext(goal, { mirrorMode: "off" })
+  assert.equal(offCompaction, offCompactionPure, "the off hook threaded its own mode through")
+  const planCompaction = buildCompactionContext(goal, { mirrorMode: "plan" })
+  assert.notEqual(planCompaction, offCompactionPure, "the compaction context must differ")
+  assert.ok(planCompaction.includes(T20_STALE_LINE))
+
+  const planPayload = buildSidebarMetadata(goal, now, { mirrorMode: "plan" })
+  assert.notEqual(planPayload.plan.mirror.state, "off", "the payload state must differ")
+  assert.equal(planPayload.plan.mirror.state, "stale")
+
+  // ============ control B: the same two HOOKS on a "plan" instance ============
+  // A second plugin instance publishes a fresh runtime, so this arm sets its own
+  // goal up with the same objective and the same three actions.
+  const { hooks: planHooks } = await createHooks()
+  const planDefinition = { description: hostDescription, parameters: { type: "object" } }
+  await planHooks["tool.definition"]({ toolID: "todowrite" }, planDefinition)
+  assert.notEqual(planDefinition.description, hostDescription, "the description must differ")
+  assert.equal(planDefinition.description, `${hostDescription}\n\n${T22_MIRROR_CLAUSE}`)
+
+  const { handlers: planHandlers } = makeAgentHandlers()
+  const planSession = "int3-mirror-plan"
+  await planHandlers.setGoal(planSession, { objective: "ship the release" })
+  await planHandlers.setPlan(planSession, { actions: INT3_PLAN_ACTIONS })
+
+  const planSystemOutput = { system: [] }
+  await planHooks["experimental.chat.system.transform"]({ sessionID: planSession }, planSystemOutput)
+  assert.ok(planSystemOutput.system.join("\n").includes(INT3_SYSTEM_SENTENCE))
+
+  const planCompactHookOutput = { context: [] }
+  await planHooks["experimental.session.compacting"]({ sessionID: planSession }, planCompactHookOutput)
+  assert.ok(planCompactHookOutput.context.join("\n").includes(T20_STALE_LINE))
+
+  // The same non-empty call, under "plan": replaced wholesale by the projection.
+  const planSent = structuredClone(sentSnapshot)
+  const planCall = { args: { todos: planSent } }
+  await planHooks["tool.execute.before"](
+    { tool: "todowrite", sessionID: planSession, callID: "int3-plan-write" },
+    planCall,
+  )
+  assert.notEqual(planCall.args.todos, planSent, "plan mode replaces the array object")
+  assert.equal(planCall.args.todos.length, 5, "3 plan rows plus the 2 kept extras")
+  assert.deepEqual(
+    planCall.args.todos.slice(3).map((row) => row.content),
+    ["my own note", "another of mine"],
+  )
+})
+
+// The wave-3 integration drift fix, and its control. T38's <existing_todos> block is a
+// prompt surface whose CONTRACTS-pinned bytes promise mirror behaviour ("the first
+// todowrite after a plan exists redraws the list from the plan"), which is false when
+// the mirror is off - so the capture is gated on the mode at the /goal set call site.
+// T38's own two units run under the default "plan" mode and could not see this.
+test("with mirrorTodos off the <existing_todos> offer is neither read nor rendered", async () => {
+  const nativeTodos = [
+    { id: "todo-1", content: "write the launch checklist", status: "pending", priority: "medium" },
+  ]
+
+  const offTodoReads = []
+  let offSourceTurn = 0
+  const off = await createHooks({
+    options: { mirrorTodos: "off", minDelayMs: 1 },
+    todo: async (input) => {
+      offTodoReads.push(input)
+      return nativeTodos
+    },
+    messages: async () => ({
+      data: [message("working on it", undefined, `msg-int3-off-${offSourceTurn}`)],
+    }),
+    onPromptAsync: () => {
+      offSourceTurn += 1
+    },
+  })
+  const offSession = "int3-existing-todos-off"
+  await off.hooks["command.execute.before"](
+    { command: "goal", sessionID: offSession, arguments: "ship the release" },
+    { parts: [] },
+  )
+  await off.hooks.event({
+    event: { type: "session.status", properties: { sessionID: offSession, status: { type: "idle" } } },
+  })
+
+  assert.equal(offTodoReads.length, 0, "an off instance makes no session.todo call at all")
+  assert.equal(off.calls.length, 1, "one continuation must have been sent")
+  const offText = off.calls[0].body?.parts?.[0]?.text ?? off.calls[0].parts?.[0]?.text
+  assert.doesNotMatch(offText, /<existing_todos>/)
+  assert.doesNotMatch(offText, /They are NOT the plan/)
+  // The production continuation surface, built by the plugin's own closure rather
+  // than by a hand-passed option: nothing in it teaches the mirror.
+  int3AssertNoMirrorWords(offText, "the continuation the off plugin actually sent")
+
+  // The control: the identical host, the default mode, reads and renders.
+  const onTodoReads = []
+  let onSourceTurn = 0
+  const on = await createHooks({
+    options: { minDelayMs: 1 },
+    todo: async (input) => {
+      onTodoReads.push(input)
+      return nativeTodos
+    },
+    messages: async () => ({
+      data: [message("working on it", undefined, `msg-int3-on-${onSourceTurn}`)],
+    }),
+    onPromptAsync: () => {
+      onSourceTurn += 1
+    },
+  })
+  const onSession = "int3-existing-todos-on"
+  await on.hooks["command.execute.before"](
+    { command: "goal", sessionID: onSession, arguments: "ship the release" },
+    { parts: [] },
+  )
+  await on.hooks.event({
+    event: { type: "session.status", properties: { sessionID: onSession, status: { type: "idle" } } },
+  })
+
+  assert.equal(onTodoReads.length, 1, "the default mode DOES read the native list")
+  assert.equal(on.calls.length, 1)
+  const onText = on.calls[0].body?.parts?.[0]?.text ?? on.calls[0].parts?.[0]?.text
+  assert.match(onText, /<existing_todos>/)
+  assert.match(onText, /- write the launch checklist \(pending\)/)
+})
+// <<< v101:INT3
