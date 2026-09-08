@@ -85,6 +85,7 @@ const {
   parseGoalArguments,
   buildGoalState,
   normalizePersistedGoal,
+  normalizeMirror,
   normalizePlan,
   emptyPlan,
   planProgress,
@@ -13283,6 +13284,98 @@ test("mirrorTodos normalizes to plan or off, defaulting to plan", () => {
 
 // >>> v101:T8 tests - normalizeMirror and the persisted record
 // T8 units: 25.
+test("a goal record written before this release loads with an empty, never-mirrored record", () => {
+  // A pre-v1.0.1 state file has no `mirror` key at all. normalizePersistedGoal
+  // is the same public load path the pre-0.11.0 persistence tests above use
+  // (e.g. "a pre-0.11.0 state record loads: ...").
+  const loaded = normalizePersistedGoal({
+    sessionID: "legacy-session-no-mirror",
+    condition: "ship it",
+    startedAt: Date.now(),
+  })
+  assert.deepEqual(loaded.mirror, {
+    fingerprint: "",
+    at: 0,
+    rows: [],
+    nudges: 0,
+    extra: [],
+  })
+
+  // A record that DOES carry a mirror key round-trips it through the same
+  // path, proving the wiring reads `rawGoal.mirror` rather than always
+  // defaulting.
+  const withMirror = normalizePersistedGoal({
+    sessionID: "session-with-mirror",
+    condition: "ship it",
+    startedAt: Date.now(),
+    mirror: {
+      fingerprint: "abc123",
+      at: 555,
+      rows: [{ content: "a-1 · Do the thing", status: "pending", priority: "high" }],
+      nudges: 2,
+      extra: [],
+    },
+  })
+  assert.deepEqual(withMirror.mirror, {
+    fingerprint: "abc123",
+    at: 555,
+    rows: [{ content: "a-1 · Do the thing", status: "pending", priority: "high" }],
+    nudges: 2,
+    extra: [],
+  })
+})
+
+test("normalizeMirror coerces a malformed record field by field", () => {
+  // No argument at all -> the documented default.
+  assert.deepEqual(normalizeMirror(), {
+    fingerprint: "",
+    at: 0,
+    rows: [],
+    nudges: 0,
+    extra: [],
+  })
+  // A non-object raw value -> the same default (never throws).
+  assert.deepEqual(normalizeMirror(null), {
+    fingerprint: "",
+    at: 0,
+    rows: [],
+    nudges: 0,
+    extra: [],
+  })
+  assert.deepEqual(normalizeMirror("garbage"), {
+    fingerprint: "",
+    at: 0,
+    rows: [],
+    nudges: 0,
+    extra: [],
+  })
+
+  const coerced = normalizeMirror({
+    fingerprint: 12345, // not a string -> coerced with String(...)
+    at: "-9", // negative and a string -> non-negative integer, defaults to 0
+    nudges: 4.7, // not a safe integer -> defaults to 0
+    rows: [
+      { content: 42, status: null, priority: undefined }, // wrong types / missing
+      "not-an-object", // not a row at all
+      null,
+    ],
+    extra: "not-an-array", // wrong type entirely -> []
+  })
+  assert.equal(coerced.fingerprint, "12345")
+  assert.equal(coerced.at, 0)
+  assert.equal(coerced.nudges, 0)
+  assert.deepEqual(coerced.rows, [
+    { content: "42", status: "pending", priority: "medium" },
+    { content: "(untitled)", status: "pending", priority: "medium" },
+    { content: "(untitled)", status: "pending", priority: "medium" },
+  ])
+  assert.deepEqual(coerced.extra, [])
+
+  // Valid at/nudges values survive as non-negative integers.
+  const valid = normalizeMirror({ at: 100, nudges: 3, rows: [], extra: [] })
+  assert.equal(valid.at, 100)
+  assert.equal(valid.nudges, 3)
+})
 // <<< v101:T8
 
 
