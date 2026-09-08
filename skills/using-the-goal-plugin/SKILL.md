@@ -290,9 +290,9 @@ The Goal panel no longer repeats the plan: it prints the progress line plus only
 attention (done-without-evidence, blocked, in progress). A fully verified plan prints one line. If the
 progress line says `todo list stale`, the Todo section above is showing an older copy - one
 `todowrite({todos: []})` fixes it. A pending row of your own keeps the Todo section on screen after
-every action has verified; it is not goal work and does not block completion. The conversation
-transcript is a separate surface: a `todowrite` bubble in scrollback may still show the wording you
-sent, not the redrawn list.
+every action has verified; it is not goal work and does not block completion. A `todowrite` bubble in
+scrollback shows the redrawn list too, not the wording you sent, because the host records the
+rewritten arguments.
 
 ## 9. State, restarts, and other processes
 

@@ -91,13 +91,18 @@ arguments, so it reaches every surface that renders the **stored** list — the 
 section, the `opencode run` renders, and the desktop client's todo dock — and it survives a restart,
 because the TUI re-seeds that store from the server on session hydration.
 
-**Two surfaces it cannot reach, by construction.** OpenCode also renders the `todowrite` *transcript
-bubble*, in the TUI and again on the web share page, and those rows come from the tool call's own
-separately captured input. No plugin can change them: the TUI plugin API exposes sidebar, prompt and
-app-shell slots only, and the transcript is a hardcoded switch rather than a slot lookup. Scrollback
-may therefore keep showing the model's original wording beside a corrected sidebar. That is a
-property of the host's plugin surface, not a defect in the mirror, and nothing in this package can
-fix it; `mirrorTodos: "off"` is the only way to keep the two readings identical.
+**Two more surfaces, reached indirectly.** OpenCode also renders the `todowrite` *transcript bubble*,
+in the TUI and again on the web share page (`opencode run` prints a third). Neither is a plugin
+slot — the TUI plugin API exposes sidebar, prompt and app-shell slots only, and the transcript is a
+hardcoded switch rather than a slot lookup — so nothing in this package can *render* into them. But
+all three read the tool call's recorded `state.input.todos`, and the host records that part from the
+very `args` object `tool.execute.before` rewrites in place, so the rewrite reaches the transcript
+anyway. **Measured on OpenCode 1.18.29: the bubble shows the mirrored rows**, so scrollback, the Todo
+sidebar section and the host's own table all agree. `npm run smoke:todo-safety` re-measures this on
+every run and prints the answer as an `F19 — verdict` line rather than asserting it, because a future
+host that snapshotted the arguments *before* the hook would flip it back — and only then would
+scrollback start keeping the model's original wording. Its control is already in the same run: with
+no goal the mirror is inert and the bubble shows exactly what the model sent.
 
 **`priority` is wire-only in the TUI.** Mirrored rows carry a `priority` (`high` for the first row
 still to act on, `low` for completed rows, `medium` otherwise) because the host's schema requires
