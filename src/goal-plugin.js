@@ -3121,10 +3121,18 @@ function buildCompactionProgressSummary(goal, { maxCheckpoints = 3, maxEvents = 
 // U+2014. Added to buildCompactionContext ONLY while mirrorState(goal, mirrorMode) === "stale":
 // there is no todoread, so after a compaction the model cannot rediscover that the Todo panel no
 // longer matches the plan on its own (design §4.3(e)).
+//
+// v1.0.1 wave-3 integration: every prompt builder that gained a `mirrorMode` option in this
+// wave defaults it to "off", never to normalizeMirrorMode's own "plan" default
+// (buildContinueMessage, buildPlanSystemLines, buildCompactionContext). The production callers
+// all thread the plugin's closure value, so the default only decides what a caller that FORGOT
+// to thread it emits — and "off" must stay byte-identical to v1.0.0, so the inert value is the
+// safe failure mode. The pre-existing prompt-budget test calls each builder with no options and
+// is the control that keeps that true.
 const MIRROR_COMPACTION_STALE_LINE =
   "The session's Todo list is stale — it shows an older copy of the plan; one todowrite({todos: []}) refreshes it."
 
-function buildCompactionContext(goal, { mirrorMode } = {}) {
+function buildCompactionContext(goal, { mirrorMode = "off" } = {}) {
   // Preserve the active goal across an OpenCode session compaction. Without
   // this, a compaction can drop the goal objective and budget state from the
   // working context, so the assistant loses the thread mid-run even though the
@@ -4141,7 +4149,7 @@ function formatPlanForPrompt(plan) {
 
 // Plan lines for the system prompt and the compaction summary. Two states: no
 // plan yet (decompose first) or a plan (work the ledger).
-function buildPlanSystemLines(goal, { mirrorMode } = {}) {
+function buildPlanSystemLines(goal, { mirrorMode = "off" } = {}) {
   const render = formatPlanForPrompt(goal?.plan)
   if (!render) {
     return [
@@ -7636,7 +7644,17 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       // v1.0.1 T38: best-effort offer of the session's pre-existing native
       // todo rows in the goal's first continuation (design §4.3(c)). Never
       // adopts anything and never blocks /goal set on failure.
-      await captureExistingTodosOffer(client, sessionApi, sessionID)
+      //
+      // Gated on the mirror mode at wave-3 integration. The offer is a prompt
+      // surface whose CONTRACTS-pinned bytes promise mirror behaviour ("the
+      // first todowrite after a plan exists redraws the list from the plan and
+      // keeps yours below it"), which is false under `mirrorTodos: "off"` —
+      // and design §4.6 requires that "off" restore today's behaviour exactly,
+      // with every prompt surface gated on the mode. Skipping the capture also
+      // skips the host read, so an "off" instance makes no session.todo call.
+      if (mirrorMode !== "off") {
+        await captureExistingTodosOffer(client, sessionApi, sessionID)
+      }
 
       pushHistory(
         goal,
