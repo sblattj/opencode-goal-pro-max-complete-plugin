@@ -4,13 +4,13 @@ The name is not a claim about the feature list. It is a claim about the **proces
 
 ## The verification ladder
 
-Every row was run against this tree on 2026-09-07 (Node v24.15.0, npm 11.12.1, bun 1.3.14, macOS 26.5.1). `npm run release:check` runs all of them in order, plus a bundle step, and takes about **2.5–3 minutes** on that stack — around nine tenths of it the mutation rung, which re-runs the whole suite once per mutant. (Timed end to end on this tree: 150 s, 151 s, 155 s and 173 s.)
+Every row was run against this tree on 2026-09-07 (Node v24.15.0, npm 11.12.1, bun 1.3.14, macOS 26.5.1). `npm run release:check` runs all of them in order, plus a bundle step, and takes about **2.5–3 minutes** on that stack — around nine tenths of it the mutation rung, which re-runs the whole suite once per mutant. (Timed end to end: 150 s, 151 s, 155 s and 173 s before 1.0.0, and 153 s and 157 s on the 1.0.0 tree, which adds 36 tests and one mutant.)
 
 | Rung | Command | What it proves | Measured |
 |---|---|---|---|
-| Unit suite | `npm test` | Every documented behaviour has an executable specification, across 12 test files | **508 tests, 508 pass, 0 fail** |
-| Coverage | `npm run test:coverage` | The suite actually reaches the code it claims to cover | **≈97% line, ≈88.5% branch, ≈94% function** over `src/` — the cross-process lease tests race, so `persistence-lease.js` and the totals move a tenth of a point or so between runs (four runs on this tree spanned 97.02–97.15% line, 88.46–88.67% branch, 93.88–94.06% function) |
-| Mutation contract | `npm run test:mutation` | Each safety property's test is *not vacuous*: the mutant reverts exactly that property in a scratch copy of `src/` and the suite must go red | **80/80 critical mutants killed** |
+| Unit suite | `npm test` | Every documented behaviour has an executable specification, across 15 test files | **544 tests, 544 pass, 0 fail** |
+| Coverage | `npm run test:coverage` | The suite actually reaches the code it claims to cover | **≈97% line, ≈88.5% branch, ≈94% function** over `src/` — the cross-process lease tests race, so `persistence-lease.js` and the totals move a tenth of a point or so between runs (five runs on this tree spanned 97.02–97.15% line, 88.44–88.67% branch, 93.88–94.06% function) |
+| Mutation contract | `npm run test:mutation` | Each safety property's test is *not vacuous*: the mutant reverts exactly that property in a scratch copy of `src/` and the suite must go red | **81/81 critical mutants killed** |
 | Behaviour benchmark | `npm run benchmark:behavior` | Six end-to-end autonomy scenarios — verified success, false completion, loop circuit breaker, human interruption, compaction continuity, restart recovery — behave as specified | **6/6 passed, score 100/100, 0 model calls, 0 external requests** |
 | Type contract | `npm run type:check` | A TypeScript consumer can compile against the **packed tarball** under both NodeNext and Bundler resolution, including the `./tui` subpath | **passed** (`opencode-goal-pro-max-complete-plugin-0.11.0.tgz`) |
 | Command-hook smoke | `npm run smoke` | The package export path and the `/goal` command hook work with no model call | **passed** |
@@ -20,7 +20,7 @@ Every row was run against this tree on 2026-09-07 (Node v24.15.0, npm 11.12.1, b
 | Git-install contract | `npm run smoke:git-install` | None of the six manifest script names that make pacote's `GitFetcher` spawn a missing `npmBin` has reappeared, and the committed `dist/` byte-matches a fresh bundle | **passed**; `dist/goal-plugin.js` and `dist/goal-tui.js` match a fresh bun 1.3.14 bundle |
 | Hook-surface verify | `npm run verify` | The installed plugin loads, registers all 9 hooks, answers `/goal status` and `/goal set`, and makes zero model calls | **all 7 checks passed** |
 | Dependency audit | `npm audit --omit=dev --audit-level=high` | No known high-severity vulnerability in the runtime dependency (`zod` only) | **0 vulnerabilities** |
-| Pack check | `npm run pack:check` | The tarball contains what it should and nothing else | **32 files, ≈330 kB packed, 1.4 MB unpacked** — `README.md` ships inside the tarball, so the exact packed byte count moves whenever it does |
+| Pack check | `npm run pack:check` | The tarball contains what it should and nothing else | **39 files, ≈363 kB packed, 1.5 MB unpacked** — `README.md` ships inside the tarball, so the exact packed byte count moves whenever it does |
 
 ## The process behind 0.11.0
 
