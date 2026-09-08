@@ -13484,7 +13484,172 @@ test("an empty mirror never records a terminal snapshot", () => {
 
 
 // >>> v101:T14 tests - staleness, mirror state and the nudge budget
-// T14 units: 19, 20, 21, 22.
+// T14 units: 19, 21, 22. Unit 20 ("a stale mirror adds one line to the continuation and a fresh one
+// adds nothing") asserts on buildContinueMessage, which T19 wires; it lives in the T19 region.
+//
+// The T12 after-hook stamp does not exist yet in this worktree, so these tests stamp the mirror the
+// way `stampMirror` is contracted to: fingerprint of a fresh projection, `at`, and the rows that
+// were written — and, load-bearing for unit 22, WITHOUT touching `nudges`.
+function t14StampMirror(goal, now) {
+  const { mirrorFingerprint, projectPlanToTodos } = testInternals
+  const rows = projectPlanToTodos(goal.plan, goal.mirror.extra)
+  goal.mirror.fingerprint = mirrorFingerprint(rows)
+  goal.mirror.at = now
+  goal.mirror.rows = rows
+  return rows
+}
+
+// CONTRACTS Strings, exact bytes (the dash is an em dash, U+2014).
+const T14_NUDGE_LINE =
+  "Todo panel is stale — call todowrite({todos: []}) once; the plan is copied into it for you."
+
+test("mirroring marks the plan fresh and a later action update marks it stale", async () => {
+  const { mirrorIsFresh, mirrorState } = testInternals
+  const { handlers } = makeAgentHandlers()
+  const sid = "t14-fresh-then-stale"
+  await handlers.setGoal(sid, { objective: "ship it" })
+  await handlers.setPlan(sid, {
+    actions: [{ id: "a1", title: "write it" }, { id: "a2", title: "verify it" }],
+  })
+  const goal = currentGoal(sid)
+
+  // Never mirrored: `at === 0` is stale by definition, whatever the fingerprint says.
+  assert.equal(goal.mirror.at, 0)
+  assert.equal(mirrorIsFresh(goal), false)
+  assert.equal(mirrorState(goal, "plan"), "stale")
+
+  t14StampMirror(goal, 1_000)
+  assert.equal(mirrorIsFresh(goal), true)
+  assert.equal(mirrorState(goal, "plan"), "fresh")
+  // The mode short-circuits the whole question: with the mirror off there is no panel to be stale.
+  assert.equal(mirrorState(goal, "off"), "off")
+
+  await handlers.updateAction(sid, { id: "a1", status: "in_progress" })
+  assert.equal(mirrorIsFresh(goal), false)
+  assert.equal(mirrorState(goal, "plan"), "stale")
+  assert.equal(mirrorState(goal, "off"), "off")
+
+  // Re-mirroring after the edit makes it fresh again, and a stamp of the SAME rows is idempotent.
+  t14StampMirror(goal, 2_000)
+  assert.equal(mirrorState(goal, "plan"), "fresh")
+  t14StampMirror(goal, 3_000)
+  assert.equal(mirrorState(goal, "plan"), "fresh")
+})
+
+test("the mirror nudge stops after three unanswered turns", async () => {
+  const { mirrorNudgeLine, MIRROR_MAX_NUDGES } = testInternals
+  const { handlers } = makeAgentHandlers()
+  const sid = "t14-nudge-budget"
+  await handlers.setGoal(sid, { objective: "ship it" })
+  await handlers.setPlan(sid, {
+    actions: [
+      { id: "a1", title: "write it" },
+      { id: "a2", title: "verify it" },
+      { id: "a3", title: "release it" },
+      { id: "a4", title: "announce it" },
+    ],
+  })
+  const goal = currentGoal(sid)
+  assert.equal(MIRROR_MAX_NUDGES, 3)
+
+  // Three updates with no todowrite in between: one line each, and the counter climbs.
+  for (const [turn, id] of ["a1", "a2", "a3"].entries()) {
+    const result = await handlers.updateAction(sid, { id, status: "in_progress" })
+    assert.equal(result.includes(T14_NUDGE_LINE), true, `turn ${turn + 1} must carry the nudge`)
+    // Appended AFTER the existing text, which is unchanged.
+    assert.match(result, new RegExp(`^Action ${id} updated: in_progress\\.`))
+    assert.equal(result.split("\n").filter((line) => line === T14_NUDGE_LINE).length, 1)
+    assert.equal(goal.mirror.nudges, turn + 1)
+  }
+
+  // The fourth is silent: the budget is a per-goal-run total, not a per-episode one.
+  const fourth = await handlers.updateAction(sid, { id: "a4", status: "in_progress" })
+  assert.equal(fourth.includes(T14_NUDGE_LINE), false)
+  assert.equal(fourth, "Action a4 updated: in_progress. Progress: 0/4 actions verified.")
+  assert.equal(goal.mirror.nudges, 3)
+
+  // Direct calls past the cap are pure: no line, no further increment.
+  assert.equal(mirrorNudgeLine(goal, "plan"), "")
+  assert.equal(goal.mirror.nudges, 3)
+
+  // The three gates that suppress the nudge without spending budget.
+  goal.mirror.nudges = 0
+  assert.equal(mirrorNudgeLine(goal, "off"), "")
+  assert.equal(goal.mirror.nudges, 0)
+  goal.stopped = true
+  assert.equal(mirrorNudgeLine(goal, "plan"), "")
+  assert.equal(goal.mirror.nudges, 0)
+  goal.stopped = false
+  const liveActions = goal.plan.actions
+  goal.plan.actions = []
+  assert.equal(mirrorNudgeLine(goal, "plan"), "")
+  assert.equal(goal.mirror.nudges, 0)
+  goal.plan.actions = liveActions
+  assert.equal(mirrorNudgeLine(undefined, "plan"), "")
+
+  // And a fresh mirror suppresses it too — the line only ever describes a stale panel.
+  t14StampMirror(goal, 5_000)
+  assert.equal(mirrorNudgeLine(goal, "plan"), "")
+  assert.equal(goal.mirror.nudges, 0)
+
+  // The control for the mode gate at the tool result: handlers built with the mirror off never
+  // append the line, however stale the mirror is.
+  const offSid = "t14-nudge-mode-off"
+  const { handlers: offHandlers } = makeAgentHandlers({ mirrorMode: "off" })
+  await offHandlers.setGoal(offSid, { objective: "ship it" })
+  await offHandlers.setPlan(offSid, { actions: [{ id: "a1", title: "write it" }] })
+  const offResult = await offHandlers.updateAction(offSid, { id: "a1", status: "in_progress" })
+  assert.equal(offResult.includes(T14_NUDGE_LINE), false)
+  assert.equal(currentGoal(offSid).mirror.nudges, 0)
+})
+
+test("a successful mirror does NOT refund the nudge budget", async () => {
+  const { mirrorState } = testInternals
+  const { handlers } = makeAgentHandlers()
+  const sid = "t14-no-refund"
+  await handlers.setGoal(sid, { objective: "ship it" })
+  await handlers.setPlan(sid, {
+    actions: [
+      { id: "a1", title: "write it" },
+      { id: "a2", title: "verify it" },
+      { id: "a3", title: "release it" },
+    ],
+  })
+  const goal = currentGoal(sid)
+
+  // Two nudges spent while the model ignored them.
+  assert.equal(
+    (await handlers.updateAction(sid, { id: "a1", status: "in_progress" })).includes(T14_NUDGE_LINE),
+    true,
+  )
+  assert.equal(
+    (await handlers.updateAction(sid, { id: "a2", status: "in_progress" })).includes(T14_NUDGE_LINE),
+    true,
+  )
+  assert.equal(goal.mirror.nudges, 2)
+
+  // The model finally calls todowrite: the mirror lands. The stamp must NOT reset the counter (X5)
+  // — this is the whole point of the unit. Under a `todowrite: "ask"` permission a refund here
+  // would let one goal-run raise an unbounded number of modals.
+  t14StampMirror(goal, 7_000)
+  assert.equal(mirrorState(goal, "plan"), "fresh")
+  assert.equal(goal.mirror.nudges, 2)
+
+  // The next edit makes it stale again and spends the LAST nudge, not a fresh budget of three.
+  const third = await handlers.updateAction(sid, { id: "a3", status: "in_progress" })
+  assert.equal(third.includes(T14_NUDGE_LINE), true)
+  assert.equal(goal.mirror.nudges, 3)
+
+  // Exactly one more line: every later update is silent, mirrored or not.
+  const fourth = await handlers.updateAction(sid, { id: "a1", status: "pending" })
+  assert.equal(fourth.includes(T14_NUDGE_LINE), false)
+  assert.equal(goal.mirror.nudges, 3)
+  t14StampMirror(goal, 8_000)
+  await handlers.updateAction(sid, { id: "a2", status: "pending" })
+  const sixth = await handlers.updateAction(sid, { id: "a3", status: "pending" })
+  assert.equal(sixth.includes(T14_NUDGE_LINE), false)
+  assert.equal(goal.mirror.nudges, 3)
+})
 // <<< v101:T14
 
 
