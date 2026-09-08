@@ -6836,15 +6836,91 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
     },
     "tool.execute.after": async (input, output) => {
       // >>> v101:T12 todowrite mirror: the freshness stamp, only after the write landed
-      // Reserved. T12 fills this (tool gate, mode gate, terminal drop, and the stamp call written
-      // as the exact literal CONTRACTS shows for mutation anchor 3 - EXACTLY ONE occurrence in
-      // this file, so do not repeat that literal in a comment).
+      // The stamp lives in the AFTER hook because only this hook proves the host
+      // actually wrote the list. Between the two hooks the host decodes the args
+      // (F2) and asks for permission (F5); either can abort the call, and a mirror
+      // stamped fresh for a write that never landed would suppress the very nudge
+      // that repairs it. That is the whole point of G1/F4.
+      if (input.tool !== "todowrite") return
+      if (mirrorMode === "off") return
+      const sessionID = input?.sessionID
+      if (!sessionID) return
+      // The handback (X2) completing itself, step three: a terminal snapshot only
+      // survives while the goal is gone and nothing has redrawn the list. A real,
+      // non-empty todowrite is the model taking the list back, so the snapshot has
+      // done its job and must not re-emit stale plan rows on some later empty call.
+      const todos = input.args?.todos
+      if (Array.isArray(todos) && todos.length > 0 && readMirrorTerminal(sessionID)) {
+        dropMirrorTerminal(sessionID)
+      }
+      const goal = goalStates.get(sessionID)
+      if (goal) {
+        const now = Date.now()
+        stampMirror(goal, input.args, now)
+        // The stamp is the only durable evidence that the list on screen matches
+        // this plan, so it has to reach disk with the rest of the goal record.
+        await persist(sessionID)
+      }
+
+      /**
+       * `stampMirror(goal, args, now)` -> void: record what the host was actually
+       * handed — the fingerprint over `args.todos`, the moment it landed, and the
+       * rows themselves coerced through the one row coercer so a reloaded record is
+       * spelled exactly like a freshly projected one.
+       *
+       * `nudges` is a per-goal-run budget (X5) and `extra` is owned by the
+       * before-hook's `pickExtras`, so neither is touched here.
+       */
+      function stampMirror(goal, args, now) {
+        const written = Array.isArray(args?.todos) ? args.todos : []
+        goal.mirror.fingerprint = mirrorFingerprint(written)
+        goal.mirror.at = now
+        goal.mirror.rows = written.map((row) => mirrorRow(row))
+      }
       // <<< v101:T12
 
 
 
       // >>> v101:T13 todowrite mirror: the tool-result note
-      // Reserved. T13 fills this (the mirrored/verified/kept/dropped note and the no-plan hint).
+      // The model reads, in its own tool result, the list that was actually
+      // written and how many of its own rows survived the cap. `goal.stopped`
+      // is excluded deliberately: units 8/9 leave a NON-EMPTY todowrite's result
+      // completely untouched when there is no goal or the goal is stopped, and
+      // only unit 10 (a live, un-stopped goal with zero actions) gets the
+      // no-plan hint.
+      if (goal && !goal.stopped) {
+        const note = mirrorResultNote(goal)
+        if (typeof output.output === "string") {
+          output.output = `${output.output}\n\n${note}`
+        }
+      }
+
+      /**
+       * `mirrorResultNote(goal) -> string`: the after-hook's tool-result note
+       * (Strings). `verified`/`total` come from `planProgress(goal.plan)`; `k` is
+       * the number of the model's own rows kept (`goal.mirror.extra.length`);
+       * `dropped` is the runtime-only counter the before-hook's `pickExtras`
+       * leaves behind (`goal.mirror.lastDropped ?? 0` — absent until a call has
+       * actually trimmed something, and never persisted). The dropped
+       * parenthetical appears ONLY when `dropped > 0`; the kept sentence itself
+       * appears ONLY when `k >= 1` — zero extras of your own kept gets no second
+       * sentence at all.
+       */
+      function mirrorResultNote(goal) {
+        const progress = planProgress(goal.plan)
+        if (progress.total === 0) {
+          return "No goal plan is recorded yet — record one with goal_plan_set, and the Todo list will be redrawn from it."
+        }
+        let note = `Mirrored from the goal plan (${progress.verified}/${progress.total} verified).`
+        const k = goal.mirror.extra.length
+        if (k >= 1) {
+          const dropped = goal.mirror.lastDropped ?? 0
+          const noun = k === 1 ? "item" : "items"
+          const droppedClause = dropped > 0 ? ` (${dropped} dropped, cap ${MIRROR_MAX_EXTRAS})` : ""
+          note += ` ${k} ${noun} of your own kept${droppedClause}.`
+        }
+        return note
+      }
       // <<< v101:T13
 
 
