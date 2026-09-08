@@ -5796,9 +5796,13 @@ function mirrorNudgeLine(goal, mirrorMode) {
  * `isEmptyList(value)` -> boolean: `Array.isArray(value) && value.length === 0`.
  *
  * The refresh idiom the model is taught is `todowrite({todos: []})`, so "an empty
- * array" has to be told apart from "no list at all": a missing/malformed
- * `args.todos` is a native call the mirror must not intercept, while an empty
- * array is the deliberate refresh T11 re-emits the last rows for.
+ * array" has to be told apart from "no list at all". An empty array is the
+ * deliberate refresh T11 re-emits the last mirrored rows (or the terminal
+ * snapshot) for, even with no live plan. A missing/malformed `args.todos` is
+ * NOT that request: outside a live plan the mirror leaves it alone and the host
+ * answers it with its own schema error, and under a live plan the before-hook
+ * projects it while keeping the extras, because a call that carried no list
+ * carries nothing to re-derive them from.
  */
 function isEmptyList(value) {
   return Array.isArray(value) && value.length === 0
@@ -7101,7 +7105,21 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       // The model's own rows, minus the ones this plugin wrote last time, bounded
       // and capped. They are re-derived from every non-empty call, so the model
       // can delete an item of its own simply by omitting it.
-      const { extra, dropped } = pickExtras(output.args.todos, goal)
+      //
+      // A call that carried NO LIST AT ALL (`args.todos` missing, `null`, or any
+      // non-array — the shape the host answers with a rewrite-me schema error)
+      // offers no rows to re-derive the extras from, so it must KEEP them, for
+      // exactly the reason the empty-list branch above keeps them. Handing such a
+      // call to `pickExtras` returns `{extra: [], dropped: 0}` by contract, and
+      // assigning that empty array below would DELETE every row of the model's
+      // own — the one thing the mirror promises never to do — on a call that says
+      // nothing about them. The guard sits here, after the projection decision,
+      // and never above the tool gate at the top of this hook: an early return
+      // keyed on `todos` would let a mutant that deletes that gate survive,
+      // because a `bash` call carries no `todos` either.
+      const { extra, dropped } = Array.isArray(output.args.todos)
+        ? pickExtras(output.args.todos, goal)
+        : { extra: goal.mirror.extra, dropped: 0 }
       goal.mirror.extra = extra
       // Runtime-only scalar for the tool-result note: `normalizeMirror` drops it,
       // so a count from one call never reaches disk or a later session.
