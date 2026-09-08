@@ -13491,6 +13491,94 @@ test("an empty mirror never records a terminal snapshot", () => {
 
 // >>> v101:T15 tests - the stall-brake exemption
 // T15 units: 27, 28.
+
+// A turn whose only tool part is a todowrite call: the shape a mirror refresh
+// leaves behind. High output tokens, so the low-output/noProgress gate never
+// fires and the no-tool-call gate is the only brake under test.
+function mirrorRefreshTurnMessage(id) {
+  return {
+    info: {
+      id,
+      role: "assistant",
+      sessionID: "session-1",
+      tokens: { input: 1, output: 100, reasoning: 0 },
+    },
+    parts: [
+      textPart("Refreshed the todo panel."),
+      { type: "tool", tool: "todowrite", state: { status: "completed" } },
+    ],
+  }
+}
+
+test("a turn whose only tool call was a mirror refresh does not clear the tool-free strike", async () => {
+  // The predicate itself: todowrite is work by default and exempt when the
+  // caller hands it the mirror's tool names.
+  const turn = [mirrorRefreshTurnMessage("msg-mirror-0")]
+  assert.equal(turnCallsTool(turn), true, "no exemption set means todowrite is work")
+  assert.equal(messageHasWorkToolCall(turn[0]), true)
+  assert.equal(
+    turnCallsTool(turn, testInternals.MIRROR_TOOL_NAMES),
+    false,
+    "an exempted todowrite is not the turn's work",
+  )
+  assert.equal(messageHasWorkToolCall(turn[0], testInternals.MIRROR_TOOL_NAMES), false)
+  // A tool the model really called still counts even with the mirror exemption.
+  assert.equal(
+    turnCallsTool([toolMessage("Ran the build.")], testInternals.MIRROR_TOOL_NAMES),
+    true,
+  )
+
+  // And through the live brake: mirrorTodos defaults to "plan", so three
+  // todowrite-only turns pause on the no-tool-call gate exactly as three
+  // text-only turns do.
+  let sourceTurn = 0
+  const { calls, hooks } = await createHooks({
+    messages: async () => ({ data: [mirrorRefreshTurnMessage(`msg-mirror-${sourceTurn}`)] }),
+    onPromptAsync: () => {
+      sourceTurn += 1
+    },
+    options: { minDelayMs: 1, noToolCallTurnsBeforePause: 2 },
+  })
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "ship it" },
+    { parts: [] },
+  )
+  for (let i = 0; i < 3; i += 1) {
+    await hooks.event({
+      event: { type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
+    })
+  }
+
+  assert.equal(calls.length, 2)
+  const goal = currentGoal("session-1")
+  assert.equal(goal.stopped, true)
+  assert.equal(goal.stopReason, "no tool calls")
+})
+
+test("todowrite still counts as work when mirroring is off", async () => {
+  let sourceTurn = 0
+  const { calls, hooks } = await createHooks({
+    messages: async () => ({ data: [mirrorRefreshTurnMessage(`msg-mirror-${sourceTurn}`)] }),
+    onPromptAsync: () => {
+      sourceTurn += 1
+    },
+    options: { minDelayMs: 1, noToolCallTurnsBeforePause: 2, mirrorTodos: "off" },
+  })
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "ship it" },
+    { parts: [] },
+  )
+  for (let i = 0; i < 3; i += 1) {
+    await hooks.event({
+      event: { type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
+    })
+  }
+
+  assert.equal(calls.length, 3)
+  const goal = currentGoal("session-1")
+  assert.equal(goal.stopped, false)
+  assert.equal(goal.noToolCallTurns, 0)
+})
 // <<< v101:T15
 
 
