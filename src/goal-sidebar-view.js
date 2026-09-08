@@ -168,8 +168,32 @@ function normalizeAction(raw) {
 }
 
 // >>> v101:T24 exception-list filter for the mirrored action list (G2)
-// Reserved. T24 filters `goalPanelModel`'s action list to done-unverified, then blocked, then
-// in_progress when `plan.mirror` exists and its state is not "off".
+// The exception list. While the native Todo section is drawing this plan, the panel stops
+// repeating rows that section already shows and keeps only what it cannot express: a
+// completion with no passing verdict, then a blocker, then the work in flight. `pending`
+// and verified-`done` rows are dropped, so a clean plan renders zero rows and the progress
+// line carries the whole story.
+//
+// The groups are listed in the order a human has to act on them, and each group keeps plan
+// order internally, so the list is stable from render to render.
+const PANEL_EXCEPTION_GROUPS = [
+  (action) => action.status === "done" && !action.verified,
+  (action) => action.status === "blocked",
+  (action) => action.status === "in_progress",
+]
+
+// Filtering is a decision about THIS plugin's own mirror mode, never a belief about what
+// another panel currently shows. A v2 payload carries no `plan.mirror` at all, and an `off`
+// mirror means the plugin never touched the Todo list; both render every action, exactly as
+// they did before v1.0.1. The payload is arbitrary JSON from another process, so a
+// non-object `mirror` is treated as absent rather than trusted.
+function mirrorFiltersPanelActions(mirror) {
+  return isRecord(mirror) && mirror.state !== "off"
+}
+
+function panelExceptionList(actions) {
+  return PANEL_EXCEPTION_GROUPS.flatMap((inGroup) => actions.filter(inGroup))
+}
 // <<< v101:T24
 
 
@@ -237,11 +261,13 @@ export function goalPanelModel(raw) {
 
   const plan = isRecord(raw.plan) ? raw.plan : {}
   const planTotal = wholeNumber(plan.total)
-  const actions = (Array.isArray(plan.actions) ? plan.actions : [])
-    .map(normalizeAction)
-    .filter(Boolean)
-    .slice(0, MAX_PANEL_ACTIONS)
-  const hiddenActions = Math.max(0, planTotal - actions.length)
+  const listed = (Array.isArray(plan.actions) ? plan.actions : []).map(normalizeAction).filter(Boolean)
+  const filtered = mirrorFiltersPanelActions(plan.mirror)
+  const shortlist = filtered ? panelExceptionList(listed) : listed
+  const actions = shortlist.slice(0, MAX_PANEL_ACTIONS)
+  // Under the exception list the `+N more` count is over the FILTERED list: it promises the
+  // rows the cap dropped, never the `pending` actions the Todo section is already showing.
+  const hiddenActions = Math.max(0, (filtered ? shortlist.length : planTotal) - actions.length)
   const progress = planTotal
     ? `${wholeNumber(plan.verified)}/${planTotal} actions verified${
         wholeNumber(plan.blocked) ? `, ${wholeNumber(plan.blocked)} blocked` : ""

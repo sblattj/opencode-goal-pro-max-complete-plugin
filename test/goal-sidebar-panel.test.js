@@ -561,6 +561,122 @@ test("the shared budget formatters are the ones the panel and the title both use
 
 // >>> v101:T24 tests - the exception-list filter
 // T24 units: 33, 34.
+
+// A `plan.mirror` record shaped like the one `buildSidebarMetadata` publishes in v3.
+function mirror(state, overrides = {}) {
+  return { state, rows: 5, extra: 0, at: 1_757_280_000, ...overrides }
+}
+
+test("a fresh mirror renders only the actions that need attention", () => {
+  // Plan order deliberately interleaves the groups, so an implementation that merely
+  // dropped `pending` rows without regrouping would render a different order.
+  const actions = [
+    { id: "a1", title: "pending work", status: "pending", verdict: null },
+    { id: "a2", title: "in flight", status: "in_progress", verdict: null },
+    { id: "a3", title: "claimed done", status: "done", verdict: null },
+    { id: "a4", title: "waiting on review", status: "blocked", verdict: null },
+    { id: "a5", title: "proven done", status: "done", verdict: "pass" },
+    { id: "a6", title: "done, verdict fail", status: "done", verdict: "fail" },
+  ]
+  const plan = { total: 6, verified: 1, blocked: 1, mirror: mirror("fresh"), actions }
+
+  const model = goalPanelModel(payload({ plan }))
+  assert.deepEqual(
+    model.actions.map((action) => action.title),
+    ["claimed done", "done, verdict fail", "waiting on review", "in flight"],
+  )
+  // The two rows the Todo section can express on its own are the ones dropped: an
+  // untouched `pending` action and a completion that already carries its verdict.
+  assert.deepEqual(
+    model.actions.map((action) => action.mark),
+    ["●", "●", "⛔", "◐"],
+  )
+  assert.equal(model.hiddenActions, 0)
+  // The progress line still counts the WHOLE plan, so nothing is lost by filtering rows.
+  assert.equal(model.progress, "1/6 actions verified, 1 blocked")
+
+  // A stale mirror is still a mirror: the Todo section holds an older copy of these rows,
+  // so the panel keeps filtering rather than duplicating the list.
+  assert.deepEqual(
+    goalPanelModel(payload({ plan: { ...plan, mirror: mirror("stale") } })).actions.map((a) => a.title),
+    ["claimed done", "done, verdict fail", "waiting on review", "in flight"],
+  )
+
+  // Controls that must come out DIFFERENT: `off` is the plugin's own statement that it
+  // never touched the Todo list, and a non-object `mirror` is junk from another process.
+  // Both fall back to today's rendering — every action, in plan order.
+  for (const junk of [mirror("off"), "fresh", 3, null, undefined, ["fresh"]]) {
+    assert.deepEqual(
+      goalPanelModel(payload({ plan: { ...plan, mirror: junk } })).actions.map((a) => a.title),
+      actions.map((action) => action.title),
+      `mirror ${JSON.stringify(junk)} must render every action`,
+    )
+  }
+})
+
+test("a fully verified plan renders the progress line and no rows", () => {
+  const actions = Array.from({ length: 4 }, (_, index) => ({
+    id: `a${index}`,
+    title: `action ${index}`,
+    status: "done",
+    verdict: "pass",
+  }))
+  const plan = { total: 4, verified: 4, blocked: 0, mirror: mirror("fresh"), actions }
+
+  const model = goalPanelModel(payload({ plan }))
+  assert.deepEqual(model.actions, [])
+  // Zero rows must not resurrect the `+N more` line: there is nothing more to show.
+  assert.equal(model.hiddenActions, 0)
+  assert.equal(model.progress, "4/4 actions verified")
+
+  // The same plan with the mirror off is the control: it still renders all four rows.
+  const off = goalPanelModel(payload({ plan: { ...plan, mirror: mirror("off") } }))
+  assert.equal(off.actions.length, 4)
+  assert.equal(off.progress, "4/4 actions verified")
+})
+
+test("the exception list keeps plan order within each group and caps at MAX_PANEL_ACTIONS", () => {
+  // 24 actions, one of each status in turn: 6 pending, 6 done-unverified, 6 blocked,
+  // 6 in_progress. The exception list is 18 rows, which the cap trims to 12.
+  const shape = [
+    { status: "pending", verdict: null },
+    { status: "done", verdict: null },
+    { status: "blocked", verdict: null },
+    { status: "in_progress", verdict: null },
+  ]
+  const actions = Array.from({ length: 24 }, (_, index) => ({
+    id: `a${index}`,
+    title: `action ${index}`,
+    ...shape[index % shape.length],
+  }))
+  const model = goalPanelModel(
+    payload({ plan: { total: 24, verified: 0, blocked: 6, mirror: mirror("fresh"), actions } }),
+  )
+
+  assert.equal(model.actions.length, 12)
+  assert.deepEqual(
+    model.actions.map((action) => action.title),
+    [
+      // every done-unverified action, in plan order...
+      "action 1",
+      "action 5",
+      "action 9",
+      "action 13",
+      "action 17",
+      "action 21",
+      // ...then the blocked ones, also in plan order, until the cap bites.
+      "action 2",
+      "action 6",
+      "action 10",
+      "action 14",
+      "action 18",
+      "action 22",
+    ],
+  )
+  // 18 exceptions less the 12 shown. `plan.total` is 24, so counting against the plan
+  // rather than the filtered list would promise 12 rows that the panel would never show.
+  assert.equal(model.hiddenActions, 6)
+})
 // <<< v101:T24
 
 
