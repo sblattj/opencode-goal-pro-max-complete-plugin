@@ -676,7 +676,7 @@ const mutants = [
     to: "",
     test: "test/goal-plugin.test.js",
   },
-  // >>> v101:T29 the seven todo-mirror mutation anchors (design §5.3)
+  // The seven todo-mirror mutation anchors (design §5.3)
   // Design §5.3 lists seven mutants; this region carries twelve records.
   //
   // Mutant 7 became TWO records. Its guard is byte-identical in the before- and
@@ -851,9 +851,6 @@ const mutants = [
     to: "    return !isPluginOwnToolName(name)",
     test: "test/goal-plugin.test.js",
   },
-  // <<< v101:T29
-
-
 
 ]
 

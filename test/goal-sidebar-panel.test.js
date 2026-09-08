@@ -17,7 +17,7 @@ import {
 } from "../src/goal-sidebar-view.js"
 import { formatBudgetMinutes, formatTurnBudget, UNLIMITED_MARK } from "../src/goal-format.js"
 // v1.0.1 wave-4 integration (unit 38): the SERVER half. The cross-half parity unit
-// in the v101:INT4 region below builds a real goal, mirrors it through the real
+// below builds a real goal, mirrors it through the real
 // tool.execute hooks and publishes a real payload, so the number the panel prints is
 // the number the server computed rather than one this file typed.
 import { GoalPlugin, testInternals } from "../src/goal-plugin.js"
@@ -564,7 +564,7 @@ test("the shared budget formatters are the ones the panel and the title both use
   assert.equal(formatTurnBudget(3, null), "3/∞")
 })
 
-// >>> v101:T24 tests - the exception-list filter
+// Tests - the exception-list filter
 // T24 units: 33, 34.
 
 // A `plan.mirror` record shaped like the one `buildSidebarMetadata` publishes in v3.
@@ -598,7 +598,7 @@ test("a fresh mirror renders only the actions that need attention", () => {
   )
   assert.equal(model.hiddenActions, 0)
   // The progress line still counts the WHOLE plan, so nothing is lost by filtering rows.
-  // v101:T25 edit: a fresh mirror now also carries the progress-line suffix (unit 35's
+  // A fresh mirror now also carries the progress-line suffix (unit 35's
   // sibling unit); this test predates T25, so the expectation is extended, not the model.
   assert.equal(model.progress, "1/6 actions verified, 1 blocked · todo mirror fresh (5)")
 
@@ -634,7 +634,7 @@ test("a fully verified plan renders the progress line and no rows", () => {
   assert.deepEqual(model.actions, [])
   // Zero rows must not resurrect the `+N more` line: there is nothing more to show.
   assert.equal(model.hiddenActions, 0)
-  // v101:T25 edit: extended for the new fresh-mirror suffix (see the note above).
+  // Extended for the new fresh-mirror suffix (see the note above).
   assert.equal(model.progress, "4/4 actions verified · todo mirror fresh (5)")
 
   // The same plan with the mirror off is the control: it still renders all four rows.
@@ -685,11 +685,8 @@ test("the exception list keeps plan order within each group and caps at MAX_PANE
   // rather than the filtered list would promise 12 rows that the panel would never show.
   assert.equal(model.hiddenActions, 6)
 })
-// <<< v101:T24
 
-
-
-// >>> v101:T25 tests - the mirror suffix on the progress line
+// Tests - the mirror suffix on the progress line
 // T25 units: 35 ("mirror off renders every action, exactly as v2 did" — design §5.2 line 725;
 // the task brief's own gloss on this unit, "under \"off\" the model's action list, progress
 // line and every field equal the v2 rendering of the same plan", is what the assertions below
@@ -757,11 +754,8 @@ test("the progress line names a fresh mirror with the live count and a stale one
     assert.equal(model.progress, "1/2 actions verified · todo mirror fresh (5)", `liveTodoCount ${String(junk)}`)
   }
 })
-// <<< v101:T25
 
-
-
-// >>> v101:T26 tests - the live drift check
+// Tests - the live drift check
 // T26 units: 37, plus "a live count that matches the payload renders as fresh" and
 // "GoalPanel tolerates a host without a todo state reader" (the latter two are new for T26 and
 // are not in design 5.2's numbered list). Unit 37's NAME is design 5.2's verbatim string, per
@@ -920,11 +914,8 @@ test("GoalPanel tolerates a host without a todo state reader", async () => {
   assert.equal(nameless.render(""), undefined, "an empty session id renders no panel at all")
   assert.deepEqual(unasked, [])
 })
-// <<< v101:T26
 
-
-
-// >>> v101:T27 tests - a v2 payload still renders as today
+// Tests - a v2 payload still renders as today
 // T27 units: 36.
 test("a v2 payload with no mirror key renders the actions", () => {
   // A payload shaped exactly like v1.0.0's `buildSidebarMetadata` output: `v:
@@ -987,11 +978,8 @@ test("a v2 payload with no mirror key renders the actions", () => {
   // ...and no mirror suffix anywhere on the progress line.
   assert.equal(/todo mirror|todo list stale|mirror drift/.test(model.progress), false)
 })
-// <<< v101:T27
 
-
-
-// >>> v101:T39 tests - the needs-evidence suffix on a panel action line
+// Tests - the needs-evidence suffix on a panel action line
 // T39 units: A3 ("a done action without a passing verdict carries the needs-evidence suffix on its panel line").
 test("a done action without a passing verdict carries the needs-evidence suffix on its panel line", async () => {
   const runtime = fakeRuntime()
@@ -1066,11 +1054,8 @@ test("a verified done action carries no suffix", async () => {
     { fg: THEME.success, text: "● proved [pass]" },
   ])
 })
-// <<< v101:T39
 
-
-
-// >>> v101:INT4 wave-4 integration - the cross-half seam no single seat could test
+// Wave-4 integration - the cross-half seam no single seat could test
 // Written by the wave-4 integrator, not by a seat. Unit 38 is design §5.2's
 // "cross-half parity" unit, and it is the one unit in this wave that no seat could
 // write: T23 (wave 3) proved the SERVER publishes `plan.mirror.rows`, and T25/T26
@@ -1203,4 +1188,3 @@ test("the server's v3 payload and the panel agree on the mirrored count", async 
   assert.ok(hostTodos[0].content.endsWith(" — needs claim/evidence/verdict"))
   assert.ok(texts.at(-2).endsWith(" — needs claim/evidence/verdict"))
 })
-// <<< v101:INT4

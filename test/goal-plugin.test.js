@@ -12825,7 +12825,7 @@ test("the terminal sidebar render keeps the context ceiling learned from the mod
   assert.deepEqual(finished.context, { used: 147_100, max: 1_000_000 })
 })
 
-// >>> v101:T1 tests - mirrorRowStatus / mirrorRowSuffix
+// Tests - mirrorRowStatus / mirrorRowSuffix
 // T1 units: 2, 3 (titles verbatim in CONTRACTS "Unit inventory" / design §5.1).
 test("a done action without a passing verdict mirrors as in-progress, not completed", () => {
   const verified = { id: "a1", title: "Ship it", status: "done", claim: "shipped", evidence: "logs show it", verdict: "pass" }
@@ -12865,11 +12865,8 @@ test("pending and in-progress actions mirror with their own status and no suffix
   assert.equal(mirrorRowStatus(inProgress), "in_progress")
   assert.equal(mirrorRowSuffix(inProgress), "")
 })
-// <<< v101:T1
 
-
-
-// >>> v101:T2 tests - projectPlanToTodos
+// Tests - projectPlanToTodos
 // T2 units: 1, 5, 6.
 function t2PlanAction(overrides = {}) {
   return { id: "a1", title: "Ship the thing", status: "pending", claim: "", evidence: "", verdict: null, ...overrides }
@@ -12984,11 +12981,8 @@ test("the projector appends extras after the plan rows without re-bounding them"
   assert.deepEqual(rows.slice(2), extras)
   assert.ok(rows[0].content.startsWith("a1 · "))
 })
-// <<< v101:T2
 
-
-
-// >>> v101:T3 tests - mirrorRow / mirrorRowPriority
+// Tests - mirrorRow / mirrorRowPriority
 // T3 units: 4 (design §5.1 name, verbatim), plus "the first open row is high priority, later
 // open rows medium, completed rows low", plus "mirrorRow never emits an undefined field".
 // (Unit 1 — "the plan projects onto native rows carrying exactly content, status and priority" —
@@ -13068,11 +13062,8 @@ test("the projector spends the high slot on the first row the model still has to
     ["low", "high", "medium"],
   )
 })
-// <<< v101:T3
 
-
-
-// >>> v101:T4 tests - mirrorFingerprint
+// Tests - mirrorFingerprint
 // T4 units: 26.
 test("the mirror fingerprint ignores plan edits that do not change a rendered row", () => {
   const { mirrorFingerprint } = testInternals
@@ -13104,11 +13095,8 @@ test("the fingerprint of an empty row list is stable and non-empty", () => {
   // A non-array input hashes the same as `[]`, never `""`.
   assert.equal(mirrorFingerprint(undefined), first)
 })
-// <<< v101:T4
 
-
-
-// >>> v101:T5 tests - isMirrorOwnedRow / pickExtras
+// Tests - isMirrorOwnedRow / pickExtras
 // T5 units: 12 (picker half), 14, 15, and the pure half of 15b.
 //
 // Wave-1 integration un-todoed the four inventory units below: they drive
@@ -13258,11 +13246,8 @@ test("pickExtras reports how many model rows the cap dropped", () => {
   assert.equal(over.extra.length, MIRROR_MAX_EXTRAS)
   assert.equal(over.extra.at(-1).content, `mine ${MIRROR_MAX_EXTRAS}`, "the cap keeps the first rows, not the last")
 })
-// <<< v101:T5
 
-
-
-// >>> v101:T6 tests - boundExtraContent / resetMirrorForNewGoal
+// Tests - boundExtraContent / resetMirrorForNewGoal
 // T6 units: 39, 40.
 test("an extra row's content is bounded like a plan row", () => {
   const long = "x".repeat(5000)
@@ -13287,11 +13272,8 @@ test("extras are cleared when a new goal is set", () => {
   resetMirrorForNewGoal(goal)
   assert.deepEqual(goal.mirror, { fingerprint: "", at: 0, rows: [], nudges: 0, extra: [] })
 })
-// <<< v101:T6
 
-
-
-// >>> v101:T7 tests - normalizeMirrorMode and the mirrorTodos option
+// Tests - normalizeMirrorMode and the mirrorTodos option
 // T7 units: 24.
 test("mirrorTodos normalizes to plan or off, defaulting to plan", () => {
   assert.equal(testInternals.normalizeMirrorMode(undefined), "plan")
@@ -13301,11 +13283,8 @@ test("mirrorTodos normalizes to plan or off, defaulting to plan", () => {
   assert.equal(testInternals.normalizeMirrorMode(0), "plan")
   assert.equal(testInternals.normalizeMirrorMode("adopt"), "plan")
 })
-// <<< v101:T7
 
-
-
-// >>> v101:T8 tests - normalizeMirror and the persisted record
+// Tests - normalizeMirror and the persisted record
 // T8 units: 25.
 test("a goal record written before this release loads with an empty, never-mirrored record", () => {
   // A pre-v1.0.1 state file has no `mirror` key at all. normalizePersistedGoal
@@ -13430,11 +13409,8 @@ test("a row loaded from disk is spelled exactly as the projector would spell it"
     }
   }
 })
-// <<< v101:T8
 
-
-
-// >>> v101:T9 tests - mirrorTerminals snapshot accessors
+// Tests - mirrorTerminals snapshot accessors
 // T9 units: 41.
 test("the mirror terminal collection stores, reads and drops a session snapshot", () => {
   const sessionID = "session-mirror-terminal-store"
@@ -13469,11 +13445,8 @@ test("an empty mirror never records a terminal snapshot", () => {
   dropMirrorTerminal(sessionID)
   assert.equal(readMirrorTerminal(sessionID), undefined)
 })
-// <<< v101:T9
 
-
-
-// >>> v101:T10 tests - the before-hook signature, tool gate and guard ladder
+// Tests - the before-hook signature, tool gate and guard ladder
 // T10 units: 7, 8, 9, 10, 11, 47.
 //
 // `testInternals` is destructured inside each test rather than at module scope so
@@ -13692,11 +13665,8 @@ test("the before-hook ignores tools other than todowrite and never adds a todos 
   )
   assert.equal(mirrored.args.todos.length, 2)
 })
-// <<< v101:T10
 
-
-
-// >>> v101:T11 tests - the empty-todowrite interception (X1)
+// Tests - the empty-todowrite interception (X1)
 // T11 units: 13, 42, 43, 44, 45.
 //
 // The A1 ladder. `todowrite({todos: []})` is the refresh idiom the plugin teaches,
@@ -13960,11 +13930,8 @@ test("an empty todowrite with mirrorTodos off passes through, and no prompt surf
   assert.notEqual(on.args.todos, on.todos)
   assert.equal(on.args.todos.length, 1)
 })
-// <<< v101:T11
 
-
-
-// >>> v101:T12 tests - the after-hook freshness stamp
+// Tests - the after-hook freshness stamp
 // T12 units: 16, 17, 46.
 //
 // The three units share one shape: build a real plugin (so `mirrorMode`, `persist` and the bound
@@ -14098,11 +14065,8 @@ test("the after-hook ignores tools other than todowrite", async () => {
   )
   assert.equal(readMirrorTerminal(sessionID), undefined)
 })
-// <<< v101:T12
 
-
-
-// >>> v101:T13 tests - the after-hook result note
+// Tests - the after-hook result note
 // T13 units: 18, 15b (15b = "dropped extras are named in the tool result only when the cap
 // trimmed them"), and the result half of 10 (the "left alone" half is T10/T11's guard; this
 // drives the after-hook directly with the non-empty list that guard leaves behind).
@@ -14230,17 +14194,14 @@ test("dropped extras are named in the tool result only when the cap trimmed them
 })
 
 // Unit 10 ("a NON-EMPTY todowrite is left alone before a plan exists, and the result
-// says to record one") lived here as T13's result half and in the v101:T10 region as
+// says to record one") lived here as T13's result half and in the before-hook section as
 // T10's before-hook half, under the same name — neither seat could reach the other's
 // region, and T13's report asked the integrator to join them rather than ship a
 // duplicate test name. At wave-2 integration the two halves were merged into the T10
 // copy, which now drives both hooks and carries the result-half control as well. The
 // no-plan hint's exact bytes are asserted there.
-// <<< v101:T13
 
-
-
-// >>> v101:T14 tests - staleness, mirror state and the nudge budget
+// Tests - staleness, mirror state and the nudge budget
 // T14 units: 19, 21, 22. Unit 20 ("a stale mirror adds one line to the continuation and a fresh one
 // adds nothing") asserts on buildContinueMessage, which T19 wires; it lives in the T19 region.
 //
@@ -14407,11 +14368,8 @@ test("a successful mirror does NOT refund the nudge budget", async () => {
   assert.equal(sixth.includes(T14_NUDGE_LINE), false)
   assert.equal(goal.mirror.nudges, 3)
 })
-// <<< v101:T14
 
-
-
-// >>> v101:T15 tests - the stall-brake exemption
+// Tests - the stall-brake exemption
 // T15 units: 27, 28.
 
 // A turn whose only tool part is a todowrite call: the shape a mirror refresh
@@ -14501,11 +14459,8 @@ test("todowrite still counts as work when mirroring is off", async () => {
   assert.equal(goal.stopped, false)
   assert.equal(goal.noToolCallTurns, 0)
 })
-// <<< v101:T15
 
-
-
-// >>> v101:T16 tests - /goal resume refunds the nudge budget
+// Tests - /goal resume refunds the nudge budget
 // T16 units: 23.
 test("/goal resume restores the nudge budget without touching the fingerprint or the carried rows", async () => {
   const sessionID = "session-t16-resume-nudges"
@@ -14539,11 +14494,8 @@ test("/goal resume restores the nudge budget without touching the fingerprint or
   assert.deepEqual(resumed.mirror.rows, rows)
   assert.deepEqual(resumed.mirror.extra, extra)
 })
-// <<< v101:T16
 
-
-
-// >>> v101:T17 tests - the goal-end snapshot and the handback line
+// Tests - the goal-end snapshot and the handback line
 // T17 units: 41, 48.
 const T17_MIRRORED_ROWS = [
   { content: "a1 · Ship the todo mirror", status: "in_progress", priority: "high" },
@@ -14676,11 +14628,8 @@ test("the goal-end response carries the todo handback line only when rows were m
   assert.equal(bareResult.ok, true)
   assert.equal(bareResult.message, "Goal marked complete and archived.")
 })
-// <<< v101:T17
 
-
-
-// >>> v101:T18 tests - the plan system-block sentence
+// Tests - the plan system-block sentence
 // T18 units: 49.
 test("the plan system block names the mirror in constant text, and the no-plan branch is unchanged", () => {
   const SYSTEM_BLOCK_SENTENCE =
@@ -14709,11 +14658,8 @@ test("the plan system block names the mirror in constant text, and the no-plan b
   const second = buildPlanSystemLines(goalWithPlan, { mirrorMode: "plan" }).join("\n")
   assert.equal(first, second)
 })
-// <<< v101:T18
 
-
-
-// >>> v101:T19 tests - the continuation nudge line
+// Tests - the continuation nudge line
 // T19 units: 20.
 test("a stale mirror adds one line to the continuation and a fresh one adds nothing", async () => {
   const { hooks } = await createHooks()
@@ -14791,11 +14737,8 @@ test("a stale mirror adds one line to the continuation and a fresh one adds noth
   assert.equal(goal.mirror.nudges, 1, "landing the refresh must not refund or spend the budget")
   assert.equal(freshAgainMessage, buildContinueMessage(goal, { mirrorMode: "off" }))
 })
-// <<< v101:T19
 
-
-
-// >>> v101:T20 tests - the compaction stale line
+// Tests - the compaction stale line
 // T20 units: 50.
 const T20_STALE_LINE =
   "The session's Todo list is stale — it shows an older copy of the plan; one todowrite({todos: []}) refreshes it."
@@ -14873,11 +14816,8 @@ test("compaction context names a stale mirror only while stale", async () => {
   await offHooks["experimental.session.compacting"]({ sessionID: offSid }, offCompactOutput)
   assert.equal(offCompactOutput.context[0].includes(T20_STALE_LINE), false)
 })
-// <<< v101:T20
 
-
-
-// >>> v101:T21 tests - the two plan tool descriptions
+// Tests - the two plan tool descriptions
 // T21 units: 51. Amended (v1.0.1 wave 5, T40): CONTRACTS "Tool-description append ... (T21)" was
 // revised after int3 so the append is gated on mirrorMode !== "off" (design SS4.6 :629-:631,
 // "off" restores v1.0.0 exactly). `buildAgentTools`'s new `mirrorMode` parameter defaults to
@@ -14990,11 +14930,8 @@ test("goal_plan_set and goal_action_update descriptions are byte-identical to v1
   assert.equal(offTools.goal_plan_set.description, v100.planSet)
   assert.equal(offTools.goal_action_update.description, v100.actionUpdate)
 })
-// <<< v101:T21
 
-
-
-// >>> v101:T22 tests - the tool.definition todowrite suffix
+// Tests - the tool.definition todowrite suffix
 // T22 units: 30, 31, 52.
 //
 // `TODOWRITE_MIRROR_DESCRIPTION` is module-scope in src/goal-plugin.js but is not
@@ -15093,11 +15030,8 @@ test("the tool.definition hook tolerates a missing output or a non-string descri
   await assert.doesNotReject(() => hooks["tool.definition"]({ toolID: "todowrite" }, nonStringDescription))
   assert.equal(nonStringDescription.description, 42)
 })
-// <<< v101:T22
 
-
-
-// >>> v101:T23 tests - the v3 sidebar payload
+// Tests - the v3 sidebar payload
 // T23 units: 38 (a §5.2 cross-half parity unit: assert the SERVER half of it here, the panel half in test/goal-sidebar-panel.test.js).
 function mirrorPayloadFixture() {
   const now = Date.now()
@@ -15209,11 +15143,8 @@ test("the server's v3 payload reports the mirrored row count", () => {
   assert.equal(payload.plan.mirror.rows, 5)
   assert.equal(payload.plan.mirror.extra, 2)
 })
-// <<< v101:T23
 
-
-
-// >>> v101:T38 tests - the <existing_todos> offer on /goal set
+// Tests - the <existing_todos> offer on /goal set
 // T38 units: 29.
 test("setting a goal in a session with existing todos offers them to the model without adopting them", async () => {
   let sourceTurn = 0
@@ -15285,16 +15216,13 @@ test("a failing todo read never blocks /goal set", async () => {
     "the failure must be logged",
   )
 })
-// <<< v101:T38
 
-
-
-// >>> v101:T28 tests - the ledger-isolation guard
+// Tests - the ledger-isolation guard
 // T28 units: 32.
 // Imported directly rather than through `testInternals`: CONTRACTS ("do NOT edit the
 // testInternals export object") froze that bag before this wave existed, and
 // `assertPlanLedgerIsolated` is exported as a plain named export instead (see the
-// `v101:T28` region in src/goal-plugin.js). A second `import` statement mid-file is
+// ledger-isolation section of src/goal-plugin.js). A second `import` statement mid-file is
 // valid ESM (import declarations are hoisted regardless of position).
 import { assertPlanLedgerIsolated } from "../src/goal-plugin.js"
 
@@ -15329,7 +15257,7 @@ function t28AssertLedgerUntouched(goal, expected, label) {
 test("no todo status, title or completion ever reaches goal.plan.actions", async () => {
   const sep = testInternals.MIRROR_ID_SEPARATOR
   const sessionID = "t28-ledger-isolation-e2e"
-  // ONE plugin instance for this whole test (v101:INT3 trap): a second createHooks()
+  // ONE plugin instance for this whole test (integration trap): a second createHooks()
   // would publish a second `lastRuntime` and orphan this session's goal.
   const { hooks } = await createHooks()
   const { handlers } = makeAgentHandlers()
@@ -15500,11 +15428,8 @@ test("no todo status, title or completion ever reaches goal.plan.actions", async
 
   t28AssertLedgerUntouched(control, expected, "after the control arm is fully restored")
 })
-// <<< v101:T28
 
-
-
-// >>> v101:INT2 wave-2 integration - the cross-seat seam no single seat could test
+// Wave-2 integration - the cross-seat seam no single seat could test
 // Written by the wave-2 integrator, not by a seat. Every seat branched from the same
 // base, so T14 could not drive T12's `stampMirror` (it stamped with its own
 // `t14StampMirror`), T12 could not drive T10/T11's before-hook, and none of them could
@@ -15599,10 +15524,9 @@ test("the taught refresh idiom really clears staleness across the wave-2 seats",
   assert.equal(controlGoal.mirror.at > 0, true, "the control WAS stamped")
   assert.equal(mirrorIsFresh(controlGoal), false, "a stamp of non-plan rows reads stale")
 })
-// <<< v101:INT2
 
 
-// >>> v101:INT3 wave-3 integration - the off-mode seam no single seat could test
+// Wave-3 integration - the off-mode seam no single seat could test
 // Written by the wave-3 integrator, not by a seat. Unit 24 is a claim about SIX
 // surfaces at once - T10/T11's before-hook, T18's system block, T19's continuation,
 // T20's compaction context, T22's tool.definition and T23's payload - and every seat
@@ -15875,4 +15799,3 @@ test("with mirrorTodos off the <existing_todos> offer is neither read nor render
   assert.match(onText, /<existing_todos>/)
   assert.match(onText, /- write the launch checklist \(pending\)/)
 })
-// <<< v101:INT3
