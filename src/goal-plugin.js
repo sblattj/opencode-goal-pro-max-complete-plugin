@@ -5358,13 +5358,25 @@ function projectPlanToTodos(plan, extras) {
  * coerces via `String(...)`, never emits `undefined`/`null`; missing status -> `"pending"`, missing
  * priority -> `"medium"`, empty/missing content -> `"(untitled)"`.
  */
-function mirrorRow({ content, status, priority } = {}) {
-  const hasContent = typeof content === "string" && content.length > 0
+function mirrorRow(raw) {
+  const { content, status, priority } = raw && typeof raw === "object" ? raw : {}
   return {
-    content: hasContent ? content : "(untitled)",
-    status: status === undefined || status === null ? "pending" : String(status),
-    priority: priority === undefined || priority === null ? "medium" : String(priority),
+    content: mirrorRowField(content, "(untitled)"),
+    status: mirrorRowField(status, "pending"),
+    priority: mirrorRowField(priority, "medium"),
   }
+}
+
+/**
+ * One field of a mirrored row: coerce with `String(...)` per CONTRACTS, then fall back to the
+ * field's default when the value was absent or coerced to the empty string. Keeping all three
+ * fields on one rule is what makes the "three non-empty strings" invariant hold: an empty status
+ * or priority is as unusable to the host as a missing one.
+ */
+function mirrorRowField(value, fallback) {
+  if (value === undefined || value === null) return fallback
+  const coerced = String(value)
+  return coerced.length > 0 ? coerced : fallback
 }
 
 /**
@@ -5482,31 +5494,15 @@ function normalizeMirrorMode(value) {
 
 // >>> v101:T8 the persisted mirror record, read side
 /**
- * Coerces a single mirror row to the T3 `mirrorRow` shape (`{ content, status,
- * priority }`, all strings, with the same defaults T3 documents: missing
- * status -> "pending", missing priority -> "medium", empty/missing content ->
- * "(untitled)"). T3's own `mirrorRow` is a scaffold stub that throws
- * unconditionally (`throw new Error("v1.0.1 T3: not implemented")`), so it
- * cannot be called here yet; this coerces inline with `String(...)` instead,
- * matching T3's documented contract so the two behave identically once T3
- * lands.
+ * Persisted rows are coerced by the SAME function that produced them, T3's `mirrorRow`. This seat
+ * originally carried its own copy because `mirrorRow` was still a throwing scaffold stub in the T8
+ * worktree; wave-1 integration landed T3, and the two copies did not in fact agree (a non-string
+ * content came back "42" here and "(untitled)" there), so the copy is gone. A row must render
+ * identically whether it was just projected or just loaded from disk, or `mirrorIsFresh` compares
+ * two spellings of the same row and reports a fresh mirror as permanently stale.
  */
-function normalizeMirrorRow(raw) {
-  const source = raw && typeof raw === "object" ? raw : {}
-  const content = source.content === undefined || source.content === null || source.content === ""
-    ? "(untitled)"
-    : String(source.content)
-  const status = source.status === undefined || source.status === null || source.status === ""
-    ? "pending"
-    : String(source.status)
-  const priority = source.priority === undefined || source.priority === null || source.priority === ""
-    ? "medium"
-    : String(source.priority)
-  return { content, status, priority }
-}
-
 function normalizeMirrorRows(raw) {
-  return Array.isArray(raw) ? raw.map(normalizeMirrorRow) : []
+  return Array.isArray(raw) ? raw.map((row) => mirrorRow(row)) : []
 }
 
 /**

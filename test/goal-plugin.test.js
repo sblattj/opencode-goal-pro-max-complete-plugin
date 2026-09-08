@@ -12870,32 +12870,24 @@ function t2Plan(count, overrides = () => ({})) {
   }
 }
 
-// T1 (`mirrorRowStatus`/`mirrorRowSuffix`) and T3 (`mirrorRow`/`mirrorRowPriority`) are stubs that
-// throw until wave 1 integrates. The projector is contractually required to route every plan row
-// through them, so before they land there is exactly one falsifiable row-level claim available:
-// that the projector delegates instead of inlining the row rules. These units assert THAT while the
-// stubs are dead and the full CONTRACTS row shape once they are live; nothing here re-implements a
-// sibling region's rules.
-const t2RowRulesLive = (() => {
+// The projector is contractually required to route every plan row through the T1
+// (`mirrorRowStatus`/`mirrorRowSuffix`) and T3 (`mirrorRow`/`mirrorRowPriority`) helpers. While
+// those were scaffold stubs that threw, the four units below took a weaker branch that only
+// asserted the delegation. Wave-1 integration landed all four helpers, so the weaker branch was
+// removed: a silent fallback would let a regression to a throwing stub downgrade four units to a
+// far weaker claim without turning the suite red. This test is the loud replacement — it fails if
+// any of the four row helpers stops working.
+test("the row helpers the projector delegates to are all live", () => {
   const probe = t2PlanAction()
-  try {
-    testInternals.mirrorRowStatus(probe)
-    testInternals.mirrorRowSuffix(probe)
-    testInternals.mirrorRowPriority(probe, 0)
-    testInternals.mirrorRow({ content: "probe", status: "pending", priority: "low" })
-    return true
-  } catch {
-    return false
-  }
-})()
-
-function t2AssertDelegatesToRowRules(plan, extras) {
-  assert.throws(
-    () => testInternals.projectPlanToTodos(plan, extras),
-    /not implemented/,
-    "every plan row must be built by the T1/T3 helpers, not inline",
-  )
-}
+  assert.equal(typeof testInternals.mirrorRowStatus(probe), "string")
+  assert.equal(typeof testInternals.mirrorRowSuffix(probe), "string")
+  assert.equal(typeof testInternals.mirrorRowPriority(probe, 0), "string")
+  assert.deepEqual(testInternals.mirrorRow({ content: "probe", status: "pending", priority: "low" }), {
+    content: "probe",
+    status: "pending",
+    priority: "low",
+  })
+})
 
 test("the plan projects onto native rows carrying exactly content, status and priority", () => {
   const plan = {
@@ -12905,10 +12897,6 @@ test("the plan projects onto native rows carrying exactly content, status and pr
       t2PlanAction({ id: "a3", title: "Third", status: "blocked", claim: "the API key is missing" }),
     ],
     updatedAt: 0,
-  }
-  if (!t2RowRulesLive) {
-    t2AssertDelegatesToRowRules(plan, [])
-    return
   }
   const rows = testInternals.projectPlanToTodos(plan, [])
   assert.equal(rows.length, 3)
@@ -12926,10 +12914,6 @@ test("the plan projects onto native rows carrying exactly content, status and pr
 test("a plan longer than the mirror cap ends in one counted overflow row", () => {
   const cap = testInternals.MIRROR_MAX_TODOS
   const over = t2Plan(cap + 5)
-  if (!t2RowRulesLive) {
-    t2AssertDelegatesToRowRules(over, [])
-    return
-  }
   const rows = testInternals.projectPlanToTodos(over, [])
   assert.equal(rows.length, cap, "plan rows never exceed the cap, overflow row included")
   assert.deepEqual(rows.at(-1), {
@@ -12956,10 +12940,6 @@ test("mirrored rows carry the action id as a content prefix", () => {
     ],
     updatedAt: 0,
   }
-  if (!t2RowRulesLive) {
-    t2AssertDelegatesToRowRules(plan, [])
-    return
-  }
   const rows = testInternals.projectPlanToTodos(plan, [])
   // F7: a native todo has no id field, so the id can only survive as a content
   // prefix - and `isMirrorOwnedRow` parses it back out of exactly these bytes.
@@ -12985,10 +12965,6 @@ test("the projector appends extras after the plan rows without re-bounding them"
   assert.deepEqual(testInternals.projectPlanToTodos(undefined, undefined), [])
 
   const plan = t2Plan(2)
-  if (!t2RowRulesLive) {
-    t2AssertDelegatesToRowRules(plan, extras)
-    return
-  }
   const rows = testInternals.projectPlanToTodos(plan, extras)
   assert.equal(rows.length, 4)
   assert.deepEqual(rows.slice(2), extras)
@@ -13034,16 +13010,50 @@ test("mirrorRow never emits an undefined field", () => {
   assert.deepEqual(Object.keys(row).sort(), ["content", "priority", "status"])
 })
 
-// "the first open row is high priority, later open rows medium, completed rows low": DEFERRED.
-// mirrorRowPriority(action, index) must call the sibling mirrorRowStatus(action) (T1) FIRST, on
-// every call, because a completed row must win "low" over an index-0 "high" — the ordering in
-// CONTRACTS ("completed -> low; index === 0 -> high; else medium") is not just presentation order,
-// it is the correctness rule. Until T1 lands, mirrorRowStatus throws unconditionally for ANY
-// action (src/goal-plugin.js:5264-5266, `throw new Error("v1.0.1 T1: not implemented")`), so
-// mirrorRowPriority throws for every input right now — not only the completed arm. This is wider
-// than the brief's assumption that only the completed-row assertion needed deferring; verified by
-// reading the T1 stub before writing this comment. Deferred in full: { todo: "lands with wave-1
-// integration" }. See REPORT.md for the reconciliation.
+// Landed at wave-1 integration. T3 deferred this unit in full (not as a `{ todo }` test but as a
+// comment) because mirrorRowPriority calls the sibling mirrorRowStatus (T1) on EVERY call — a
+// completed row must win "low" over an index-0 "high" — and T1 was still a throwing stub in the
+// T3 seat worktree. T1 is merged, so the assertions run for real.
+test("the first open row is high priority, later open rows medium, completed rows low", () => {
+  const pending = { id: "a1", title: "Draft the spec", status: "pending", claim: "", evidence: "", verdict: null }
+  const inProgress = { id: "a2", title: "Ship it", status: "in_progress", claim: "", evidence: "", verdict: null }
+  const verifiedDone = { id: "a3", title: "Land it", status: "done", claim: "landed", evidence: "ci green", verdict: "pass" }
+  const unverifiedDone = { id: "a4", title: "Land it", status: "done", claim: "landed", evidence: "ci green", verdict: null }
+
+  // index 0 is the single `high` slot.
+  assert.equal(mirrorRowPriority(pending, 0), "high")
+  assert.equal(mirrorRowPriority(inProgress, 0), "high")
+  // Later open rows are medium.
+  assert.equal(mirrorRowPriority(pending, 1), "medium")
+  assert.equal(mirrorRowPriority(inProgress, 7), "medium")
+  // A completed row is low, and completed WINS over the index-0 high slot — the
+  // ordering in the contract is the correctness rule, not presentation order.
+  assert.equal(mirrorRowPriority(verifiedDone, 3), "low")
+  assert.equal(mirrorRowPriority(verifiedDone, 0), "low")
+  // A done action with no passing verdict is NOT completed (mirrorRowStatus), so it
+  // keeps an open row's priority rather than being demoted to low.
+  assert.equal(mirrorRowStatus(unverifiedDone), "in_progress")
+  assert.equal(mirrorRowPriority(unverifiedDone, 0), "high")
+  assert.equal(mirrorRowPriority(unverifiedDone, 2), "medium")
+})
+
+test("the projector spends the high slot on the first row the model still has to act on", () => {
+  const { projectPlanToTodos } = testInternals
+  // The running index in projectPlanToTodos counts only non-completed rows, so a
+  // completed first action must not consume the single `high` slot.
+  const plan = {
+    actions: [
+      { id: "a1", title: "Already landed", status: "done", claim: "landed", evidence: "ci green", verdict: "pass" },
+      { id: "a2", title: "Next up", status: "pending", claim: "", evidence: "", verdict: null },
+      { id: "a3", title: "After that", status: "pending", claim: "", evidence: "", verdict: null },
+    ],
+  }
+  const rows = projectPlanToTodos(plan, [])
+  assert.deepEqual(
+    rows.map((row) => row.priority),
+    ["low", "high", "medium"],
+  )
+})
 // <<< v101:T3
 
 
@@ -13087,20 +13097,16 @@ test("the fingerprint of an empty row list is stable and non-empty", () => {
 // >>> v101:T5 tests - isMirrorOwnedRow / pickExtras
 // T5 units: 12 (picker half), 14, 15, and the pure half of 15b.
 //
-// INTEGRATOR: the four units named in the inventory drive `pickExtras` over rows
-// the model authored, and every kept row goes through `mirrorRow` (T3) and
-// `boundExtraContent` (T6) - both still scaffold stubs that throw. So those four
-// carry `{ todo: T5_TODO_UNTIL_WAVE1 }`: they run, they report the real stub
-// error, and they turn green by DELETING that option once T3 and T6 land. The
-// assertions in them are final; nothing about them is provisional.
-// The three units that need no stub - `isMirrorOwnedRow`, and the `pickExtras`
-// paths where nothing is kept - assert for real today, and the all-owned case is
-// falsifiable evidence for "owned rows are excluded": pick a plan row by mistake
-// and the T3 stub throws.
+// Wave-1 integration un-todoed the four inventory units below: they drive
+// `pickExtras` over rows the model authored, and every kept row goes through
+// `mirrorRow` (T3) and `boundExtraContent` (T6), which were scaffold stubs while
+// T5 was written and are real now. They run for real, with no `{ todo }` option.
+// The three units that never needed a stub - `isMirrorOwnedRow`, and the
+// `pickExtras` paths where nothing is kept - always asserted for real; the
+// all-owned case is falsifiable evidence for "owned rows are excluded".
 // `testInternals` is destructured inside each test rather than at the top of the
 // file so that nine parallel wave-1 regions cannot collide on one module-scope
 // const.
-const T5_TODO_UNTIL_WAVE1 = "lands with wave-1 integration"
 
 function t5MirrorGoal(ids = ["a1", "a2"]) {
   return { plan: { actions: ids.map((id) => ({ id, title: `action ${id}`, status: "pending" })) } }
@@ -13166,7 +13172,7 @@ test("pickExtras never mutates the incoming todos array the host still holds", (
   assert.deepEqual(result, { extra: [], dropped: 0 })
 })
 
-test("rows the model authored are kept after the plan rows and capped", { todo: T5_TODO_UNTIL_WAVE1 }, () => {
+test("rows the model authored are kept after the plan rows and capped", () => {
   const { pickExtras, MIRROR_MAX_EXTRAS, MIRROR_ID_SEPARATOR } = testInternals
   const goal = t5MirrorGoal(["a1", "a2"])
   const mine = Array.from({ length: MIRROR_MAX_EXTRAS + 4 }, (_, i) => ({
@@ -13190,7 +13196,7 @@ test("rows the model authored are kept after the plan rows and capped", { todo: 
   )
 })
 
-test("a non-empty todowrite redefines the extras from that call", { todo: T5_TODO_UNTIL_WAVE1 }, () => {
+test("a non-empty todowrite redefines the extras from that call", () => {
   const { pickExtras } = testInternals
   const goal = t5MirrorGoal(["a1"])
 
@@ -13206,7 +13212,7 @@ test("a non-empty todowrite redefines the extras from that call", { todo: T5_TOD
   assert.deepEqual(first.extra.map((r) => r.content), ["read the ADR", "ask about the cap"])
 })
 
-test("an incoming row missing priority is coerced rather than passed through", { todo: T5_TODO_UNTIL_WAVE1 }, () => {
+test("an incoming row missing priority is coerced rather than passed through", () => {
   const { pickExtras } = testInternals
   const goal = t5MirrorGoal(["a1"])
   const { extra } = pickExtras(
@@ -13225,7 +13231,7 @@ test("an incoming row missing priority is coerced rather than passed through", {
   }
 })
 
-test("pickExtras reports how many model rows the cap dropped", { todo: T5_TODO_UNTIL_WAVE1 }, () => {
+test("pickExtras reports how many model rows the cap dropped", () => {
   const { pickExtras, MIRROR_MAX_EXTRAS } = testInternals
   const goal = t5MirrorGoal(["a1"])
   const rows = (n) => Array.from({ length: n }, (_, i) => ({ content: `mine ${i + 1}` }))
@@ -13378,6 +13384,37 @@ test("normalizeMirror coerces a malformed record field by field", () => {
   const valid = normalizeMirror({ at: 100, nudges: 3, rows: [], extra: [] })
   assert.equal(valid.at, 100)
   assert.equal(valid.nudges, 3)
+})
+
+// Added at wave-1 integration. T8 wrote its own row coercer while T3's `mirrorRow` was still a
+// throwing scaffold stub, and the two copies did NOT agree: `{ content: 42 }` came back "42" from
+// normalizeMirror and "(untitled)" from mirrorRow. normalizeMirror now delegates to mirrorRow, and
+// this is the control that keeps them one function. It fails the moment a second coercer appears.
+test("a row loaded from disk is spelled exactly as the projector would spell it", () => {
+  const { mirrorRow, normalizeMirror } = testInternals
+  const awkward = [
+    { content: 42, status: "pending", priority: "high" },
+    { content: "", status: "", priority: "" },
+    { content: "a1 · Ship it", status: "in_progress", priority: "medium" },
+    { content: undefined, status: null, priority: undefined },
+    { content: true, status: 7, priority: 0 },
+    "not-an-object",
+    null,
+  ]
+  const loaded = normalizeMirror({ rows: awkward, extra: awkward }).rows
+  assert.equal(loaded.length, awkward.length)
+  for (const [i, raw] of awkward.entries()) {
+    assert.deepEqual(loaded[i], mirrorRow(raw), `row ${i} must round-trip through the one coercer`)
+  }
+  // And the invariant that motivates it: every field is a non-empty string, so a persisted row can
+  // never be spelled differently from a freshly projected one and drive mirrorIsFresh permanently
+  // stale.
+  for (const row of loaded) {
+    for (const key of ["content", "status", "priority"]) {
+      assert.equal(typeof row[key], "string")
+      assert.ok(row[key].length > 0, `${key} must be a non-empty string`)
+    }
+  }
 })
 // <<< v101:T8
 
