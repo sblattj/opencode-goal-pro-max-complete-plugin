@@ -13497,6 +13497,38 @@ test("an empty mirror never records a terminal snapshot", () => {
 
 // >>> v101:T16 tests - /goal resume refunds the nudge budget
 // T16 units: 23.
+test("/goal resume restores the nudge budget without touching the fingerprint or the carried rows", async () => {
+  const sessionID = "session-t16-resume-nudges"
+  const { hooks } = await createHooks({ options: { minDelayMs: 1 } })
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID, arguments: "ship it" },
+    { parts: [] },
+  )
+
+  const pauseOutput = { parts: [] }
+  await hooks["command.execute.before"]({ command: "goal", sessionID, arguments: "pause" }, pauseOutput)
+  assert.match(pauseOutput.parts[0].text, /Goal paused/)
+
+  const rows = [{ content: "act-1 · Do the thing", status: "pending", priority: "medium" }]
+  const extra = [{ content: "extra note", status: "pending", priority: "low" }]
+  const goal = currentGoal(sessionID)
+  goal.mirror.fingerprint = "fingerprint-before-resume"
+  goal.mirror.at = 123456789
+  goal.mirror.rows = rows
+  goal.mirror.extra = extra
+  goal.mirror.nudges = 3
+
+  const resumeOutput = { parts: [] }
+  await hooks["command.execute.before"]({ command: "goal", sessionID, arguments: "resume" }, resumeOutput)
+  assert.match(resumeOutput.parts[0].text, /fresh limits/)
+
+  const resumed = currentGoal(sessionID)
+  assert.equal(resumed.mirror.nudges, 0)
+  assert.equal(resumed.mirror.fingerprint, "fingerprint-before-resume")
+  assert.equal(resumed.mirror.at, 123456789)
+  assert.deepEqual(resumed.mirror.rows, rows)
+  assert.deepEqual(resumed.mirror.extra, extra)
+})
 // <<< v101:T16
 
 
