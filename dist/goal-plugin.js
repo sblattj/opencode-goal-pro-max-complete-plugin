@@ -14314,7 +14314,7 @@ var SHAPE_ERROR_PATTERNS = [
   /(?:expected|must be).*(?:object|path|body|query|sessionID)/i,
   /(?:validation|schema|invalid input|invalid argument)/i
 ];
-var REPLAY_SAFE_OPERATIONS = new Set(["messages", "get", "children", "status"]);
+var REPLAY_SAFE_OPERATIONS = new Set(["messages", "get", "children", "status", "todo"]);
 function isArgumentShapeError(error51) {
   if (!(error51 instanceof TypeError))
     return false;
@@ -14381,6 +14381,9 @@ function createOpenCodeSessionApi(client, options = {}) {
     },
     get(sessionID) {
       return invoke("get", { sessionID }, { path: { id: sessionID } });
+    },
+    todo(sessionID) {
+      return invoke("todo", { sessionID }, { path: { id: sessionID } });
     },
     delete(sessionID) {
       return invoke("delete", { sessionID }, { path: { id: sessionID } });
@@ -15179,6 +15182,8 @@ function createRuntimeState() {
     sessionTitles: new Map,
     appliedTitles: new Map,
     sidebarTerminals: new Map,
+    mirrorTerminals: new Map,
+    existingTodoOffers: new Map,
     pendingCommandTurns: new Map,
     activeCommandTurns: new Map,
     commandOutputs: new WeakMap,
@@ -15306,9 +15311,16 @@ function isPluginOwnToolName(name) {
   }
   return false;
 }
-function messageHasWorkToolCall(message) {
+var NO_EXEMPT_TOOL_NAMES = new Set;
+function messageHasWorkToolCall(message, exempt = NO_EXEMPT_TOOL_NAMES) {
   const parts = Array.isArray(message?.parts) ? message.parts : [];
-  return parts.some((part) => part && TOOL_PART_TYPES.has(part.type) && !isPluginOwnToolName(toolPartName(part)));
+  const exemptNames = exempt && typeof exempt.has === "function" ? exempt : NO_EXEMPT_TOOL_NAMES;
+  return parts.some((part) => {
+    if (!part || !TOOL_PART_TYPES.has(part.type))
+      return false;
+    const name = toolPartName(part);
+    return !isPluginOwnToolName(name) && !exemptNames.has(name);
+  });
 }
 var GOAL_MODES = new Set(["normal", "ordered"]);
 function normalizeMode(value) {
@@ -15471,7 +15483,7 @@ function isPlanAgent(agent) {
 }
 var SESSION_TITLE_OBJECTIVE_LIMIT = 48;
 var SESSION_TITLE_ICONS = ["▶", "⏸", "⛔", "✓"];
-var SIDEBAR_METADATA_VERSION = 2;
+var SIDEBAR_METADATA_VERSION = 3;
 var SIDEBAR_METADATA_TEXT_LIMIT = 400;
 var SIDEBAR_METADATA_MAX_ACTIONS = 20;
 function describeTurnLimit(max) {
@@ -15515,6 +15527,7 @@ function buildSidebarTerminal(goal, state, finishedAt) {
     constraints: goal.constraints,
     options: goal.options,
     plan: goal.plan,
+    mirror: goal.mirror,
     turnCount: goal.turnCount,
     peakContextTokens: goal.peakContextTokens,
     modelContextTokens: goal.modelContextTokens,
@@ -15573,6 +15586,12 @@ function buildSidebarMetadata(goal, now = Date.now(), context = {}) {
       total: progress.total,
       verified: progress.verified,
       blocked: progress.blocked,
+      mirror: {
+        state: mirrorState(goal, context.mirrorMode ?? "plan"),
+        rows: goal.mirror.rows.length,
+        extra: goal.mirror.extra.length,
+        at: goal.mirror.at
+      },
       actions: (goal.plan?.actions || []).slice(0, SIDEBAR_METADATA_MAX_ACTIONS).map((action) => ({
         id: action.id,
         title: summarizeText(action.title, 120),
@@ -16012,9 +16031,16 @@ function promoteNextOrderedGoal(sessionID) {
   focusGoal(sessionID, next);
   return next;
 }
+function mirrorHandbackLine(goal) {
+  const rows = goal?.mirror?.rows;
+  if (!Array.isArray(rows) || rows.length === 0)
+    return "";
+  return `The Todo list still shows this plan's ${rows.length} rows. It is yours again: your next todowrite replaces it.`;
+}
 function cleanupGoal(sessionID) {
   const goal = goalStates.get(sessionID);
   if (goal) {
+    snapshotMirror(sessionID, goal, Date.now());
     removeSessionGoal(sessionID, goal.goalId);
   }
   goalStates.delete(sessionID);
@@ -16210,6 +16236,7 @@ function resetGoalBudget(goal) {
   goal.compactionSourceAssistantMessageID = "";
   goal.skipNextTerminalCheck = false;
   goal.history = [...goal.history || []].slice(-MAX_HISTORY_ENTRIES);
+  goal.mirror.nudges = 0;
 }
 function currentGoal(sessionID, goalID, runID) {
   const goal = goalStates.get(sessionID);
@@ -16462,7 +16489,8 @@ function normalizePersistedGoal(rawGoal) {
     history: normalizeHistoryEntries(rawGoal.history).slice(-MAX_HISTORY_ENTRIES),
     checkpoints: checkpoints.slice(-MAX_CHECKPOINTS),
     lastCheckpoint,
-    skipNextTerminalCheck: rawGoal.skipNextTerminalCheck === true
+    skipNextTerminalCheck: rawGoal.skipNextTerminalCheck === true,
+    mirror: normalizeMirror(rawGoal.mirror)
   };
 }
 function normalizePersistedResult(rawResult) {
@@ -17219,7 +17247,8 @@ function buildContinueMessage(goal, {
   budgetWrapup = false,
   completionUnverified = false,
   blockerUnstated = false,
-  completionRejection = ""
+  completionRejection = "",
+  mirrorMode = "off"
 } = {}) {
   const remainingTokens = Math.max(0, goal.options.maxTokens - goalSpendTokens(goal));
   const contextWindow = contextWindowLimit(goal);
@@ -17245,6 +17274,7 @@ function buildContinueMessage(goal, {
     "<goal_plan>",
     planRender || "none — call goal_plan_set([{id,title},…]) first.",
     planRender ? `progress: ${planStatusLabel(goal.plan)}; done needs claim+evidence+verdict=pass.` : "",
+    mirrorNudgeLine(goal, mirrorMode),
     "</goal_plan>"
   ].filter(Boolean));
   lines.push("Completion format—consecutive plain lines; no Markdown/backticks/blank line:", "[goal:evidence] <proof>", "[goal:complete]", "Need user input? State why before [goal:blocked].");
@@ -17279,7 +17309,8 @@ function buildCompactionProgressSummary(goal, { maxCheckpoints = 3, maxEvents = 
   }
   return lines;
 }
-function buildCompactionContext(goal) {
+var MIRROR_COMPACTION_STALE_LINE = "The session's Todo list is stale — it shows an older copy of the plan; one todowrite({todos: []}) refreshes it.";
+function buildCompactionContext(goal, { mirrorMode = "off" } = {}) {
   const snapshotAt = goal.lastContinueAt || goal.startedAt || 0;
   const elapsedSeconds = Math.round((snapshotAt - goal.startedAt) / 1000);
   return [
@@ -17291,6 +17322,7 @@ function buildCompactionContext(goal) {
     goal.lastCheckpoint ? `Latest checkpoint: ${escapeGoalText(summarizeText(goal.lastCheckpoint.summary, 200))}` : null,
     ...buildCompactionProgressSummary(goal),
     ...formatPlanForPrompt(goal.plan) ? ["<goal_plan>", formatPlanForPrompt(goal.plan), `progress: ${planStatusLabel(goal.plan)}`, "</goal_plan>"] : [],
+    mirrorState(goal, mirrorMode) === "stale" ? MIRROR_COMPACTION_STALE_LINE : null,
     "After compaction, continue from the next concrete unfinished step while the goal is active. Verify the result against the goal objective before ending; output [goal:complete] (preceded by a [goal:evidence] line) only when fully satisfied, or [goal:blocked] (preceded by a concrete blocker) only if user input is required."
   ].filter(Boolean).join(`
 `);
@@ -17573,8 +17605,8 @@ function turnWasTruncated(messages, turnMessages, visibilityLimit) {
     return false;
   return turn[0] === list[0];
 }
-function turnCallsTool(turnMessages) {
-  return (Array.isArray(turnMessages) ? turnMessages : []).some((message) => messageHasWorkToolCall(message));
+function turnCallsTool(turnMessages, exempt = NO_EXEMPT_TOOL_NAMES) {
+  return (Array.isArray(turnMessages) ? turnMessages : []).some((message) => messageHasWorkToolCall(message, exempt));
 }
 function turnTerminalText(turnMessages, latestAssistant) {
   const turn = Array.isArray(turnMessages) ? turnMessages : [];
@@ -17916,7 +17948,7 @@ function formatPlanForPrompt(plan) {
   }).join(`
 `);
 }
-function buildPlanSystemLines(goal) {
+function buildPlanSystemLines(goal, { mirrorMode = "off" } = {}) {
   const render = formatPlanForPrompt(goal?.plan);
   if (!render) {
     return [
@@ -17932,6 +17964,9 @@ function buildPlanSystemLines(goal) {
     render,
     `progress: ${planStatusLabel(goal.plan)}`,
     "Keep it current with goal_action_update(id, status, claim?, evidence?, verdict?); add or replace the whole list with goal_plan_set.",
+    ...mirrorMode === "plan" ? [
+      "The session's Todo list is drawn from this plan: while a plan exists, todowrite redraws it from the plan's actions and keeps any items of your own below them. Change the work with goal_plan_set/goal_action_update, and call todowrite({todos: []}) to refresh the panel."
+    ] : [],
     "An action may only become done with a claim, the evidence that could have falsified it, and verdict=pass. A blocked action must state its reason in claim.",
     "The goal cannot be completed until every action is done with verdict=pass, or blocked with a stated reason.",
     CEV_RULE,
@@ -17998,7 +18033,8 @@ function buildGoalState(sessionID, condition, options, meta3 = {}, lastStatus = 
     history: [],
     checkpoints: [],
     lastCheckpoint: null,
-    skipNextTerminalCheck: false
+    skipNextTerminalCheck: false,
+    mirror: normalizeMirror()
   };
 }
 var AGENT_UPDATE_STATUSES = new Set(["complete", "blocked", "paused", "resumed"]);
@@ -18013,7 +18049,8 @@ function buildAgentToolHandlers({
   announceAudit = async () => {},
   auditMessagesEnabled = false,
   announceLifecycle = () => {},
-  commandName = "goal"
+  commandName = "goal",
+  mirrorMode = "plan"
 }) {
   const persistFinal = persistTerminalState || persist;
   async function getGoal(sessionID) {
@@ -18200,6 +18237,7 @@ function buildAgentToolHandlers({
         const ledgerDurable = pushHistory(goal, "completed", evidence ? `Marked complete via tool: ${summarizeText(evidence, 400)}` : "Marked complete via agent tool.");
         const ordered = sessionOrdered.has(sessionID);
         const completedResult = rememberGoalResult(sessionID, goal, "achieved", "", evidence);
+        const completionHandback = mirrorHandbackLine(goal);
         cleanupGoal(sessionID);
         const promoted = ordered ? promoteNextOrderedGoal(sessionID) : null;
         const postCompletionSnapshot = captureFocusedGoalSnapshot(sessionID);
@@ -18237,7 +18275,9 @@ function buildAgentToolHandlers({
             expectedState: activePromoted ? "active" : ""
           });
         }
-        return AGENT_COMPLETE_SUCCESS;
+        return completionHandback ? `${AGENT_COMPLETE_SUCCESS}
+
+${completionHandback}` : AGENT_COMPLETE_SUCCESS;
       }
       if (status === "blocked") {
         const blockerText = typeof args.blocker === "string" ? args.blocker.trim() : "";
@@ -18439,11 +18479,15 @@ function buildAgentToolHandlers({
     goal.lastStatus = `Action ${id} → ${action.status}; ${planStatusLabel(goal.plan)}.`;
     pushHistory(goal, "plan-action", `Action ${id} set to ${action.status}.`);
     await persist(sessionID);
-    return [`Action ${id} updated: ${action.status}.`, `Progress: ${planStatusLabel(goal.plan)}.`].join(" ");
+    const result = [`Action ${id} updated: ${action.status}.`, `Progress: ${planStatusLabel(goal.plan)}.`].join(" ");
+    const nudge = mirrorNudgeLine(goal, mirrorMode);
+    return nudge ? `${result}
+${nudge}` : result;
   }
   async function clearGoal(sessionID) {
     const goals = listSessionGoals(sessionID);
     const clearedGoal = goalStates.get(sessionID) || goals[0] || null;
+    const clearHandback = mirrorHandbackLine(clearedGoal);
     const hadState = goals.length > 0 || lastGoalResults.has(sessionID);
     const ledgerDurable = goals.length > 0 && goals.map((goal) => pushHistory(goal, "cleared", "Cleared via agent tool.")).every(Boolean);
     sessionOrdered.delete(sessionID);
@@ -18462,7 +18506,10 @@ function buildAgentToolHandlers({
     if (!clearStillCurrent) {
       return "Clear persistence finished after goal state changed; current state was left untouched.";
     }
-    return durable === false ? "Goal cleared in memory, but terminal state could not be persisted. It may reappear after restart." : "Goal cleared.";
+    const clearText = durable === false ? "Goal cleared in memory, but terminal state could not be persisted. It may reappear after restart." : "Goal cleared.";
+    return clearHandback ? `${clearText}
+
+${clearHandback}` : clearText;
   }
   return { getGoal, getGoalHistory, setGoal, updateGoal, clearGoal, getPlan, setPlan, updateAction };
 }
@@ -18486,7 +18533,11 @@ function inactiveGoalToolResult(loadResult, commandName = "goal", disposed = fal
   }
   return null;
 }
-function buildAgentTools(toolHelper, handlers, ensureSessionLoaded = async () => ACTIVE_PERSISTENCE_DISABLED, commandName = "goal", isDisposed = () => false, commandRegistered = true) {
+var MIRROR_PLAN_TOOL_DESCRIPTION_APPEND = " The session's Todo list is redrawn from this plan on the next todowrite call.";
+function planToolDescription(base, mirrorMode) {
+  return mirrorMode === "off" ? base : `${base}${MIRROR_PLAN_TOOL_DESCRIPTION_APPEND}`;
+}
+function buildAgentTools(toolHelper, handlers, ensureSessionLoaded = async () => ACTIVE_PERSISTENCE_DISABLED, commandName = "goal", isDisposed = () => false, commandRegistered = true, mirrorMode = "off") {
   const schema = toolHelper.schema;
   const run = (handler) => async (args, ctx) => {
     const sessionID = agentToolSessionID(ctx);
@@ -18535,7 +18586,10 @@ function buildAgentTools(toolHelper, handlers, ensureSessionLoaded = async () =>
       }
       const message = await handlers.updateGoal(sessionID, args);
       if (args.status === "complete") {
-        if (message !== AGENT_COMPLETE_SUCCESS || currentGoal(sessionID, before.goalId, before.runId)) {
+        const archived = message === AGENT_COMPLETE_SUCCESS || message.startsWith(`${AGENT_COMPLETE_SUCCESS}
+
+`);
+        if (!archived || currentGoal(sessionID, before.goalId, before.runId)) {
           return goalToolFailure("completion_rejected", message);
         }
       }
@@ -18613,7 +18667,7 @@ function buildAgentTools(toolHelper, handlers, ensureSessionLoaded = async () =>
       execute: canonicalRun("plan_get", async (sessionID) => goalToolSuccess(await handlers.getPlan(sessionID)))
     }),
     goal_plan_set: toolHelper({
-      description: "Record the ordered action plan for the current goal. Decompose the objective into concrete actions; each needs a stable `id` and a `title`. Replaces the whole plan, preserving already-recorded claim/evidence/verdict for actions you keep by id.",
+      description: planToolDescription("Record the ordered action plan for the current goal. Decompose the objective into concrete actions; each needs a stable `id` and a `title`. Replaces the whole plan, preserving already-recorded claim/evidence/verdict for actions you keep by id.", mirrorMode),
       args: {
         actions: schema.array(schema.object({
           id: schema.string().optional(),
@@ -18630,7 +18684,7 @@ function buildAgentTools(toolHelper, handlers, ensureSessionLoaded = async () =>
       })
     }),
     goal_action_update: toolHelper({
-      description: "Update one action of the goal plan. An action may only become `done` with a claim, the minimum evidence that could have falsified it (real command output, file content, or response — not your own report), and verdict `pass`. A `blocked` action must state its reason in `claim`.",
+      description: planToolDescription("Update one action of the goal plan. An action may only become `done` with a claim, the minimum evidence that could have falsified it (real command output, file content, or response — not your own report), and verdict `pass`. A `blocked` action must state its reason in `claim`.", mirrorMode),
       args: {
         id: schema.string(),
         status: schema.enum(PLAN_ACTION_STATUSES).optional(),
@@ -18852,6 +18906,247 @@ function createChildSessionAuditor(client, { agent = "build", timeoutMs = 120000
     }
   };
 }
+var MIRROR_MAX_TODOS = 20;
+var MIRROR_MAX_EXTRAS = 10;
+var MIRROR_EXTRA_TEXT_LIMIT = 120;
+var MIRROR_MAX_NUDGES = 3;
+var MIRROR_ID_SEPARATOR = " · ";
+var MIRROR_TOOL_NAMES = new Set(["todowrite"]);
+var MIRROR_MODES = new Set(["plan", "off"]);
+var TODOWRITE_MIRROR_DESCRIPTION = "GOAL PLUGIN: if a <goal_plan> block is present in your context, this session's todo list is drawn from that plan — plan actions are written here for you, and items of your own are kept below them. Use goal_plan_set / goal_action_update to change the work, and follow the refresh instruction in that block when it asks for one. With no <goal_plan> block, this tool behaves normally.";
+function mirrorRowStatus(action) {
+  if (action.status === "pending")
+    return "pending";
+  if (action.status === "in_progress")
+    return "in_progress";
+  if (action.status === "blocked")
+    return "in_progress";
+  return planActionVerified(action) ? "completed" : "in_progress";
+}
+function mirrorRowSuffix(action) {
+  if (action.status === "blocked") {
+    const reasonHead = summarizeText(action.claim, 60) || "no reason recorded";
+    return ` — BLOCKED: ${reasonHead}`;
+  }
+  if (action.status === "done" && !planActionVerified(action)) {
+    return " — needs claim/evidence/verdict";
+  }
+  return "";
+}
+function projectPlanToTodos(plan, extras) {
+  const actions = Array.isArray(plan?.actions) ? plan.actions : [];
+  const tail = Array.isArray(extras) ? extras : [];
+  const overflowed = actions.length > MIRROR_MAX_TODOS;
+  const shown = overflowed ? actions.slice(0, MIRROR_MAX_TODOS - 1) : actions;
+  const rows = [];
+  let index = 0;
+  for (const action of shown) {
+    const status = mirrorRowStatus(action);
+    const title = summarizeText(action.title, MIRROR_EXTRA_TEXT_LIMIT);
+    rows.push(mirrorRow({
+      content: `${action.id}${MIRROR_ID_SEPARATOR}${title}${mirrorRowSuffix(action)}`,
+      status,
+      priority: mirrorRowPriority(action, index)
+    }));
+    if (status !== "completed")
+      index += 1;
+  }
+  if (overflowed) {
+    rows.push(mirrorRow({
+      content: `+${actions.length - shown.length} more actions — /goal status`,
+      status: "pending",
+      priority: "low"
+    }));
+  }
+  for (const extra of tail)
+    rows.push(extra);
+  return rows;
+}
+function mirrorRow(raw) {
+  const { content, status, priority } = raw && typeof raw === "object" ? raw : {};
+  return {
+    content: mirrorRowField(content, "(untitled)"),
+    status: mirrorRowField(status, "pending"),
+    priority: mirrorRowField(priority, "medium")
+  };
+}
+function mirrorRowField(value, fallback) {
+  if (value === undefined || value === null)
+    return fallback;
+  const coerced = String(value);
+  return coerced.length > 0 ? coerced : fallback;
+}
+function mirrorRowPriority(action, index) {
+  if (mirrorRowStatus(action) === "completed")
+    return "low";
+  return index === 0 ? "high" : "medium";
+}
+function mirrorFingerprint(rows) {
+  const safeRows = Array.isArray(rows) ? rows : [];
+  const payload = JSON.stringify(safeRows.map((r) => [r.content, r.status, r.priority]));
+  return createHash("sha256").update(payload).digest("hex");
+}
+function isMirrorOwnedRow(content, goal) {
+  if (typeof content !== "string" || content === "")
+    return false;
+  if (/^\+\d+ more actions — \/goal status$/.test(content))
+    return true;
+  const actions = goal?.plan?.actions;
+  if (!Array.isArray(actions))
+    return false;
+  return actions.some((action) => {
+    const id = action?.id;
+    return typeof id === "string" && id !== "" && content.startsWith(`${id}${MIRROR_ID_SEPARATOR}`);
+  });
+}
+function pickExtras(incoming, goal) {
+  if (!Array.isArray(incoming))
+    return { extra: [], dropped: 0 };
+  const candidates = incoming.filter((row) => !isMirrorOwnedRow(row?.content, goal));
+  const kept = candidates.slice(0, MIRROR_MAX_EXTRAS);
+  const extra = kept.map((row) => mirrorRow({
+    content: boundExtraContent(row?.content),
+    status: row?.status,
+    priority: row?.priority
+  }));
+  return { extra, dropped: candidates.length - kept.length };
+}
+function boundExtraContent(content) {
+  return summarizeText(String(content ?? ""), MIRROR_EXTRA_TEXT_LIMIT);
+}
+function resetMirrorForNewGoal(goal) {
+  goal.mirror = normalizeMirror();
+}
+function normalizeMirrorMode(value) {
+  return MIRROR_MODES.has(value) ? value : "plan";
+}
+function normalizeMirrorRows(raw) {
+  return Array.isArray(raw) ? raw.map((row) => mirrorRow(row)) : [];
+}
+function normalizeMirror(raw) {
+  const source = raw && typeof raw === "object" ? raw : {};
+  return {
+    fingerprint: source.fingerprint === undefined || source.fingerprint === null ? "" : String(source.fingerprint),
+    at: toNonNegativeInteger(source.at),
+    rows: normalizeMirrorRows(source.rows),
+    nudges: toNonNegativeInteger(source.nudges),
+    extra: normalizeMirrorRows(source.extra)
+  };
+}
+var mirrorTerminals = runtimeCollection("mirrorTerminals");
+function snapshotMirror(sessionID, goal, now) {
+  const rows = goal?.mirror?.rows;
+  if (!Array.isArray(rows) || rows.length === 0)
+    return;
+  mirrorTerminals.set(sessionID, { rows: [...rows], at: now });
+}
+function readMirrorTerminal(sessionID) {
+  return mirrorTerminals.get(sessionID);
+}
+function dropMirrorTerminal(sessionID) {
+  mirrorTerminals.delete(sessionID);
+}
+var existingTodoOffers = runtimeCollection("existingTodoOffers");
+async function captureExistingTodosOffer(client, sessionApi, sessionID) {
+  existingTodoOffers.delete(sessionID);
+  let rows;
+  try {
+    rows = await sessionApi.todo(sessionID);
+  } catch (error51) {
+    await logPluginWarning(client, `goal set: reading the session's existing todo list for the <existing_todos> offer failed (${error51?.message || error51}); skipped.`);
+    return;
+  }
+  if (!Array.isArray(rows)) {
+    await logPluginWarning(client, "goal set: the session's existing todo list did not return an array; skipped the <existing_todos> offer.");
+    return;
+  }
+  if (rows.length === 0)
+    return;
+  existingTodoOffers.set(sessionID, rows.map((row) => mirrorRow(row)));
+}
+function withExistingTodosOffer(continuationText, sessionID) {
+  const rows = existingTodoOffers.get(sessionID);
+  if (!rows)
+    return continuationText;
+  existingTodoOffers.delete(sessionID);
+  const block = [
+    "<existing_todos>",
+    `This session already has ${rows.length} native todo items. They are NOT the plan. Either record them as the plan with goal_plan_set (rewriting each as a falsifiable claim about the end state), or ignore them — the first todowrite after a plan exists redraws the list from the plan and keeps yours below it.`,
+    ...rows.map((row) => `- ${row.content} (${row.status})`),
+    "</existing_todos>"
+  ].join(`
+`);
+  return `${continuationText}
+
+${block}`;
+}
+function mirrorIsFresh(goal) {
+  const mirror = goal?.mirror;
+  if (!mirror || !(mirror.at > 0))
+    return false;
+  return mirrorFingerprint(projectPlanToTodos(goal.plan, mirror.extra)) === mirror.fingerprint;
+}
+function mirrorState(goal, mirrorMode) {
+  if (mirrorMode === "off")
+    return "off";
+  return mirrorIsFresh(goal) ? "fresh" : "stale";
+}
+var MIRROR_NUDGE_LINE = "Todo panel is stale — call todowrite({todos: []}) once; the plan is copied into it for you.";
+function mirrorNudgeLine(goal, mirrorMode) {
+  if (mirrorMode !== "plan")
+    return "";
+  if (!goal || goal.stopped)
+    return "";
+  const actions = goal.plan?.actions;
+  if (!Array.isArray(actions) || actions.length === 0)
+    return "";
+  if (mirrorState(goal, mirrorMode) !== "stale")
+    return "";
+  const mirror = goal.mirror;
+  if (!mirror || !(mirror.nudges < MIRROR_MAX_NUDGES))
+    return "";
+  mirror.nudges += 1;
+  return MIRROR_NUDGE_LINE;
+}
+function isEmptyList(value) {
+  return Array.isArray(value) && value.length === 0;
+}
+function stampMirror(goal, args, now) {
+  const written = Array.isArray(args?.todos) ? args.todos : [];
+  goal.mirror.fingerprint = mirrorFingerprint(written);
+  goal.mirror.at = now;
+  goal.mirror.rows = written.map((row) => mirrorRow(row));
+}
+function assertPlanLedgerIsolated(goal) {
+  const actions = goal?.plan?.actions;
+  if (!Array.isArray(actions))
+    return goal;
+  actions.forEach((action, index) => {
+    if (!isPlainObject2(action))
+      return;
+    if ("content" in action) {
+      throw new Error(`goal.plan.actions[${index}] carries a todo-shaped "content" key`);
+    }
+    if ("priority" in action) {
+      throw new Error(`goal.plan.actions[${index}] carries a todo-shaped "priority" key`);
+    }
+    if (!PLAN_ACTION_STATUS_SET.has(action.status)) {
+      throw new Error(`goal.plan.actions[${index}] has status ${JSON.stringify(action.status)}, outside PLAN_ACTION_STATUSES`);
+    }
+    if (planActionTitleCarriesMirrorPrefix(action.title)) {
+      throw new Error(`goal.plan.actions[${index}] title carries a mirrored-row id prefix`);
+    }
+  });
+  return goal;
+}
+function planActionTitleCarriesMirrorPrefix(title) {
+  if (typeof title !== "string")
+    return false;
+  const idMatch = /^a\d+/.exec(title);
+  if (!idMatch)
+    return false;
+  return title.startsWith(`${idMatch[0]}${MIRROR_ID_SEPARATOR}`);
+}
 async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) {
   if (pluginOptions.completionAudit && pluginOptions.registerAgents === false) {
     throw new TypeError("completionAudit requires registerAgents to remain enabled");
@@ -18868,6 +19163,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
   const { commandName, registerCommand } = normalizeCommandOptions(pluginOptions);
   const restrictedAgents = normalizeRestrictedAgents(pluginOptions.restrictedAgents);
   const allowGoalExecutionFromPlan = pluginOptions.allowGoalExecutionFromPlan === true;
+  const mirrorMode = normalizeMirrorMode(pluginOptions.mirrorTodos);
   const sidebarEnv = String((pluginOptions.env || process.env || {}).OPENCODE_GOAL_SIDEBAR ?? "").trim().toLowerCase();
   const sidebarDisabledByEnv = sidebarEnv === "0" || sidebarEnv === "false" || sidebarEnv === "off";
   const sidebarOption = pluginOptions.sidebarStatus !== undefined ? pluginOptions.sidebarStatus : pluginOptions.sessionTitleStatus;
@@ -18900,7 +19196,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
     const now = Date.now();
     const context = sidebarSequenceContext(sessionID);
     const title = buildSessionTitle(goal, now, context);
-    const metadata = buildSidebarMetadata(goal, now, context);
+    const metadata = buildSidebarMetadata(goal, now, { ...context, mirrorMode });
     const fingerprint = JSON.stringify([title, { ...metadata, updatedAt: 0 }]);
     if (currentRuntime().appliedTitles.get(sessionID) === fingerprint)
       return;
@@ -19195,7 +19491,8 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
     announceAudit,
     auditMessagesEnabled,
     announceLifecycle,
-    commandName
+    commandName,
+    mirrorMode
   });
   const abortAcceptedContinuation = async (sessionID) => {
     const runtimeState = currentRuntime();
@@ -19624,16 +19921,100 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         abortAccepted: true
       });
     },
-    "tool.execute.before": async (input) => {
+    "tool.execute.before": async (input, output) => {
       const sessionID = input?.sessionID;
       if (!sessionID)
         return;
       await ensureSessionLoaded(sessionID);
       if (currentRuntime().disposed)
         return;
-      if (currentRuntime().activeCommandTurns.get(sessionID)?.policy !== "control")
+      if (currentRuntime().activeCommandTurns.get(sessionID)?.policy === "control") {
+        throw new Error(`This /${commandName} control command has already been handled. Tool "${input?.tool || "unknown"}" was blocked because no tool calls are allowed while its result is being reported. Wait for a separate user turn before using tools or modifying work or goal state.`);
+      }
+      if (input.tool !== "todowrite")
         return;
-      throw new Error(`This /${commandName} control command has already been handled. Tool "${input?.tool || "unknown"}" was blocked because no tool calls are allowed while its result is being reported. Wait for a separate user turn before using tools or modifying work or goal state.`);
+      if (mirrorMode === "off")
+        return;
+      if (!output?.args)
+        return;
+      const goal = goalStates.get(sessionID);
+      if (isEmptyList(output?.args?.todos)) {
+        if (goal && !goal.stopped && goal.plan.actions.length > 0) {
+          output.args.todos = projectPlanToTodos(goal.plan, goal.mirror.extra);
+          goal.mirror.lastDropped = 0;
+          return;
+        }
+        if (goal?.mirror?.at > 0) {
+          output.args.todos = goal.mirror.rows;
+          return;
+        }
+        const terminal = readMirrorTerminal(sessionID);
+        if (terminal) {
+          output.args.todos = terminal.rows;
+          return;
+        }
+        return;
+      }
+      if (!goal || goal.stopped || goal.plan.actions.length === 0)
+        return;
+      const { extra, dropped } = pickExtras(output.args.todos, goal);
+      goal.mirror.extra = extra;
+      goal.mirror.lastDropped = dropped;
+      const rows = projectPlanToTodos(goal.plan, extra);
+      output.args.todos = rows;
+    },
+    "tool.execute.after": async (input, output) => {
+      if (input.tool !== "todowrite")
+        return;
+      if (mirrorMode === "off")
+        return;
+      const sessionID = input?.sessionID;
+      if (!sessionID)
+        return;
+      const todos = input.args?.todos;
+      if (Array.isArray(todos) && todos.length > 0 && readMirrorTerminal(sessionID)) {
+        dropMirrorTerminal(sessionID);
+      }
+      const goal = goalStates.get(sessionID);
+      if (goal) {
+        const now = Date.now();
+        stampMirror(goal, input.args, now);
+        await persist(sessionID);
+      }
+      if (goal && !goal.stopped) {
+        const note = mirrorResultNote(goal);
+        if (typeof output.output === "string") {
+          output.output = `${output.output}
+
+${note}`;
+        }
+      }
+      function mirrorResultNote(goal2) {
+        const progress = planProgress(goal2.plan);
+        if (progress.total === 0) {
+          return "No goal plan is recorded yet — record one with goal_plan_set, and the Todo list will be redrawn from it.";
+        }
+        let note = `Mirrored from the goal plan (${progress.verified}/${progress.total} verified).`;
+        const k = goal2.mirror.extra.length;
+        if (k >= 1) {
+          const dropped = goal2.mirror.lastDropped ?? 0;
+          const noun = k === 1 ? "item" : "items";
+          const droppedClause = dropped > 0 ? ` (${dropped} dropped, cap ${MIRROR_MAX_EXTRAS})` : "";
+          note += ` ${k} ${noun} of your own kept${droppedClause}.`;
+        }
+        return note;
+      }
+    },
+    "tool.definition": async (input, output) => {
+      if (input?.toolID !== "todowrite")
+        return;
+      if (mirrorMode === "off")
+        return;
+      if (!output || typeof output.description !== "string")
+        return;
+      output.description = `${output.description}
+
+${TODOWRITE_MIRROR_DESCRIPTION}`;
     },
     "command.execute.before": async (input, output) => {
       if (!input || input.command !== commandName || !output)
@@ -19692,6 +20073,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       if (CLEAR_COMMANDS.has(args)) {
         const goals = listSessionGoals(sessionID);
         const clearedGoal = goalStates.get(sessionID) || goals[0] || null;
+        const clearHandback = mirrorHandbackLine(clearedGoal);
         const hadState = goals.length > 0 || lastGoalResults.has(sessionID);
         const ledgerDurable = goals.length > 0 && goals.map((goal2) => pushHistory(goal2, "cleared", "User cleared the goal.")).every(Boolean);
         sessionOrdered.delete(sessionID);
@@ -19709,7 +20091,10 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         }
         if (clearStillCurrent)
           await restoreSessionTitle(sessionID);
-        replaceCommandOutputText(output, !clearStillCurrent ? "Clear persistence finished after goal state changed; current state was left untouched." : durable === false ? "Goal cleared in memory, but terminal state could not be persisted. It may reappear after restart." : "Goal cleared.");
+        const clearText = !clearStillCurrent ? "Clear persistence finished after goal state changed; current state was left untouched." : durable === false ? "Goal cleared in memory, but terminal state could not be persisted. It may reappear after restart." : "Goal cleared.";
+        replaceCommandOutputText(output, clearHandback ? `${clearText}
+
+${clearHandback}` : clearText);
         return;
       }
       if (PAUSE_COMMANDS.has(args)) {
@@ -19974,6 +20359,10 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       }
       const replacedGoal = goalStates.get(sessionID);
       const goal = buildGoalState(sessionID, parsed.condition, parsed.options, parsed.meta);
+      resetMirrorForNewGoal(goal);
+      if (mirrorMode !== "off") {
+        await captureExistingTodosOffer(client, sessionApi, sessionID);
+      }
       pushHistory(goal, "set", `Goal created with limits: ${describeTurnLimit(goal.options.maxTurns)} auto-continues, ${formatBudgetDuration(goal.options.maxDurationMs)}, ${goal.options.maxTokens.toLocaleString()} tokens, ${goal.options.contextWindowTokens.toLocaleString()}-token context window.`);
       const creationRestrictedAgent = await restrictedAgentFor(sessionID);
       if (creationRestrictedAgent) {
@@ -20354,6 +20743,10 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
             const ledgerDurable = pushHistory(activeGoalAfterMessages, "completed", `Assistant marked the goal complete with evidence: ${summarizeText(evidence, 400)}`);
             const ordered = sessionOrdered.has(sessionID);
             const completedResult = rememberGoalResult(sessionID, activeGoalAfterMessages, "achieved", "", evidence);
+            const completionHandback = mirrorHandbackLine(activeGoalAfterMessages);
+            const completionHandbackSuffix = completionHandback ? `
+
+${completionHandback}` : "";
             cleanupGoal(sessionID);
             const promoted = ordered ? promoteNextOrderedGoal(sessionID) : null;
             const postCompletionSnapshot = captureFocusedGoalSnapshot(sessionID);
@@ -20382,9 +20775,9 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
             }
             const activePromoted = promoted ? activeGoal(sessionID, promoted.goalId, promoted.runId) : null;
             if (auditMessagesEnabled) {
-              await announceAudit(sessionID, activePromoted ? "Audit result: completion accepted — goal archived as achieved; next ordered goal active." : "Audit result: completion accepted — goal archived as achieved.");
+              await announceAudit(sessionID, (activePromoted ? "Audit result: completion accepted — goal archived as achieved; next ordered goal active." : "Audit result: completion accepted — goal archived as achieved.") + completionHandbackSuffix);
             } else {
-              announceLifecycle(sessionID, activePromoted ? "Goal achieved; next ordered goal active." : "Goal achieved.", {
+              announceLifecycle(sessionID, (activePromoted ? "Goal achieved; next ordered goal active." : "Goal achieved.") + completionHandbackSuffix, {
                 goal: activePromoted || activeGoalAfterMessages,
                 transition: activePromoted ? "achieved-promoted" : "achieved",
                 requireCurrent: Boolean(activePromoted),
@@ -20471,7 +20864,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
               response2 = await sessionApi.promptAsync(sessionID, {
                 ...continuationContextInput(claimedGoal),
                 parts: [
-                  makeContinuationPart(buildContinueMessage(claimedGoal, { budgetWrapup: true }), continueToken)
+                  makeContinuationPart(withExistingTodosOffer(buildContinueMessage(claimedGoal, { budgetWrapup: true, mirrorMode }), sessionID), continueToken)
                 ]
               });
             } finally {
@@ -20499,7 +20892,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           }
           return;
         }
-        const turnHasToolCall = turnCallsTool(turnMessages);
+        const turnHasToolCall = turnCallsTool(turnMessages, mirrorMode === "plan" ? MIRROR_TOOL_NAMES : NO_EXEMPT_TOOL_NAMES);
         if (turnTruncated && activeGoalAfterMessages.turnCount > 0 && !activationBoundary) {
           pushHistory(activeGoalAfterMessages, "warning", `The latest turn reaches the edge of the ${activeGoalAfterMessages.options.maxRecentMessages}-message visibility window and may be truncated; the stall brakes were not charged for it. Raise maxRecentMessages if this repeats.`);
         }
@@ -20621,12 +21014,13 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           response = await sessionApi.promptAsync(sessionID, {
             ...continuationContextInput(activeGoalBeforePrompt),
             parts: [
-              makeContinuationPart(buildContinueMessage(activeGoalBeforePrompt, {
+              makeContinuationPart(withExistingTodosOffer(buildContinueMessage(activeGoalBeforePrompt, {
                 budgetWrapup,
                 completionUnverified,
                 blockerUnstated,
-                completionRejection
-              }), continueToken)
+                completionRejection,
+                mirrorMode
+              }), sessionID), continueToken)
             ]
           });
         } finally {
@@ -20735,7 +21129,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
 `) : [
         `<opencode_goal_plugin id="${goal.goalId}">`,
         buildGoalBlock(goal),
-        ...buildPlanSystemLines(goal),
+        ...buildPlanSystemLines(goal, { mirrorMode }),
         "Keep working until the goal is fully satisfied.",
         "When fully satisfied, put a `[goal:evidence]` line summarizing what you verified immediately before `[goal:complete]`. A `[goal:complete]` without evidence is rejected.",
         "If user input is required, explain the concrete blocker in the line immediately before `[goal:blocked]`. A `[goal:blocked]` without a concrete blocker is rejected.",
@@ -20763,7 +21157,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       const goal = goalStates.get(input.sessionID);
       if (!goal)
         return;
-      const context = buildCompactionContext(goal);
+      const context = buildCompactionContext(goal, { mirrorMode });
       if (Array.isArray(output.context)) {
         output.context.push(context);
       } else {
@@ -20808,7 +21202,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
     delete hooks["command.execute.before"];
   }
   if (pluginOptions.registerTools !== false) {
-    hooks.tool = buildAgentTools(bundledToolHelper, agentToolHandlers, ensureSessionLoaded, commandName, () => runtime.disposed, registerCommand);
+    hooks.tool = buildAgentTools(bundledToolHelper, agentToolHandlers, ensureSessionLoaded, commandName, () => runtime.disposed, registerCommand, mirrorMode);
   }
   return hooks;
 }
@@ -20991,10 +21385,38 @@ var testInternals = {
   resolveStateFilePath,
   runtimeSessionDiagnostics,
   stopReason,
-  xdgStateFilePath
+  xdgStateFilePath,
+  MIRROR_MAX_TODOS,
+  MIRROR_MAX_EXTRAS,
+  MIRROR_EXTRA_TEXT_LIMIT,
+  MIRROR_MAX_NUDGES,
+  MIRROR_ID_SEPARATOR,
+  MIRROR_TOOL_NAMES,
+  MIRROR_MODES,
+  mirrorRowStatus,
+  mirrorRowSuffix,
+  projectPlanToTodos,
+  mirrorRow,
+  mirrorRowPriority,
+  mirrorFingerprint,
+  isMirrorOwnedRow,
+  pickExtras,
+  boundExtraContent,
+  resetMirrorForNewGoal,
+  normalizeMirrorMode,
+  normalizeMirror,
+  snapshotMirror,
+  readMirrorTerminal,
+  dropMirrorTerminal,
+  mirrorIsFresh,
+  mirrorState,
+  mirrorNudgeLine,
+  isEmptyList,
+  stampMirror
 };
 export {
   testInternals,
   goal_plugin_default as default,
+  assertPlanLedgerIsolated,
   GoalPlugin
 };
