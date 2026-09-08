@@ -38,8 +38,8 @@ The sidebar's Todo section is drawn from the same plan: while a plan exists, eve
 
 | Rung | Proves | Result |
 |---|---|---|
-| `npm test` | an executable spec for every documented behaviour | 655 of 655 pass |
-| `npm run test:mutation` | those tests are not vacuous | 95 of 95 critical mutants killed |
+| `npm test` | an executable spec for every documented behaviour | 660 of 660 pass |
+| `npm run test:mutation` | those tests are not vacuous | 99 of 99 critical mutants killed |
 | `npm run benchmark:behavior` | six end-to-end autonomy scenarios | 6 of 6, 0 model calls |
 | `npm run benchmark:todo-mirror` | the Todo mirror against a pre-v1.0.1 control | 0 of 8 turns diverge, 1 persistent checklist |
 | `npm run release:check` | the whole gate, in order | passes in about 2.5 to 3 minutes |

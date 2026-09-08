@@ -1,6 +1,6 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": ["opencode-goal-pro-max-complete-plugin@github:sblattj/opencode-goal-pro-max-complete-plugin#v1.0.0"],
+  "plugin": ["opencode-goal-pro-max-complete-plugin@github:sblattj/opencode-goal-pro-max-complete-plugin#v1.0.1"],
   "command": {
     "goal": {
       "description": "Set a session-scoped goal and auto-continue until complete.",
