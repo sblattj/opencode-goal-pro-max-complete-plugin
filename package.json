@@ -59,6 +59,7 @@
     "smoke:todo-mirror": "node scripts/smoke-todo-mirror.mjs",
     "smoke:todo-safety": "node scripts/smoke-todo-safety.mjs",
     "benchmark:behavior": "node scripts/behavior-benchmark.mjs",
+    "benchmark:todo-mirror": "node scripts/bench-todo-mirror.mjs",
     "verify": "node scripts/verify.mjs",
     "installer": "node scripts/cli.mjs",
     "check": "node -c src/goal-plugin.js && node -c src/goal-tui.js && node -c src/goal-sidebar-view.js && node -c src/goal-format.js && npm test",
@@ -66,7 +67,7 @@
     "bundle:server": "bun build ./src/goal-plugin.js --outfile ./dist/goal-plugin.js --target node",
     "bundle:tui": "bun build ./src/goal-tui.js --outfile ./dist/goal-tui.js --target node --packages external",
     "pack:check": "npm pack --dry-run",
-    "release:check": "npm run bundle && npm run check && npm run test:coverage && npm run type:check && npm run test:mutation && npm run benchmark:behavior && npm run smoke && npm run smoke:packed-host && npm run smoke:packed-tools && npm run smoke:packed-manifest && npm run smoke:git-install && npm run verify && npm audit --omit=dev --audit-level=high && npm run pack:check"
+    "release:check": "npm run bundle && npm run check && npm run test:coverage && npm run type:check && npm run test:mutation && npm run benchmark:behavior && npm run benchmark:todo-mirror && npm run smoke && npm run smoke:packed-host && npm run smoke:packed-tools && npm run smoke:packed-manifest && npm run smoke:git-install && npm run verify && npm audit --omit=dev --audit-level=high && npm run pack:check"
   },
   "keywords": [
     "opencode",
