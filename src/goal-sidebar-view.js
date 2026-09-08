@@ -188,8 +188,16 @@ function normalizeAction(raw) {
 
 
 // >>> v101:T39 the needs-evidence suffix on a panel action line (A3)
-// Reserved. T39 appends ` — needs claim/evidence/verdict` in `actionLine` for a done action
-// with no passing verdict.
+// A done action without a passing verdict is exactly the unsubstantiated
+// completion the CEV gate exists to catch (mirrors `mirrorRowSuffix` in
+// `src/goal-plugin.js`, CONTRACTS Strings), so the panel line names it the
+// same way the Todo mirror row does. `action.verified` is computed by
+// `normalizeAction` above as `status === "done" && verdict === "pass"`, so
+// checking it alone (once status is known to be "done") is equivalent to
+// checking for a passing verdict.
+function actionNeedsEvidenceSuffix(action) {
+  return action.status === "done" && !action.verified ? " — needs claim/evidence/verdict" : ""
+}
 // <<< v101:T39
 
 
@@ -295,7 +303,7 @@ function actionColor(theme, action) {
 
 function actionLine(action) {
   const verdict = action.verdict ? ` [${action.verdict}]` : ""
-  return `${action.mark} ${action.title}${verdict}`
+  return `${action.mark} ${action.title}${verdict}${actionNeedsEvidenceSuffix(action)}`
 }
 
 /**

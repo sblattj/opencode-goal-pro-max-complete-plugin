@@ -585,6 +585,79 @@ test("the shared budget formatters are the ones the panel and the title both use
 
 // >>> v101:T39 tests - the needs-evidence suffix on a panel action line
 // T39 units: A3 ("a done action without a passing verdict carries the needs-evidence suffix on its panel line").
+test("a done action without a passing verdict carries the needs-evidence suffix on its panel line", async () => {
+  const runtime = fakeRuntime()
+  const { tui } = createGoalSidebar(runtime)
+  const sessions = new Map([
+    [
+      "ses_plan",
+      {
+        id: "ses_plan",
+        metadata: {
+          goal: payload({
+            turns: undefined,
+            minutes: undefined,
+            tokens: undefined,
+            plan: {
+              total: 2,
+              verified: 0,
+              blocked: 0,
+              actions: [
+                { id: "a1", title: "claim it works", status: "done", verdict: null },
+                { id: "a2", title: "broke it", status: "done", verdict: "fail" },
+              ],
+            },
+          }),
+        },
+      },
+    ],
+  ])
+  const { api, registrations } = fakeApi(sessions)
+  await tui(api, {}, { spec: "opencode-goal-pro-max-complete-plugin" })
+
+  const node = registrations[0].slots.sidebar_content({}, { session_id: "ses_plan" })
+  const lines = renderLines(runtime, node)
+  assert.deepEqual(lines.slice(2), [
+    { fg: THEME.textMuted, text: "0/2 actions verified" },
+    { fg: THEME.textMuted, text: "● claim it works — needs claim/evidence/verdict" },
+    { fg: THEME.error, text: "● broke it [fail] — needs claim/evidence/verdict" },
+  ])
+})
+
+test("a verified done action carries no suffix", async () => {
+  const runtime = fakeRuntime()
+  const { tui } = createGoalSidebar(runtime)
+  const sessions = new Map([
+    [
+      "ses_plan",
+      {
+        id: "ses_plan",
+        metadata: {
+          goal: payload({
+            turns: undefined,
+            minutes: undefined,
+            tokens: undefined,
+            plan: {
+              total: 1,
+              verified: 1,
+              blocked: 0,
+              actions: [{ id: "a1", title: "proved", status: "done", verdict: "pass" }],
+            },
+          }),
+        },
+      },
+    ],
+  ])
+  const { api, registrations } = fakeApi(sessions)
+  await tui(api, {}, { spec: "opencode-goal-pro-max-complete-plugin" })
+
+  const node = registrations[0].slots.sidebar_content({}, { session_id: "ses_plan" })
+  const lines = renderLines(runtime, node)
+  assert.deepEqual(lines.slice(2), [
+    { fg: THEME.textMuted, text: "1/1 actions verified" },
+    { fg: THEME.success, text: "● proved [pass]" },
+  ])
+})
 // <<< v101:T39
 
 
