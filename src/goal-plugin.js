@@ -1654,7 +1654,7 @@ function resetGoalBudget(goal) {
   goal.compactionSourceAssistantMessageID = ""
   goal.skipNextTerminalCheck = false
   goal.history = [...(goal.history || [])].slice(-MAX_HISTORY_ENTRIES)
-  goal.mirror.nudges = 0 // v101:T16 — a fresh budget window re-earns the full nudge budget; fingerprint/rows untouched.
+  goal.mirror.nudges = 0 // A fresh budget window re-earns the full nudge budget; fingerprint/rows untouched.
 }
 
 function currentGoal(sessionID, goalID, runID) {
@@ -5379,7 +5379,7 @@ function createChildSessionAuditor(
   }
 }
 
-// >>> v101:CONST todo-mirror bounds, id separator, tool set and mode set
+// Todo-mirror bounds, id separator, tool set and mode set
 const MIRROR_MAX_TODOS = 20          // plan rows incl. the overflow row
 const MIRROR_MAX_EXTRAS = 10         // model-authored rows kept after the plan rows
 const MIRROR_EXTRA_TEXT_LIMIT = 120  // bound on each extra row's content (via summarizeText)
@@ -5390,14 +5390,11 @@ const MIRROR_MODES = new Set(["plan", "off"])
 // T22's static todowrite description suffix (CONTRACTS "todowrite description
 // suffix (T22)"). Module scope because the `tool.definition` hook has no
 // sessionID and must emit byte-identical text across every call (X4/F23); the
-// hook body lives in the v101:T22 region below.
+// hook body lives in the `tool.definition` hook below.
 const TODOWRITE_MIRROR_DESCRIPTION =
   "GOAL PLUGIN: if a <goal_plan> block is present in your context, this session's todo list is drawn from that plan — plan actions are written here for you, and items of your own are kept below them. Use goal_plan_set / goal_action_update to change the work, and follow the refresh instruction in that block when it asks for one. With no <goal_plan> block, this tool behaves normally."
-// <<< v101:CONST
 
-
-
-// >>> v101:T1 plan action -> mirrored row status and suffix
+// Plan action -> mirrored row status and suffix
 /**
  * `mirrorRowStatus(action)` -> `"pending" | "in_progress" | "completed"`: pending->pending;
  * in_progress->in_progress; done AND `planActionVerified(action)`->completed; done not
@@ -5428,11 +5425,8 @@ function mirrorRowSuffix(action) {
   }
   return ""
 }
-// <<< v101:T1
 
-
-
-// >>> v101:T2 plan -> native todo rows, with the one counted overflow row
+// Plan -> native todo rows, with the one counted overflow row
 /**
  * `projectPlanToTodos(plan, extras)` -> row[]: plan rows in plan order; if
  * `plan.actions.length > MIRROR_MAX_TODOS`, emit the first `MIRROR_MAX_TODOS - 1` actions then ONE
@@ -5482,11 +5476,8 @@ function projectPlanToTodos(plan, extras) {
   for (const extra of tail) rows.push(extra)
   return rows
 }
-// <<< v101:T2
 
-
-
-// >>> v101:T3 the three-required-strings invariant, and the row priority
+// The three-required-strings invariant, and the row priority
 /**
  * `mirrorRow({ content, status, priority })` -> `{ content: string, status: string, priority: string }`:
  * coerces via `String(...)`, never emits `undefined`/`null`; missing status -> `"pending"`, missing
@@ -5521,11 +5512,8 @@ function mirrorRowPriority(action, index) {
   if (mirrorRowStatus(action) === "completed") return "low"
   return index === 0 ? "high" : "medium"
 }
-// <<< v101:T3
 
-
-
-// >>> v101:T4 fingerprint over the rendered rows, never over the plan
+// Fingerprint over the rendered rows, never over the plan
 /**
  * `mirrorFingerprint(rows)` -> string: sha256 hex (node:crypto) over
  * `JSON.stringify(rows.map(r => [r.content, r.status, r.priority]))`; `[]` -> the hash of `"[]"`,
@@ -5536,11 +5524,8 @@ function mirrorFingerprint(rows) {
   const payload = JSON.stringify(safeRows.map((r) => [r.content, r.status, r.priority]))
   return createHash("sha256").update(payload).digest("hex")
 }
-// <<< v101:T4
 
-
-
-// >>> v101:T5 the extras picker: rows the model authored, kept and capped
+// The extras picker: rows the model authored, kept and capped
 /**
  * `isMirrorOwnedRow(content, goal)` -> boolean: content starts with `${id}${MIRROR_ID_SEPARATOR}`
  * for an id currently in `goal.plan.actions`, OR matches the overflow row pattern
@@ -5591,11 +5576,8 @@ function pickExtras(incoming, goal) {
   )
   return { extra, dropped: candidates.length - kept.length }
 }
-// <<< v101:T5
 
-
-
-// >>> v101:T6 extras bounding, and the reset on a new goal
+// Extras bounding, and the reset on a new goal
 /**
  * `boundExtraContent(content)` -> string: the bound T5 calls, `summarizeText(content,
  * MIRROR_EXTRA_TEXT_LIMIT)`.
@@ -5611,22 +5593,16 @@ function boundExtraContent(content) {
 function resetMirrorForNewGoal(goal) {
   goal.mirror = normalizeMirror()
 }
-// <<< v101:T6
 
-
-
-// >>> v101:T7 the mirrorTodos option
+// The mirrorTodos option
 /**
  * `normalizeMirrorMode(value)` -> `"plan" | "off"` (anything not in `MIRROR_MODES` -> `"plan"`).
  */
 function normalizeMirrorMode(value) {
   return MIRROR_MODES.has(value) ? value : "plan"
 }
-// <<< v101:T7
 
-
-
-// >>> v101:T8 the persisted mirror record, read side
+// The persisted mirror record, read side
 /**
  * Persisted rows are coerced by the SAME function that produced them, T3's `mirrorRow`. This seat
  * originally carried its own copy because `mirrorRow` was still a throwing scaffold stub in the T8
@@ -5658,11 +5634,8 @@ function normalizeMirror(raw) {
     extra: normalizeMirrorRows(source.extra),
   }
 }
-// <<< v101:T8
 
-
-
-// >>> v101:T9 the mirrorTerminals collection and its snapshot accessors
+// The mirrorTerminals collection and its snapshot accessors
 // The terminal render for a goal's mirrored todo rows after the goal record
 // itself is gone (stop/clear/completion), mirroring sidebarTerminals above
 // (F33): sessionID -> { rows, at }.
@@ -5692,9 +5665,6 @@ function readMirrorTerminal(sessionID) {
 function dropMirrorTerminal(sessionID) {
   mirrorTerminals.delete(sessionID)
 }
-// <<< v101:T9
-
-
 
 // v1.0.1 T38: the <existing_todos> offer queue (design §4.3(c), CONTRACTS
 // T38). `/goal set` stores a session's pre-existing native todo rows here —
@@ -5759,9 +5729,7 @@ function withExistingTodosOffer(continuationText, sessionID) {
   return `${continuationText}\n\n${block}`
 }
 
-
-
-// >>> v101:T14 mirror staleness, the mirror state, and the nudge budget
+// Mirror staleness, the mirror state, and the nudge budget
 /**
  * `mirrorIsFresh(goal)` -> boolean: `goal.mirror.at > 0 &&
  * mirrorFingerprint(projectPlanToTodos(goal.plan, goal.mirror.extra)) === goal.mirror.fingerprint`.
@@ -5814,11 +5782,8 @@ function mirrorNudgeLine(goal, mirrorMode) {
   mirror.nudges += 1
   return MIRROR_NUDGE_LINE
 }
-// <<< v101:T14
 
-
-
-// >>> v101:T10 the empty-list predicate the before-hook guard ladder shares
+// The empty-list predicate the before-hook guard ladder shares
 /**
  * `isEmptyList(value)` -> boolean: `Array.isArray(value) && value.length === 0`.
  *
@@ -5830,11 +5795,8 @@ function mirrorNudgeLine(goal, mirrorMode) {
 function isEmptyList(value) {
   return Array.isArray(value) && value.length === 0
 }
-// <<< v101:T10
 
-
-
-// >>> v101:T12 the mirror freshness stamp
+// The mirror freshness stamp
 /**
  * `stampMirror(goal, args, now)` -> void: record what the host was actually
  * handed — the fingerprint over `args.todos`, the moment it landed, and the
@@ -5856,11 +5818,8 @@ function stampMirror(goal, args, now) {
   goal.mirror.at = now
   goal.mirror.rows = written.map((row) => mirrorRow(row))
 }
-// <<< v101:T12
 
-
-
-// >>> v101:T28 the ledger-isolation guard: no todo shape reaches goal.plan.actions
+// The ledger-isolation guard: no todo shape reaches goal.plan.actions
 /**
  * `assertPlanLedgerIsolated(goal)` -> the same `goal`, unchanged, when every action in
  * `goal.plan.actions` is still shaped like a plan action and not like a mirrored todo row.
@@ -5924,9 +5883,6 @@ function planActionTitleCarriesMirrorPrefix(title) {
  * next integration.
  */
 export { assertPlanLedgerIsolated }
-// <<< v101:T28
-
-
 
 async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) {
   if (pluginOptions.completionAudit && pluginOptions.registerAgents === false) {
@@ -7072,7 +7028,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           `This /${commandName} control command has already been handled. Tool "${input?.tool || "unknown"}" was blocked because no tool calls are allowed while its result is being reported. Wait for a separate user turn before using tools or modifying work or goal state.`,
         )
       }
-      // >>> v101:T10 todowrite mirror: hook signature, tool gate and the guard ladder
+      // Todowrite mirror: hook signature, tool gate and the guard ladder
       // The tool gate is the FIRST mirror statement, and it is mandatory: without
       // it the plugin would write a `todos` property into `bash`'s args and every
       // tool call in the session would fail the host's argument decode.
@@ -7085,11 +7041,8 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       // would invent arguments the host never sent.
       if (!output?.args) return
       const goal = goalStates.get(sessionID)
-      // <<< v101:T10
 
-
-
-      // >>> v101:T11 todowrite mirror: the empty-call interception (X1)
+      // Todowrite mirror: the empty-call interception (X1)
       // `todowrite({todos: []})` is the refresh idiom the plugin teaches, so an
       // empty list is never a native "clear my todo list" instruction: it is a
       // request to redraw. Letting it reach the host would wipe the panel — the
@@ -7131,11 +7084,8 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         // the empty list is the model's own and the host may honour it.
         return
       }
-      // <<< v101:T11
 
-
-
-      // >>> v101:T10 todowrite mirror: the non-empty path - extras, projection, the write
+      // Todowrite mirror: the non-empty path - extras, projection, the write
       // Native behaviour whenever there is no live plan to draw from: no goal, a
       // paused/stopped one, or a goal whose plan is still empty. The plan is
       // opt-in, so a session that never recorded one keeps its own todo list.
@@ -7153,13 +7103,10 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       // kept its reference before triggering the hook, so reassigning
       // `output.args` would be silently dropped.
       output.args.todos = rows
-      // <<< v101:T10
-
-
 
     },
     "tool.execute.after": async (input, output) => {
-      // >>> v101:T12 todowrite mirror: the freshness stamp, only after the write landed
+      // Todowrite mirror: the freshness stamp, only after the write landed
       // The stamp lives in the AFTER hook because only this hook proves the host
       // actually wrote the list. Between the two hooks the host decodes the args
       // (F2) and asks for permission (F5); either can abort the call, and a mirror
@@ -7185,14 +7132,11 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         // this plan, so it has to reach disk with the rest of the goal record.
         await persist(sessionID)
       }
-      // `stampMirror` itself lives at module scope, in the v101:T12 region beside
+      // `stampMirror` itself lives at module scope, beside
       // the other mirror helpers, so CONTRACTS' "exported through testInternals"
       // can hold for it. Only the call site is here.
-      // <<< v101:T12
 
-
-
-      // >>> v101:T13 todowrite mirror: the tool-result note
+      // Todowrite mirror: the tool-result note
       // The model reads, in its own tool result, the list that was actually
       // written and how many of its own rows survived the cap. `goal.stopped`
       // is excluded deliberately: units 8/9 leave a NON-EMPTY todowrite's result
@@ -7232,13 +7176,10 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         }
         return note
       }
-      // <<< v101:T13
-
-
 
     },
     "tool.definition": async (input, output) => {
-      // >>> v101:T22 todowrite description suffix (X4)
+      // Todowrite description suffix (X4)
       // Static text only: the hook carries no sessionID and this plugin instance is
       // cached per directory, so every session in the project shares one description
       // (design §4.4(E), F23). Never gate this on goal state (F23's whole point is
@@ -7247,9 +7188,6 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       if (mirrorMode === "off") return
       if (!output || typeof output.description !== "string") return
       output.description = `${output.description}\n\n${TODOWRITE_MIRROR_DESCRIPTION}`
-      // <<< v101:T22
-
-
 
     },
     "command.execute.before": async (input, output) => {

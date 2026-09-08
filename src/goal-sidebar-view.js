@@ -167,7 +167,7 @@ function normalizeAction(raw) {
   }
 }
 
-// >>> v101:T24 exception-list filter for the mirrored action list (G2)
+// Exception-list filter for the mirrored action list (G2)
 // The exception list. While the native Todo section is drawing this plan, the panel stops
 // repeating rows that section already shows and keeps only what it cannot express: a
 // completion with no passing verdict, then a blocker, then the work in flight. `pending`
@@ -194,11 +194,8 @@ function mirrorFiltersPanelActions(mirror) {
 function panelExceptionList(actions) {
   return PANEL_EXCEPTION_GROUPS.flatMap((inGroup) => actions.filter(inGroup))
 }
-// <<< v101:T24
 
-
-
-// >>> v101:T25 mirror suffix on the progress line
+// Mirror suffix on the progress line
 // Computes both the progress-line suffix and the `model.mirror` facts consumed by T26 and
 // the types seat from the same inputs, so the two surfaces can never disagree about
 // whether there is drift. `liveTodoCount` is the option `goalPanelModel` was called with;
@@ -220,11 +217,8 @@ function mirrorProgress(mirror, liveTodoCount) {
   if (mirror.state === "stale") return { suffix: " · todo list stale", facts }
   return { suffix: "", facts }
 }
-// <<< v101:T25
 
-
-
-// >>> v101:T26 live drift check
+// Live drift check
 // The live row count of the host's OWN todo list, read exactly the way opencode's builtin Todo
 // section reads it: `api.state.session.todo(sessionID)`
 // (`packages/tui/src/feature-plugins/sidebar/todo.tsx:11` `View`, typed at
@@ -256,11 +250,8 @@ function readLiveTodoCount(api, sessionID) {
     return undefined
   }
 }
-// <<< v101:T26
 
-
-
-// >>> v101:T39 the needs-evidence suffix on a panel action line (A3)
+// The needs-evidence suffix on a panel action line (A3)
 // A done action without a passing verdict is exactly the unsubstantiated
 // completion the CEV gate exists to catch (mirrors `mirrorRowSuffix` in
 // `src/goal-plugin.js`, CONTRACTS Strings), so the panel line names it the
@@ -271,9 +262,6 @@ function readLiveTodoCount(api, sessionID) {
 function actionNeedsEvidenceSuffix(action) {
   return action.status === "done" && !action.verified ? " — needs claim/evidence/verdict" : ""
 }
-// <<< v101:T39
-
-
 
 /**
  * Turn a `session.metadata.goal` payload into everything the panel renders.
@@ -417,7 +405,7 @@ export function createGoalSidebar(runtime) {
 
   function GoalPanel(props) {
     const theme = () => props.api.theme.current
-    // v101:T26 edit (outside the T26 region, the one call site): the live todo count is read in
+    // The one call site: the live todo count is read in
     // the SAME memo as the payload, so both the drift check and its inputs are tracked together.
     const model = createMemo(() =>
       goalPanelModel(readGoalPayload(props.api, props.session_id), {
