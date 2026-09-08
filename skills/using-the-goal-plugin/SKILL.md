@@ -1,6 +1,6 @@
 ---
 name: using-the-goal-plugin
-description: "Use when a goal is running or requested: the prompt carries a <goal_continuation> or <goal_plan> block, the sidebar shows a Goal panel, the turn says 'Start working toward this goal now', the user types /goal, pastes a handoff, asks for unattended multi-step work or to 'keep going until done', or asks how a goal is doing. Covers setting and decomposing goals, the goal_* tools, CEV evidence, the [goal:evidence]/[goal:complete]/[goal:blocked] markers, budgets, and the sidebar."
+description: "Use when a goal is running or requested: the prompt carries a <goal_continuation> or <goal_plan> block, the sidebar shows a Goal panel, the turn says 'Start working toward this goal now', the user types /goal, pastes a handoff, asks for unattended multi-step work or to 'keep going until done', asks how a goal is doing, or asks why the native Todo list rewrote itself or why the Goal panel reads 'todo list stale' or 'mirror drift'. Covers setting and decomposing goals, the goal_* tools, CEV evidence, the [goal:evidence]/[goal:complete]/[goal:blocked] markers, budgets, the todo mirror (the Todo section is the plan, and one todowrite({todos: []}) redraws it), and the sidebar."
 ---
 
 # Using the goal plugin
