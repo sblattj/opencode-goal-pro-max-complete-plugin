@@ -141,7 +141,9 @@ They are documented rather than worked around, and `mirrorTodos: "off"` removes 
    tool outright, `explore` denies everything but a read-only allow-list, and every `task`-spawned
    subagent inherits a default deny (hazard 1), so the before-hook never gets to mirror anything and
    no write ever lands. The mirror then reads `stale` for the whole run rather than `off`, which has
-   two visible consequences: the Goal panel's progress line carries ` · todo list stale`, and the
+   two visible consequences: the Goal panel's progress line carries ` · todo list stale` — or
+   ` · mirror drift (N≠0)` when the session's own native list is not empty, because the panel checks
+   drift against `plan.mirror.rows` (0 here) *before* it reports staleness — and the
    panel still shows the **exception list**, so `pending` actions appear only in `/goal status`. The
    nudge self-suppresses once its budget is spent. **No configuration introspection is performed** —
    the plugin cannot see the merged ruleset, and the empirical signal is both simpler and correct.

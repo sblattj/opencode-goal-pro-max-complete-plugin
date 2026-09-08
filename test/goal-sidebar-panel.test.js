@@ -748,6 +748,20 @@ test("the progress line names a fresh mirror with the live count and a stale one
   assert.equal(staleDrift.progress, "1/2 actions verified · mirror drift (7≠5)")
   assert.equal(staleDrift.mirror.drift, true)
 
+  // The NEVER-MIRRORED stale case, `rows: 0` — the shape a host that denies
+  // `todowrite` produces, which docs/compatibility.md hazard 3 describes. Drift
+  // still wins, so the suffix that hazard promises is only the one you see when
+  // the session's own native list is empty too.
+  const neverMirrored = { ...plan, mirror: mirror("stale", { rows: 0 }) }
+  assert.equal(
+    goalPanelModel(payload({ plan: neverMirrored }), { liveTodoCount: 0 }).progress,
+    "1/2 actions verified · todo list stale",
+  )
+  assert.equal(
+    goalPanelModel(payload({ plan: neverMirrored }), { liveTodoCount: 3 }).progress,
+    "1/2 actions verified · mirror drift (3≠0)",
+  )
+
   // Non-finite live counts behave exactly like "no live count was supplied".
   for (const junk of [undefined, NaN, "5", null]) {
     const model = goalPanelModel(payload({ plan }), { liveTodoCount: junk })

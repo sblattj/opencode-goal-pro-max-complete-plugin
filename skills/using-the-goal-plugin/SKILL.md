@@ -288,8 +288,8 @@ verified - the usual reason a goal looks finished but will not complete.
 
 The Goal panel no longer repeats the plan: it prints the progress line plus only the actions that need
 attention (done-without-evidence, blocked, in progress). A fully verified plan prints one line. If the
-progress line says `todo list stale`, the Todo section above is showing an older copy - one
-`todowrite({todos: []})` fixes it. A pending row of your own keeps the Todo section on screen after
+progress line says `todo list stale` or `mirror drift`, the Todo section above is showing an older copy
+or a different list - one `todowrite({todos: []})` fixes either. A pending row of your own keeps the Todo section on screen after
 every action has verified; it is not goal work and does not block completion. A `todowrite` bubble in
 scrollback shows the redrawn list too, not the wording you sent, because the host records the
 rewritten arguments.
