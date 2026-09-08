@@ -56,6 +56,7 @@
     "smoke:packed-tools": "node scripts/packed-tool-contract.mjs",
     "smoke:packed-manifest": "node scripts/packed-manifest-contract.mjs",
     "smoke:git-install": "node scripts/git-install-contract.mjs",
+    "smoke:todo-mirror": "node scripts/smoke-todo-mirror.mjs",
     "benchmark:behavior": "node scripts/behavior-benchmark.mjs",
     "verify": "node scripts/verify.mjs",
     "installer": "node scripts/cli.mjs",
