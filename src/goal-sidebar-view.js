@@ -199,8 +199,27 @@ function panelExceptionList(actions) {
 
 
 // >>> v101:T25 mirror suffix on the progress line
-// Reserved. T25 adds the ` · todo mirror fresh (n)` / ` · todo list stale` suffix and the
-// `{ liveTodoCount }` options argument.
+// Computes both the progress-line suffix and the `model.mirror` facts consumed by T26 and
+// the types seat from the same inputs, so the two surfaces can never disagree about
+// whether there is drift. `liveTodoCount` is the option `goalPanelModel` was called with;
+// only a finite number counts (T26's own read is guarded to fall back to `undefined` on any
+// throw/absence). Returns `facts: null` when there is nothing to report — no `plan.mirror`,
+// or `state === "off"` — so `goalPanelModel` can omit the `mirror` key from the model
+// entirely rather than set it to `undefined`, which is what unit 35 requires: an `off`
+// mirror (or a v2 payload with no `plan.mirror` at all) must render a model with exactly
+// the same OWN KEYS as today, not an extra `mirror: undefined` a strict deep-equal would
+// still see.
+function mirrorProgress(mirror, liveTodoCount) {
+  if (!isRecord(mirror) || mirror.state === "off") return { suffix: "", facts: null }
+  const rows = wholeNumber(mirror.rows)
+  const live = Number.isFinite(liveTodoCount) ? liveTodoCount : null
+  const drift = (mirror.state === "fresh" || mirror.state === "stale") && live !== null && live !== rows
+  const facts = { state: mirror.state, rows, extra: wholeNumber(mirror.extra), liveTodoCount: live, drift }
+  if (drift) return { suffix: ` · mirror drift (${live}≠${rows})`, facts }
+  if (mirror.state === "fresh") return { suffix: ` · todo mirror fresh (${live !== null ? live : rows})`, facts }
+  if (mirror.state === "stale") return { suffix: " · todo list stale", facts }
+  return { suffix: "", facts }
+}
 // <<< v101:T25
 
 
@@ -226,7 +245,7 @@ function panelExceptionList(actions) {
  * The payload crosses a process boundary as arbitrary JSON, so every field is
  * validated here rather than trusted.
  */
-export function goalPanelModel(raw) {
+export function goalPanelModel(raw, { liveTodoCount } = {}) {
   if (!isRecord(raw)) return null
   const objective = boundedText(raw.objective, 120)
   if (!objective) return null
@@ -273,6 +292,7 @@ export function goalPanelModel(raw) {
         wholeNumber(plan.blocked) ? `, ${wholeNumber(plan.blocked)} blocked` : ""
       }`
     : ""
+  const { suffix: mirrorSuffix, facts: mirrorFacts } = mirrorProgress(plan.mirror, liveTodoCount)
 
   // Ordered by what a human needs first when they glance at a stuck run: why it
   // stopped, then what it was told to satisfy.
@@ -292,10 +312,11 @@ export function goalPanelModel(raw) {
     objective,
     stats,
     sequence,
-    progress,
+    progress: `${progress}${mirrorSuffix}`,
     actions,
     hiddenActions,
     notes,
+    ...(mirrorFacts ? { mirror: mirrorFacts } : {}),
   }
 }
 

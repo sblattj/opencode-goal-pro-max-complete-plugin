@@ -593,7 +593,9 @@ test("a fresh mirror renders only the actions that need attention", () => {
   )
   assert.equal(model.hiddenActions, 0)
   // The progress line still counts the WHOLE plan, so nothing is lost by filtering rows.
-  assert.equal(model.progress, "1/6 actions verified, 1 blocked")
+  // v101:T25 edit: a fresh mirror now also carries the progress-line suffix (unit 35's
+  // sibling unit); this test predates T25, so the expectation is extended, not the model.
+  assert.equal(model.progress, "1/6 actions verified, 1 blocked · todo mirror fresh (5)")
 
   // A stale mirror is still a mirror: the Todo section holds an older copy of these rows,
   // so the panel keeps filtering rather than duplicating the list.
@@ -627,7 +629,8 @@ test("a fully verified plan renders the progress line and no rows", () => {
   assert.deepEqual(model.actions, [])
   // Zero rows must not resurrect the `+N more` line: there is nothing more to show.
   assert.equal(model.hiddenActions, 0)
-  assert.equal(model.progress, "4/4 actions verified")
+  // v101:T25 edit: extended for the new fresh-mirror suffix (see the note above).
+  assert.equal(model.progress, "4/4 actions verified · todo mirror fresh (5)")
 
   // The same plan with the mirror off is the control: it still renders all four rows.
   const off = goalPanelModel(payload({ plan: { ...plan, mirror: mirror("off") } }))
@@ -682,7 +685,73 @@ test("the exception list keeps plan order within each group and caps at MAX_PANE
 
 
 // >>> v101:T25 tests - the mirror suffix on the progress line
-// T25 units: 35.
+// T25 units: 35 ("mirror off renders every action, exactly as v2 did" — design §5.2 line 725;
+// the task brief's own gloss on this unit, "under \"off\" the model's action list, progress
+// line and every field equal the v2 rendering of the same plan", is what the assertions below
+// prove, but the design-assigned NAME is kept verbatim per CONTRACTS ("33-38 as listed in
+// design §5.2") since that string, not the brief's paraphrase, is the one other seats/anchors
+// can cite), plus "the progress line names a fresh mirror with the live count and a stale one
+// without it" (new for T25, not in design §5.2's numbered list).
+
+test("mirror off renders every action, exactly as v2 did", () => {
+  const actions = [
+    { id: "a1", title: "pending work", status: "pending", verdict: null },
+    { id: "a2", title: "in flight", status: "in_progress", verdict: null },
+    { id: "a3", title: "claimed done", status: "done", verdict: null },
+  ]
+  const planWithOff = { total: 3, verified: 1, blocked: 0, mirror: mirror("off"), actions }
+  const planNoMirrorKey = { total: 3, verified: 1, blocked: 0, actions } // v2: no `mirror` key at all
+
+  const withOff = goalPanelModel(payload({ plan: planWithOff }))
+  const v2 = goalPanelModel(payload({ plan: planNoMirrorKey }))
+  assert.deepEqual(withOff, v2)
+  assert.ok(!("mirror" in withOff), "an off mirror must not leak a `mirror` key onto the model")
+  assert.equal(withOff.actions.length, 3)
+  assert.equal(withOff.progress, "1/3 actions verified")
+
+  // A `liveTodoCount` is ignored outright while the mirror is off: still byte-equal to v2.
+  const withOffAndLive = goalPanelModel(payload({ plan: planWithOff }), { liveTodoCount: 99 })
+  assert.deepEqual(withOffAndLive, v2)
+})
+
+test("the progress line names a fresh mirror with the live count and a stale one without it", () => {
+  const plan = { total: 2, verified: 1, blocked: 0, mirror: mirror("fresh", { rows: 5 }), actions: [] }
+
+  // No live count supplied: the suffix falls back to the payload's own `mirror.rows`.
+  const noLive = goalPanelModel(payload({ plan }))
+  assert.equal(noLive.progress, "1/2 actions verified · todo mirror fresh (5)")
+  assert.deepEqual(noLive.mirror, { state: "fresh", rows: 5, extra: 0, liveTodoCount: null, drift: false })
+
+  // A finite live count that agrees with the payload names the live number instead — they
+  // happen to be equal here, which also proves this is not double-counting anything.
+  const liveAgrees = goalPanelModel(payload({ plan }), { liveTodoCount: 5 })
+  assert.equal(liveAgrees.progress, "1/2 actions verified · todo mirror fresh (5)")
+  assert.equal(liveAgrees.mirror.liveTodoCount, 5)
+  assert.equal(liveAgrees.mirror.drift, false)
+
+  // Stale carries NO count at all: the payload's row count is a snapshot the panel does not
+  // want to imply is still accurate once the mirror has gone stale.
+  const stalePlan = { ...plan, mirror: mirror("stale", { rows: 5 }) }
+  const stale = goalPanelModel(payload({ plan: stalePlan }))
+  assert.equal(stale.progress, "1/2 actions verified · todo list stale")
+  assert.deepEqual(stale.mirror, { state: "stale", rows: 5, extra: 0, liveTodoCount: null, drift: false })
+
+  // A live count that disagrees overrides BOTH the fresh and the stale suffix with drift —
+  // proved here from `goalPanelModel`'s side alone; T26 owns supplying the real live count.
+  const freshDrift = goalPanelModel(payload({ plan }), { liveTodoCount: 7 })
+  assert.equal(freshDrift.progress, "1/2 actions verified · mirror drift (7≠5)")
+  assert.equal(freshDrift.mirror.drift, true)
+
+  const staleDrift = goalPanelModel(payload({ plan: stalePlan }), { liveTodoCount: 7 })
+  assert.equal(staleDrift.progress, "1/2 actions verified · mirror drift (7≠5)")
+  assert.equal(staleDrift.mirror.drift, true)
+
+  // Non-finite live counts behave exactly like "no live count was supplied".
+  for (const junk of [undefined, NaN, "5", null]) {
+    const model = goalPanelModel(payload({ plan }), { liveTodoCount: junk })
+    assert.equal(model.progress, "1/2 actions verified · todo mirror fresh (5)", `liveTodoCount ${String(junk)}`)
+  }
+})
 // <<< v101:T25
 
 
