@@ -54,20 +54,80 @@ export interface GoalPanelModel {
   stats: string[]
   /** `step 2/4` for an ordered `/goal sequence`, otherwise empty. */
   sequence: string
-  /** `3/7 actions verified`, otherwise empty. */
+  /**
+   * `3/7 actions verified`, otherwise empty. When the payload carries a v3
+   * `plan.mirror` whose `state` is not `"off"`, one of three suffixes is
+   * appended (see {@link mirror}): `" · todo mirror fresh (5)"`,
+   * `" · todo list stale"`, or `" · mirror drift (7≠5)"`. No suffix is
+   * appended for a v2 payload (no `plan.mirror`) or a `mirror.state` of
+   * `"off"` — the line renders exactly as it did before v1.0.1.
+   */
   progress: string
+  /**
+   * Under an active mirror ({@link mirror} present), this is the EXCEPTION
+   * list — only actions that need attention, in order: a `done` action with
+   * no passing verdict, then `blocked`, then `in_progress`; `pending` and a
+   * verified `done` are omitted entirely (the native Todo section already
+   * shows plan work, so the panel repeats only what that section cannot
+   * express). Without an active mirror (v2 payload, or `mirror.state ===
+   * "off"`), this is every action, exactly as before v1.0.1.
+   */
   actions: GoalPanelAction[]
-  /** Actions beyond the panel's render cap. */
+  /**
+   * Actions beyond the panel's render cap (`MAX_PANEL_ACTIONS`). Under an
+   * active mirror this counts over the FILTERED exception list, not the
+   * full plan — a plan with 40 pending actions and one exception renders
+   * `hiddenActions: 0`, because none of the omitted rows were exceptions.
+   * The count is also taken over the plan actions the server already
+   * capped to 20 (`SIDEBAR_METADATA_MAX_ACTIONS`), so it cannot see
+   * exceptions beyond that server-side cap either.
+   */
   hiddenActions: number
   notes: GoalPanelNote[]
+  /**
+   * Todo-mirror facts for the current payload, present only when the
+   * payload carries a v3 `plan.mirror` and its `state` is not `"off"` — a
+   * v2 payload (no `plan.mirror` at all) and an `"off"` mirror both omit
+   * this key entirely, they do not set it to `undefined`.
+   */
+  mirror?: {
+    /** Always `"fresh"` or `"stale"` here — an `"off"` mirror omits the whole key instead. */
+    state: "fresh" | "stale"
+    /** `plan.mirror.rows` from the payload, coerced to a non-negative integer. */
+    rows: number
+    /** `plan.mirror.extra` from the payload, coerced to a non-negative integer. */
+    extra: number
+    /**
+     * The `liveTodoCount` this model was built with, or `null` when none was
+     * supplied or it was not a finite number. Distinct from `0`, a real
+     * answer meaning the host's live Todo list is empty right now.
+     */
+    liveTodoCount: number | null
+    /**
+     * `true` only when `liveTodoCount` is a finite number that disagrees
+     * with `rows` while `state` is `"fresh"` or `"stale"`. `false` whenever
+     * `liveTodoCount` is `null` (no live read available) — a missing live
+     * count is never treated as drift.
+     */
+    drift: boolean
+  }
 }
 
 /**
  * Validate and reduce a `session.metadata.goal` payload. Returns `null` when
  * there is no goal — including after `/goal clear`, which writes
  * `metadata.goal = null` — so the panel hides itself.
+ *
+ * `options.liveTodoCount`, when supplied, is the host's own live Todo row
+ * count (read separately from `api.state.session.todo(sessionID)` by the
+ * caller — this function never reads the host itself) used to compute
+ * {@link GoalPanelModel.mirror}`.drift`. Omit it, or pass a non-finite
+ * value, to render the mirror facts without a drift comparison.
  */
-export function goalPanelModel(raw: unknown): GoalPanelModel | null
+export function goalPanelModel(
+  raw: unknown,
+  options?: { liveTodoCount?: number },
+): GoalPanelModel | null
 
 /** Abbreviate a token count the way the session title does (`45k`, `1.5m`). */
 export function formatPanelTokens(value: number): string
