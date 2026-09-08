@@ -686,7 +686,10 @@ const SESSION_TITLE_ICONS = ["▶", "⏸", "⛔", "✓"]
 // v2 payload on a best-effort basis rather than hiding it, but an older TUI
 // half does silently drop the turns stat from a v2 payload, so both halves are
 // meant to be upgraded together.
-const SIDEBAR_METADATA_VERSION = 2
+// v3 (v1.0.1): `plan.mirror` was added (the todo-mirror state/rows/extra/at
+// snapshot). Every v2 field is still written; a consumer pinned to v2 simply
+// never reads the new key.
+const SIDEBAR_METADATA_VERSION = 3
 const SIDEBAR_METADATA_TEXT_LIMIT = 400
 const SIDEBAR_METADATA_MAX_ACTIONS = 20
 
@@ -740,6 +743,9 @@ function buildSidebarTerminal(goal, state, finishedAt) {
     constraints: goal.constraints,
     options: goal.options,
     plan: goal.plan,
+    // v3: buildSidebarMetadata reads goal.mirror.{rows,extra,at} unconditionally,
+    // so the terminal render needs the same shape a live goal carries.
+    mirror: goal.mirror,
     turnCount: goal.turnCount,
     peakContextTokens: goal.peakContextTokens,
     // ...and the ceiling that peak is measured against. Under the shipped
@@ -846,6 +852,13 @@ function buildSidebarMetadata(goal, now = Date.now(), context = {}) {
       total: progress.total,
       verified: progress.verified,
       blocked: progress.blocked,
+      // v3: is the native Todo section currently showing this exact plan?
+      mirror: {
+        state: mirrorState(goal, context.mirrorMode ?? "plan"),
+        rows: goal.mirror.rows.length,
+        extra: goal.mirror.extra.length,
+        at: goal.mirror.at,
+      },
       actions: (goal.plan?.actions || []).slice(0, SIDEBAR_METADATA_MAX_ACTIONS).map((action) => ({
         id: action.id,
         title: summarizeText(action.title, 120),
@@ -5913,7 +5926,9 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
     const now = Date.now()
     const context = sidebarSequenceContext(sessionID)
     const title = buildSessionTitle(goal, now, context)
-    const metadata = buildSidebarMetadata(goal, now, context)
+    // v3: buildSidebarMetadata reads context.mirrorMode to compute plan.mirror.state;
+    // buildSessionTitle ignores the extra key.
+    const metadata = buildSidebarMetadata(goal, now, { ...context, mirrorMode })
     // Idempotence: compare everything except the timestamp, so an idle tick that
     // changed nothing costs no API round trip.
     const fingerprint = JSON.stringify([title, { ...metadata, updatedAt: 0 }])

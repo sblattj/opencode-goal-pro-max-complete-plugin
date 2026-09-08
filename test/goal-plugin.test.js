@@ -11024,7 +11024,7 @@ test("the sidebar payload carries state, budgets, plan progress, and criteria", 
   assert.match(latest.title, /^▶ Ship v0\.10\.0 · 0\/10 · 0s\/30m · 0\/200k · 1\/3✓$/)
 
   const status = latest.metadata.goal
-  assert.equal(status.v, 2, "the payload version tracks the shape: nullable turns.max, plus durationMs")
+  assert.equal(status.v, 3, "the payload version tracks the shape: nullable turns.max, plus durationMs, plus plan.mirror")
   assert.equal(status.state, "active")
   assert.equal(status.objective, "Ship v0.10.0")
   assert.deepEqual(status.turns, { used: 0, max: 10 })
@@ -11893,9 +11893,9 @@ test("the sidebar panel renders the session title's own duration string, and nei
   assert.equal(stopReason({ ...goal, startedAt: Date.now() - 479 * 60_000 }), null)
   assert.match(stopReason({ ...goal, startedAt: Date.now() - 480 * 60_000 }), /max duration reached \(8h\)/)
 
-  // And the payload the panel read is v2, with both duration fields.
+  // And the payload the panel read is v3, with both duration fields.
   const fresh = at(45_000)
-  assert.equal(fresh.payload.v, 2)
+  assert.equal(fresh.payload.v, 3)
   assert.deepEqual(fresh.payload.durationMs, { used: 45_000, max: 28_800_000 })
   assert.deepEqual(fresh.payload.minutes, { used: 0, max: 480 })
   assert.deepEqual(fresh.payload.turns, { used: 1, max: null, unlimited: true })
@@ -12080,6 +12080,8 @@ test("the session title and the sidebar render spend against the token budget, w
     startedAt: now - 120_000,
     pausedAt: 0,
     plan: emptyPlan(),
+    // v3: buildSidebarMetadata reads goal.mirror unconditionally.
+    mirror: normalizeMirror(),
     options: normalizeOptions(),
   }
 
@@ -15001,6 +15003,116 @@ test("the tool.definition hook tolerates a missing output or a non-string descri
 
 // >>> v101:T23 tests - the v3 sidebar payload
 // T23 units: 38 (a §5.2 cross-half parity unit: assert the SERVER half of it here, the panel half in test/goal-sidebar-panel.test.js).
+function mirrorPayloadFixture() {
+  const now = Date.now()
+  const goal = {
+    goalId: "mirror-payload",
+    condition: "ship it",
+    objectiveLabel: "ship it",
+    stopped: false,
+    blockedReason: "",
+    turnCount: 1,
+    usage: normalizeUsage(),
+    peakContextTokens: 0,
+    modelContextTokens: 0,
+    startedAt: now,
+    pausedAt: 0,
+    plan: normalizePlan({
+      actions: [
+        { id: "a1", title: "write it", status: "done", claim: "c", evidence: "e", verdict: "pass" },
+        { id: "a2", title: "verify it", status: "in_progress" },
+      ],
+    }),
+    mirror: normalizeMirror(),
+    options: normalizeOptions(),
+  }
+  return { now, goal }
+}
+
+test("the v3 payload carries plan.mirror beside every v2 field", () => {
+  const { now, goal } = mirrorPayloadFixture()
+
+  // Before any mirror: the payload version bumped, and a live plan with no
+  // mirror snapshot yet reads as stale, never fresh and never off.
+  const before = buildSidebarMetadata(goal, now, { mirrorMode: "plan" })
+  assert.equal(before.v, 3)
+  assert.deepEqual(before.plan.mirror, { state: "stale", rows: 0, extra: 0, at: 0 })
+  assert.equal(before.plan.total, 2)
+  assert.equal(before.plan.verified, 1)
+  assert.equal(before.plan.blocked, 0)
+  assert.deepEqual(
+    before.plan.actions.map((action) => action.id),
+    ["a1", "a2"],
+  )
+
+  // After a mirror that matches the live plan exactly: fresh.
+  const rows = testInternals.projectPlanToTodos(goal.plan, goal.mirror.extra)
+  testInternals.stampMirror(goal, { todos: rows }, now)
+  const after = buildSidebarMetadata(goal, now, { mirrorMode: "plan" })
+  assert.equal(after.plan.mirror.state, "fresh")
+  assert.equal(after.plan.mirror.rows, rows.length)
+  assert.equal(after.plan.mirror.extra, 0)
+  assert.equal(after.plan.mirror.at, now)
+  // Every v2 field is unaffected by the mirror snapshot.
+  assert.equal(after.plan.total, 2)
+  assert.equal(after.plan.verified, 1)
+  assert.equal(after.plan.blocked, 0)
+  assert.deepEqual(
+    after.plan.actions.map((action) => action.id),
+    ["a1", "a2"],
+  )
+
+  // Under mirrorTodos off: state is "off" regardless of freshness, but the
+  // counts still report what is actually on the goal record.
+  const off = buildSidebarMetadata(goal, now, { mirrorMode: "off" })
+  assert.equal(off.plan.mirror.state, "off")
+  assert.equal(off.plan.mirror.rows, rows.length)
+  assert.equal(off.plan.mirror.extra, 0)
+})
+
+test("the server's v3 payload reports the mirrored row count", () => {
+  const now = Date.now()
+  const plan = normalizePlan({
+    actions: [
+      { id: "a1", title: "write it", status: "pending" },
+      { id: "a2", title: "verify it", status: "pending" },
+      { id: "a3", title: "ship it", status: "pending" },
+    ],
+  })
+  const goal = {
+    goalId: "mirror-count",
+    condition: "ship it",
+    objectiveLabel: "ship it",
+    stopped: false,
+    blockedReason: "",
+    turnCount: 1,
+    usage: normalizeUsage(),
+    peakContextTokens: 0,
+    modelContextTokens: 0,
+    startedAt: now,
+    pausedAt: 0,
+    plan,
+    mirror: normalizeMirror(),
+    options: normalizeOptions(),
+  }
+
+  const incoming = [
+    { content: "buy milk", status: "pending", priority: "medium" },
+    { content: "call mom", status: "pending", priority: "medium" },
+  ]
+  const { extra, dropped } = testInternals.pickExtras(incoming, goal)
+  assert.equal(extra.length, 2)
+  assert.equal(dropped, 0)
+  goal.mirror.extra = extra
+
+  const rows = testInternals.projectPlanToTodos(goal.plan, goal.mirror.extra)
+  assert.equal(rows.length, 5, "3 plan rows plus 2 kept extras")
+  testInternals.stampMirror(goal, { todos: rows }, now)
+
+  const payload = buildSidebarMetadata(goal, now, { mirrorMode: "plan" })
+  assert.equal(payload.plan.mirror.rows, 5)
+  assert.equal(payload.plan.mirror.extra, 2)
+})
 // <<< v101:T23
 
 
