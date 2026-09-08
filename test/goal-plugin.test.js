@@ -13461,12 +13461,465 @@ test("an empty mirror never records a terminal snapshot", () => {
 
 // >>> v101:T10 tests - the before-hook signature, tool gate and guard ladder
 // T10 units: 7, 8, 9, 10, 11, 47.
+//
+// `testInternals` is destructured inside each test rather than at module scope so
+// that parallel wave-2 regions cannot collide on one const.
+//
+// Every unit here drives the REAL hook returned by `createHooks`, with a goal set
+// through the real `/goal <condition>` command path and a plan recorded through the
+// real `goal_plan_set` handler - so a regression anywhere in that chain turns these
+// red rather than being papered over by a hand-built goal record.
+
+async function t10Hooks(sessionID, actions, overrides = {}) {
+  const { hooks } = await createHooks(overrides)
+  await runGoal(hooks, sessionID, "ship the todo mirror")
+  if (actions) {
+    const { handlers } = makeAgentHandlers()
+    await handlers.setPlan(sessionID, { actions })
+  }
+  return hooks
+}
+
+function t10Row(content, overrides = {}) {
+  return { content, status: "pending", priority: "medium", ...overrides }
+}
+
+test("todowrite args are rewritten in place, because a reassigned args object is dropped by the host", async () => {
+  const { MIRROR_ID_SEPARATOR } = testInternals
+  const sessionID = "t10-args-in-place"
+  const hooks = await t10Hooks(sessionID, [
+    { id: "a1", title: "Ship the mirror" },
+    { id: "a2", title: "Prove it" },
+  ])
+
+  // The host reads its OWN args object back after the hook returns, so the write
+  // has to be a property write. Keeping a reference here is what makes that
+  // falsifiable: `output.args = {...}` would leave `args` untouched below.
+  const args = { todos: [t10Row("my own note")] }
+  const output = { args }
+  await hooks["tool.execute.before"](
+    { tool: "todowrite", sessionID, callID: "t10-in-place-call" },
+    output,
+  )
+
+  assert.equal(output.args, args, "the hook must not replace the caller's args object")
+  assert.deepEqual(
+    args.todos.map((row) => row.content),
+    [
+      `a1${MIRROR_ID_SEPARATOR}Ship the mirror`,
+      `a2${MIRROR_ID_SEPARATOR}Prove it`,
+      "my own note",
+    ],
+  )
+  // Exactly the three native fields on every row, plan rows and kept extras alike.
+  for (const row of args.todos) {
+    assert.deepEqual(Object.keys(row).sort(), ["content", "priority", "status"])
+  }
+  // The extras the projection kept are recorded on the goal for the after-hook's
+  // note, and nothing was dropped by the cap.
+  const goal = currentGoal(sessionID)
+  assert.deepEqual(goal.mirror.extra.map((row) => row.content), ["my own note"])
+  assert.equal(goal.mirror.lastDropped, 0)
+})
+
+test("a NON-EMPTY todowrite is left alone when the session has no goal, and reaches the host unchanged", async () => {
+  const { hooks } = await createHooks()
+  const sessionID = "t10-no-goal-session"
+  assert.equal(currentGoal(sessionID), null)
+
+  const todos = [t10Row("native item", { priority: "high" })]
+  const args = { todos }
+  await hooks["tool.execute.before"](
+    { tool: "todowrite", sessionID, callID: "t10-no-goal-call" },
+    { args },
+  )
+
+  // Identity, not just deep equality: an untouched call must reach the host as the
+  // very array the model wrote.
+  assert.equal(args.todos, todos)
+  assert.deepEqual(args, { todos: [{ content: "native item", status: "pending", priority: "high" }] })
+})
+
+test("a NON-EMPTY todowrite is left alone when the goal is stopped", async () => {
+  const sessionID = "t10-stopped-goal"
+  const hooks = await t10Hooks(sessionID, [{ id: "a1", title: "Ship the mirror" }])
+  const { handlers } = makeAgentHandlers()
+
+  await handlers.updateGoal(sessionID, { status: "paused" })
+  assert.equal(currentGoal(sessionID).stopped, true)
+
+  const todos = [t10Row("native item")]
+  const args = { todos }
+  await hooks["tool.execute.before"](
+    { tool: "todowrite", sessionID, callID: "t10-stopped-call" },
+    { args },
+  )
+  assert.equal(args.todos, todos, "a paused goal must not redraw the list")
+
+  // The control: the same session and the same plan, resumed, DOES mirror - so the
+  // pass above is the `stopped` guard and not a plan that never existed.
+  await handlers.updateGoal(sessionID, { status: "resumed" })
+  const resumedArgs = { todos: [t10Row("native item")] }
+  await hooks["tool.execute.before"](
+    { tool: "todowrite", sessionID, callID: "t10-resumed-call" },
+    { args: resumedArgs },
+  )
+  assert.equal(resumedArgs.todos.length, 2)
+  assert.equal(resumedArgs.todos[1].content, "native item")
+})
+
+test("a NON-EMPTY todowrite is left alone before a plan exists, and the result says to record one", async () => {
+  // T10 owns the before-hook half of this unit: with a goal but zero plan actions
+  // the ladder returns and the model's list reaches the host untouched. The
+  // tool-result half - the "record one with goal_plan_set" hint - is written into
+  // the after-hook by T13.
+  const sessionID = "t10-no-plan-yet"
+  const hooks = await t10Hooks(sessionID, null)
+  assert.equal(currentGoal(sessionID).plan.actions.length, 0)
+
+  const todos = [t10Row("native item")]
+  const args = { todos }
+  await hooks["tool.execute.before"](
+    { tool: "todowrite", sessionID, callID: "t10-no-plan-call" },
+    { args },
+  )
+  assert.equal(args.todos, todos)
+
+  // The control: recording a plan into the same live goal flips the same call to
+  // mirrored, so the pass above is the empty-plan guard.
+  const { handlers } = makeAgentHandlers()
+  await handlers.setPlan(sessionID, { actions: [{ id: "a1", title: "Ship the mirror" }] })
+  const plannedArgs = { todos: [t10Row("native item")] }
+  await hooks["tool.execute.before"](
+    { tool: "todowrite", sessionID, callID: "t10-planned-call" },
+    { args: plannedArgs },
+  )
+  assert.equal(plannedArgs.todos.length, 2)
+})
+
+test("a control-command turn still blocks todowrite before any mirroring happens", async () => {
+  const { hooks } = await createHooks()
+  const sessionID = "t10-control-turn"
+  await runRoutedCommand(hooks, sessionID, "ship the todo mirror")
+  const { handlers } = makeAgentHandlers()
+  await handlers.setPlan(sessionID, { actions: [{ id: "a1", title: "Ship the mirror" }] })
+
+  // The control: outside a control turn this exact call mirrors.
+  const beforeArgs = { todos: [t10Row("native item")] }
+  await hooks["tool.execute.before"](
+    { tool: "todowrite", sessionID, callID: "t10-pre-control-call" },
+    { args: beforeArgs },
+  )
+  assert.equal(beforeArgs.todos.length, 2)
+
+  await runRoutedCommand(hooks, sessionID, "status")
+
+  const args = {}
+  await assert.rejects(
+    () => hooks["tool.execute.before"](
+      { tool: "todowrite", sessionID, callID: "t10-control-call" },
+      { args },
+    ),
+    /control command.*todowrite.*blocked/i,
+  )
+  // The throw wins outright: no projection ran, so no `todos` key was invented on
+  // a call the host will never execute.
+  assert.equal(Object.prototype.hasOwnProperty.call(args, "todos"), false)
+})
+
+test("the before-hook ignores tools other than todowrite and never adds a todos key to their args", async () => {
+  const sessionID = "t10-other-tools"
+  const hooks = await t10Hooks(sessionID, [{ id: "a1", title: "Ship the mirror" }])
+
+  const args = { command: "ls" }
+  const output = { args }
+  await hooks["tool.execute.before"](
+    { tool: "bash", sessionID, callID: "t10-bash-call" },
+    output,
+  )
+  // Writing a `todos` property into another tool's args is the catastrophic
+  // failure: the host's argument decode would reject every call in the session.
+  assert.equal(Object.prototype.hasOwnProperty.call(args, "todos"), false)
+  assert.deepEqual(args, { command: "ls" })
+  assert.equal(output.args, args)
+
+  // The control: same session, same live plan, tool "todowrite" - the mirror does
+  // fire, so the pass above is the tool gate and not a dead mirror.
+  const mirrored = { args: { todos: [t10Row("native item")] } }
+  await hooks["tool.execute.before"](
+    { tool: "todowrite", sessionID, callID: "t10-todowrite-control-call" },
+    mirrored,
+  )
+  assert.equal(mirrored.args.todos.length, 2)
+})
 // <<< v101:T10
 
 
 
 // >>> v101:T11 tests - the empty-todowrite interception (X1)
 // T11 units: 13, 42, 43, 44, 45.
+//
+// The A1 ladder. `todowrite({todos: []})` is the refresh idiom the plugin teaches,
+// so an empty list is a request to redraw and never a native "clear my list" -
+// letting one reach the host as `[]` would wipe the panel. Every unit below drives
+// the REAL before-hook returned by `createHooks`, with the goal set through the
+// real `/goal <condition>` path and the plan recorded through the real
+// `goal_plan_set` handler.
+//
+// `goal.mirror.at` / `goal.mirror.rows` are written by the AFTER-hook's
+// `stampMirror`, which is T12's region and still a placeholder at this commit, so
+// the units that need a previously-written mirror set exactly those two fields on
+// the goal record directly. That is also the shape a goal restored from disk
+// arrives in (`normalizePersistedGoal` -> `normalizeMirror`), so it is a real
+// state and not only a test fixture.
+
+async function t11Hooks(sessionID, actions, overrides = {}) {
+  const { hooks } = await createHooks(overrides)
+  await runGoal(hooks, sessionID, "ship the todo mirror")
+  if (actions) {
+    const { handlers } = makeAgentHandlers()
+    await handlers.setPlan(sessionID, { actions })
+  }
+  return hooks
+}
+
+function t11Row(content, overrides = {}) {
+  return { content, status: "pending", priority: "medium", ...overrides }
+}
+
+// The refresh idiom, byte for byte. Kept as one constant so unit 45's prompt-surface
+// control and the comment above cannot drift apart.
+const T11_REFRESH_IDIOM = "todowrite({todos: []})"
+const T11_STAMPED_AT = 1_700_000_000_000
+
+// One empty todowrite through the real hook. Returns the args object the host would
+// read back plus the exact `[]` the model wrote, so a test can assert on identity.
+async function t11EmptyCall(hooks, sessionID, callID) {
+  const todos = []
+  const args = { todos }
+  const output = { args }
+  await hooks["tool.execute.before"]({ tool: "todowrite", sessionID, callID }, output)
+  return { args, output, todos }
+}
+
+test("an empty todowrite with a live plan re-projects the plan and keeps the existing extras", async () => {
+  const { MIRROR_ID_SEPARATOR } = testInternals
+  const sessionID = "t11-live-plan-reproject"
+  const hooks = await t11Hooks(sessionID, [
+    { id: "a1", title: "Ship the mirror" },
+    { id: "a2", title: "Prove it" },
+  ])
+
+  // 1. One NON-EMPTY call, carrying two rows of the model's own, establishes the
+  // extras the empty call below has to preserve.
+  const seedArgs = {
+    todos: [t11Row("call the vendor"), t11Row("read the changelog")],
+  }
+  await hooks["tool.execute.before"](
+    { tool: "todowrite", sessionID, callID: "t11-seed-call" },
+    { args: seedArgs },
+  )
+  const goal = currentGoal(sessionID)
+  assert.deepEqual(goal.mirror.extra.map((row) => row.content), [
+    "call the vendor",
+    "read the changelog",
+  ])
+
+  // Stamp what T12's after-hook will stamp. This is what makes the assertion below
+  // falsifiable: the superseded rule re-emitted THESE rows for an empty call.
+  goal.mirror.rows = seedArgs.todos.map((row) => ({ ...row }))
+  goal.mirror.at = T11_STAMPED_AT
+
+  // 2. The plan changes under the mirror, which is the whole point of A1: the rows
+  // last written are stale the moment an action moves.
+  const { handlers } = makeAgentHandlers()
+  await handlers.updateAction(sessionID, { id: "a1", status: "in_progress" })
+
+  // 3. The refresh idiom.
+  const { args, output, todos } = await t11EmptyCall(hooks, sessionID, "t11-empty-refresh-call")
+
+  assert.equal(output.args, args, "the hook must not replace the caller's args object")
+  assert.notEqual(args.todos, todos, "the empty array itself must never reach the host")
+  // The NEW projection: a1 is in_progress and still holds the single `high` slot.
+  assert.deepEqual(
+    args.todos.map((row) => [row.content, row.status, row.priority]),
+    [
+      [`a1${MIRROR_ID_SEPARATOR}Ship the mirror`, "in_progress", "high"],
+      [`a2${MIRROR_ID_SEPARATOR}Prove it`, "pending", "medium"],
+      ["call the vendor", "pending", "medium"],
+      ["read the changelog", "pending", "medium"],
+    ],
+  )
+
+  // The extras survived. An empty call carries no rows of the model's own, so
+  // `pickExtras` is not called for it - reading `[]` as "the model deleted them"
+  // would make the taught refresh idiom destroy the model's own items.
+  assert.deepEqual(goal.mirror.extra.map((row) => row.content), [
+    "call the vendor",
+    "read the changelog",
+  ])
+  // Nothing was offered, so nothing was trimmed: the after-hook note must not
+  // repeat a drop count from an earlier, non-empty call.
+  assert.equal(goal.mirror.lastDropped, 0)
+
+  // The control that names A1's mechanism: this was a RE-PROJECTION, not a re-emit
+  // of the stamped rows. Those rows still say a1 is pending, and they are not the
+  // array the host received.
+  assert.equal(goal.mirror.rows[0].status, "pending")
+  assert.notEqual(args.todos, goal.mirror.rows)
+})
+
+test("an empty todowrite in a session with no goal record is passed through untouched", async () => {
+  const { snapshotMirror } = testInternals
+  const { hooks } = await createHooks()
+  const sessionID = "t11-no-goal-empty"
+  assert.equal(currentGoal(sessionID), null)
+
+  const { args, output, todos } = await t11EmptyCall(hooks, sessionID, "t11-no-goal-empty-call")
+
+  // Identity, not deep equality: nothing was ever mirrored into this session, so
+  // the empty list is the model's own native intent and must reach the host as the
+  // very array it wrote. Inventing rows here would forge a list nobody asked for.
+  assert.equal(output.args, args)
+  assert.equal(args.todos, todos)
+  assert.deepEqual(args.todos, [])
+
+  // The control: give the SAME session the third rung of the ladder - a terminal
+  // snapshot, the render left behind when a goal record is deleted - and the
+  // identical call re-emits instead of passing through. So the pass above is the
+  // exhausted ladder and not a dead hook.
+  snapshotMirror(
+    sessionID,
+    { mirror: { rows: [t11Row("the row the finished goal left behind")] } },
+    T11_STAMPED_AT,
+  )
+  const second = await t11EmptyCall(hooks, sessionID, "t11-terminal-empty-call")
+  assert.notEqual(second.args.todos, second.todos)
+  assert.deepEqual(second.args.todos.map((row) => row.content), [
+    "the row the finished goal left behind",
+  ])
+})
+
+test("an empty todowrite in a stopped-goal session re-emits the last mirrored rows", async () => {
+  const { MIRROR_ID_SEPARATOR } = testInternals
+  const sessionID = "t11-stopped-empty"
+  const hooks = await t11Hooks(sessionID, [{ id: "a1", title: "Ship the mirror" }])
+  const { handlers } = makeAgentHandlers()
+
+  const seedArgs = { todos: [t11Row("my own note")] }
+  await hooks["tool.execute.before"](
+    { tool: "todowrite", sessionID, callID: "t11-stopped-seed-call" },
+    { args: seedArgs },
+  )
+  const goal = currentGoal(sessionID)
+  goal.mirror.rows = seedArgs.todos.map((row) => ({ ...row }))
+  goal.mirror.at = T11_STAMPED_AT
+
+  await handlers.updateGoal(sessionID, { status: "paused" })
+  assert.equal(currentGoal(sessionID).stopped, true)
+
+  const { args, todos } = await t11EmptyCall(hooks, sessionID, "t11-stopped-empty-call")
+
+  // A paused goal must not redraw from the plan - but it must not clear the panel
+  // either. The rows last written are re-emitted verbatim.
+  assert.notEqual(args.todos, todos)
+  assert.equal(args.todos, goal.mirror.rows, "the stopped arm re-emits the stamped rows themselves")
+  assert.deepEqual(args.todos.map((row) => row.content), [
+    `a1${MIRROR_ID_SEPARATOR}Ship the mirror`,
+    "my own note",
+  ])
+
+  // The control: resumed, with a1 moved on, the same empty call re-projects from
+  // the live plan instead - so the branch above is the `stopped` guard and not a
+  // ladder that always re-emits.
+  await handlers.updateGoal(sessionID, { status: "resumed" })
+  await handlers.updateAction(sessionID, { id: "a1", status: "in_progress" })
+  const resumed = await t11EmptyCall(hooks, sessionID, "t11-resumed-empty-call")
+  assert.notEqual(resumed.args.todos, goal.mirror.rows)
+  assert.deepEqual(
+    resumed.args.todos.map((row) => [row.content, row.status]),
+    [
+      [`a1${MIRROR_ID_SEPARATOR}Ship the mirror`, "in_progress"],
+      ["my own note", "pending"],
+    ],
+  )
+})
+
+test("an empty todowrite before a plan exists re-emits the last mirrored rows, and passes through when nothing was ever mirrored", async () => {
+  const { hooks } = await createHooks()
+
+  // Arm 1: a goal with no plan yet, but a mirror record that was written earlier -
+  // the shape a session restored from disk arrives in. There is nothing to project,
+  // so the rows last written are re-emitted rather than the panel being cleared.
+  const mirroredSession = "t11-no-plan-mirrored"
+  await runGoal(hooks, mirroredSession, "ship the todo mirror")
+  const mirroredGoal = currentGoal(mirroredSession)
+  assert.equal(mirroredGoal.plan.actions.length, 0)
+  mirroredGoal.mirror.rows = [t11Row("a row from before the plan was dropped")]
+  mirroredGoal.mirror.at = T11_STAMPED_AT
+
+  const mirrored = await t11EmptyCall(hooks, mirroredSession, "t11-no-plan-mirrored-call")
+  assert.notEqual(mirrored.args.todos, mirrored.todos)
+  assert.equal(mirrored.args.todos, mirroredGoal.mirror.rows)
+  assert.deepEqual(mirrored.args.todos.map((row) => row.content), [
+    "a row from before the plan was dropped",
+  ])
+
+  // Arm 2: same hooks, same "goal but no plan" state, `mirror.at` still 0 and no
+  // terminal snapshot - nothing was ever mirrored into this session, so the ladder
+  // runs out and the model's own empty list reaches the host untouched.
+  const virginSession = "t11-no-plan-never-mirrored"
+  await runGoal(hooks, virginSession, "ship the todo mirror")
+  const virginGoal = currentGoal(virginSession)
+  assert.equal(virginGoal.plan.actions.length, 0)
+  assert.equal(virginGoal.mirror.at, 0)
+  assert.deepEqual(virginGoal.mirror.rows, [])
+
+  const virgin = await t11EmptyCall(hooks, virginSession, "t11-no-plan-virgin-call")
+  assert.equal(virgin.output.args, virgin.args)
+  assert.equal(virgin.args.todos, virgin.todos)
+  assert.deepEqual(virgin.args.todos, [])
+})
+
+test("an empty todowrite with mirrorTodos off passes through, and no prompt surface taught the idiom", async () => {
+  const sessionID = "t11-mirror-off-empty"
+  const hooks = await t11Hooks(sessionID, [{ id: "a1", title: "Ship the mirror" }], {
+    options: { mirrorTodos: "off" },
+  })
+  const goal = currentGoal(sessionID)
+  // Rows the "plan" mode would have re-emitted. Under the kill switch the ladder is
+  // never reached, so their presence makes the pass-through falsifiable.
+  goal.mirror.rows = [t11Row("would have been re-emitted")]
+  goal.mirror.at = T11_STAMPED_AT
+
+  const { args, output, todos } = await t11EmptyCall(hooks, sessionID, "t11-mirror-off-empty-call")
+  assert.equal(output.args, args)
+  assert.equal(args.todos, todos)
+  assert.deepEqual(args.todos, [])
+
+  // The byte-for-byte control, and the reason the kill switch has to reach the
+  // prompt as well as the hook: with the mirror off, `todowrite({todos: []})` is a
+  // real instruction to clear the list. Nothing this plugin puts in the model's
+  // context may teach the idiom, or the model would call it and the host would
+  // honour it. (T18/T19 add the mode-gated sentences that could break this.)
+  assert.equal(buildContinueMessage(goal).includes(T11_REFRESH_IDIOM), false)
+  assert.equal(buildPlanSystemLines(goal).join("\n").includes(T11_REFRESH_IDIOM), false)
+  // The same claim through the production surface, where the plugin's own
+  // `mirrorMode` closure decides: the system prompt this "off" plugin actually
+  // emits for this goal.
+  const systemOutput = { system: [] }
+  await hooks["experimental.chat.system.transform"]({ sessionID }, systemOutput)
+  assert.equal(systemOutput.system.length, 1)
+  assert.equal(systemOutput.system.join("\n").includes(T11_REFRESH_IDIOM), false)
+
+  // The control: the identical call under the default "plan" mode DOES mirror, so
+  // the pass-through above is the kill switch and not a broken ladder.
+  const onSession = "t11-mirror-on-empty"
+  const onHooks = await t11Hooks(onSession, [{ id: "a1", title: "Ship the mirror" }])
+  const on = await t11EmptyCall(onHooks, onSession, "t11-mirror-on-empty-call")
+  assert.notEqual(on.args.todos, on.todos)
+  assert.equal(on.args.todos.length, 1)
+})
 // <<< v101:T11
 
 
