@@ -5376,7 +5376,9 @@ function mirrorRowPriority(action, index) {
  * never `""`.
  */
 function mirrorFingerprint(rows) {
-  throw new Error("v1.0.1 T4: not implemented")
+  const safeRows = Array.isArray(rows) ? rows : []
+  const payload = JSON.stringify(safeRows.map((r) => [r.content, r.status, r.priority]))
+  return createHash("sha256").update(payload).digest("hex")
 }
 // <<< v101:T4
 
