@@ -5445,7 +5445,7 @@ function pickExtras(incoming, goal) {
  * MIRROR_EXTRA_TEXT_LIMIT)`.
  */
 function boundExtraContent(content) {
-  throw new Error("v1.0.1 T6: not implemented")
+  return summarizeText(String(content ?? ""), MIRROR_EXTRA_TEXT_LIMIT)
 }
 
 /**
@@ -5453,7 +5453,7 @@ function boundExtraContent(content) {
  * on the goal-set path and names the function it edited.
  */
 function resetMirrorForNewGoal(goal) {
-  throw new Error("v1.0.1 T6: not implemented")
+  goal.mirror = normalizeMirror()
 }
 // <<< v101:T6
 
@@ -7194,6 +7194,9 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
 
       const replacedGoal = goalStates.get(sessionID)
       const goal = buildGoalState(sessionID, parsed.condition, parsed.options, parsed.meta)
+      // v1.0.1 T6: a new goal record always starts with a clean mirror (X6) —
+      // extras from a prior goal never leak into this one.
+      resetMirrorForNewGoal(goal)
 
       pushHistory(
         goal,

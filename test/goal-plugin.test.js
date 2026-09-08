@@ -112,6 +112,10 @@ const {
   mirrorRowSuffix,
   mirrorRow,
   mirrorRowPriority,
+  // v1.0.1 T6
+  boundExtraContent,
+  resetMirrorForNewGoal,
+  MIRROR_EXTRA_TEXT_LIMIT,
 } = testInternals
 
 function sessionStatePath(stateFilePath, sessionID) {
@@ -13236,6 +13240,29 @@ test("pickExtras reports how many model rows the cap dropped", { todo: T5_TODO_U
 
 // >>> v101:T6 tests - boundExtraContent / resetMirrorForNewGoal
 // T6 units: 39, 40.
+test("an extra row's content is bounded like a plan row", () => {
+  const long = "x".repeat(5000)
+  const bounded = boundExtraContent(long)
+  // summarizeText slices to (limit - 1) chars then appends exactly one
+  // ellipsis character, so the observed bound is exactly MIRROR_EXTRA_TEXT_LIMIT
+  // (120) chars — never limit + 1 for the ellipsis.
+  assert.equal(bounded.length, MIRROR_EXTRA_TEXT_LIMIT)
+  assert.ok(bounded.length <= MIRROR_EXTRA_TEXT_LIMIT)
+  assert.ok(bounded.endsWith("…"))
+})
+
+test("extras are cleared when a new goal is set", () => {
+  const goal = buildGoalState("mirror-reset", "ship it", normalizeOptions())
+  goal.mirror = {
+    fingerprint: "stale-fingerprint",
+    at: 12345,
+    rows: [{ content: "old row", status: "pending", priority: "medium" }],
+    nudges: 2,
+    extra: [{ content: "leftover extra", status: "pending", priority: "medium" }],
+  }
+  resetMirrorForNewGoal(goal)
+  assert.deepEqual(goal.mirror, { fingerprint: "", at: 0, rows: [], nudges: 0, extra: [] })
+})
 // <<< v101:T6
 
 
