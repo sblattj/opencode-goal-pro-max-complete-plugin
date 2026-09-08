@@ -14680,7 +14680,7 @@ test("the goal-end response carries the todo handback line only when rows were m
 
 // >>> v101:T18 tests - the plan system-block sentence
 // T18 units: 49.
-test("the system-block sentence appears only under plan mode with a plan, and is byte-stable", () => {
+test("the plan system block names the mirror in constant text, and the no-plan branch is unchanged", () => {
   const SYSTEM_BLOCK_SENTENCE =
     "The session's Todo list is drawn from this plan: while a plan exists, todowrite redraws it from the plan's actions and keeps any items of your own below them. Change the work with goal_plan_set/goal_action_update, and call todowrite({todos: []}) to refresh the panel."
 
@@ -14697,6 +14697,11 @@ test("the system-block sentence appears only under plan mode with a plan, and is
   const goalNoPlan = { plan: emptyPlan() }
   const noPlan = buildPlanSystemLines(goalNoPlan, { mirrorMode: "plan" }).join("\n")
   assert.equal(noPlan.includes(SYSTEM_BLOCK_SENTENCE), false)
+  // "the no-plan branch is unchanged" is the second half of this unit's name, so
+  // assert the branch itself, not just the absence of the new sentence: the mode
+  // may not move a single byte of it. (Added at wave-3 integration with the rename
+  // to the design §5.1 name.)
+  assert.equal(noPlan, buildPlanSystemLines(goalNoPlan, { mirrorMode: "off" }).join("\n"))
 
   const first = buildPlanSystemLines(goalWithPlan, { mirrorMode: "plan" }).join("\n")
   const second = buildPlanSystemLines(goalWithPlan, { mirrorMode: "plan" }).join("\n")
@@ -14708,7 +14713,7 @@ test("the system-block sentence appears only under plan mode with a plan, and is
 
 // >>> v101:T19 tests - the continuation nudge line
 // T19 units: 20.
-test("mirroring the plan once produces no continuation nudge; a plan edit adds exactly one, and re-mirroring silences it again", async () => {
+test("a stale mirror adds one line to the continuation and a fresh one adds nothing", async () => {
   const { hooks } = await createHooks()
   const sessionID = "t19-continuation-nudge"
   const goal = await t12MirrorSetup(sessionID, [
@@ -14872,7 +14877,7 @@ test("compaction context names a stale mirror only while stale", async () => {
 
 // >>> v101:T21 tests - the two plan tool descriptions
 // T21 units: 51.
-test("both descriptions end with the sentence; the unchanged descriptions of the other goal tools do not contain it", async () => {
+test("goal_plan_set and goal_action_update descriptions name the todo redraw", async () => {
   const schema = {
     string: () => ({ optional: () => "str?" }),
     number: () => ({ optional: () => "num?" }),
