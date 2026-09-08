@@ -126,11 +126,18 @@ const exportedTui: GoalTuiPlugin = tui
 const panel: GoalPanelModel | null = goalPanelModel({ objective: "ship it" })
 const marks: string[] = (panel?.actions ?? []).map((action) => action.mark)
 const budget: string = formatPanelTokens(1234)
+// The panel forwards the payload's plan.mirror.state verbatim, so the model can
+// carry a state this release has never heard of. A consumer must be able to put
+// an arbitrary string back into that field; a two-literal union here rejects this
+// line and lies about what the panel can hand out.
+declare const someServerMirrorState: string
+const forwardedMirrorState: NonNullable<GoalPanelModel["mirror"]>["state"] = someServerMirrorState
 void sameTui
 void entryTui
 void exportedTui
 void marks
 void budget
+void forwardedMirrorState
 
 // @ts-expect-error the tui target must not also export server()
 tuiPlugin.server

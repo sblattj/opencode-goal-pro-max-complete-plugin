@@ -855,6 +855,21 @@ const mutants = [
     test: "test/goal-sidebar-panel.test.js",
   },
   {
+    name: "drift is only claimed for a mirror state this release understands",
+    file: "src/goal-sidebar-view.js",
+    // The panel forwards an unrecognised `plan.mirror.state` verbatim (a payload is
+    // written by whichever server version the host runs), which is why tui.d.ts
+    // declares that field a `string`. Dropping the guard makes the panel compare a
+    // live count against rows it has no reason to believe are comparable, and render
+    // a drift suffix for a state whose meaning it does not know. Killed by "a mirror
+    // state this release does not know stays active, reports itself, and claims no
+    // drift".
+    from:
+      '(mirror.state === "fresh" || mirror.state === "stale") && live !== null && live !== rows',
+    to: "live !== null && live !== rows",
+    test: "test/goal-sidebar-panel.test.js",
+  },
+  {
     name: "nothing is exempt from the tool-free strike when mirroring is off",
     file: "src/goal-plugin.js",
     // T15's `exempt` parameter, caller half. Exempting todowrite unconditionally
