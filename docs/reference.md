@@ -373,7 +373,7 @@ The original title is captured before the first overwrite and restored by `/goal
 
 ### Sidebar panel (TUI)
 
-When the host's TUI supports plugin sidebar slots (1.18.x and later), the package renders the whole goal as a panel above the todo list:
+When the host's TUI supports plugin sidebar slots (1.18.x and later), the package renders the whole goal as a panel below the todo list (the plugin registers at `order: 450`, the builtin Todo section at `order: 400`, and the host's slot registry sorts ascending into a single column):
 
 ```
 Goal
