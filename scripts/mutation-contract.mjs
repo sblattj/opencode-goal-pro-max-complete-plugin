@@ -674,7 +674,180 @@ const mutants = [
     test: "test/goal-plugin.test.js",
   },
   // >>> v101:T29 the seven todo-mirror mutation anchors (design §5.3)
-  // Reserved. T29 adds the seven mutants here, as the LAST elements of `mutants`.
+  // Design §5.3 lists seven mutants; this region carries twelve records.
+  //
+  // Mutant 7 became TWO records. Its guard is byte-identical in the before- and
+  // the after-hook, so one `/g` anchor matches twice and `occurrences === 1`
+  // rejects it — mutating both at once would also prove nothing about which
+  // hook the failing test caught. Each record is therefore selected by the code
+  // that FOLLOWS its own guard: only the after-hook reads its sessionID
+  // directly under its mode guard, so the positive lookahead selects that hook
+  // and the negative one selects the before-hook. Both stay zero-width, so the
+  // replacement still removes the guard alone.
+  //
+  // Four further anchors close gaps the wave-3 and wave-4 integrations recorded
+  // as unowned: the tool.definition kill switch, the panel's exception-group
+  // ORDER (the first record in this contract naming src/goal-sidebar-view.js —
+  // the staging step below copies the whole of src/, so it needs no new wiring)
+  // and both halves of T15's `exempt` parameter, the caller's mode gate and the
+  // predicate that honours the set.
+  //
+  // Every killing unit named below was observed failing under its own mutant,
+  // not inferred from the design.
+  {
+    name: "the todo mirror mutates the host's args object rather than replacing it",
+    file: "src/goal-plugin.js",
+    // The one wrong implementation every naive test accepts. The host keeps its
+    // own reference to the args bag before triggering the hook, so replacing the
+    // bag is silently dropped and the model's unmirrored list reaches the tool.
+    // Killed by "todowrite args are rewritten in place, because a reassigned
+    // args object is dropped by the host" (unit 7).
+    from: "output.args.todos = rows",
+    to: "output.args = { ...output.args, todos: rows }",
+    test: "test/goal-plugin.test.js",
+  },
+  {
+    name: "an unverified done action never mirrors as completed",
+    file: "src/goal-plugin.js",
+    // The CEV gate, in the mirror: a `done` status the plan's own verdict has
+    // not confirmed must render as work still in flight, never as a tick.
+    // Killed by "a done action without a passing verdict mirrors as in-progress,
+    // not completed" (unit 2).
+    from: 'return planActionVerified(action) ? "completed" : "in_progress"',
+    to: 'return action.status === "done" ? "completed" : "in_progress"',
+    test: "test/goal-plugin.test.js",
+  },
+  {
+    name: "freshness is stamped only after the write landed",
+    file: "src/goal-plugin.js",
+    // Single call site, in tool.execute.after. Reading the before-hook's box
+    // instead stamps a list the host may never have written — the host decodes
+    // the args and asks for permission between the two hooks, and either can
+    // abort — which would suppress the very nudge that repairs the panel.
+    // Killed by "the mirror is stamped fresh in the after-hook, from the args
+    // that were written" (unit 17).
+    from: "stampMirror(goal, input.args, now)",
+    to: "stampMirror(goal, output.args, now)",
+    test: "test/goal-plugin.test.js",
+  },
+  {
+    name: "every mirrored row carries a priority",
+    file: "src/goal-plugin.js",
+    // A row without a priority is a row the host renders in an arbitrary slot,
+    // so the high slot stops tracking the first row the model must act on.
+    // Killed by "the projector spends the high slot on the first row the model
+    // still has to act on" (unit 4).
+    from: "priority: mirrorRowPriority(action, index)",
+    to: "priority: undefined",
+    test: "test/goal-plugin.test.js",
+  },
+  {
+    // RegExp anchor: this set grows, so anchor on the declaration.
+    // Precedent: REPLAY_SAFE_OPERATIONS above.
+    name: "a mirror refresh is bookkeeping, not work",
+    file: "src/goal-plugin.js",
+    // Emptying the set makes the plugin's own panel refresh count as the turn's
+    // work, so the no-tool-call brake never fires on a model that only redraws
+    // its todo list. Killed by "a turn whose only tool call was a mirror refresh
+    // does not clear the tool-free strike" (unit 27).
+    from: /const MIRROR_TOOL_NAMES = new Set\(\[[^\]]*\]\)/,
+    to: "const MIRROR_TOOL_NAMES = new Set([])",
+    test: "test/goal-plugin.test.js",
+  },
+  {
+    name: "an empty todowrite never reaches the host as an empty list",
+    file: "src/goal-plugin.js",
+    // The data-loss mutant (X1): deleting the empty-call interception wipes the
+    // user's panel, and it is exactly what revision 1 of this design shipped.
+    // Killed by "an empty todowrite in a stopped-goal session re-emits the last
+    // mirrored rows" (unit 43) and "an empty todowrite before a plan exists
+    // re-emits the last mirrored rows, and passes through when nothing was ever
+    // mirrored" (unit 44). Design §5.3 names unit 13 here; unit 13 exercises the
+    // LIVE-plan branch, which re-projects instead of re-emitting and so cannot
+    // see this line — 43 and 44 are the units that actually kill it.
+    from: "output.args.todos = goal.mirror.rows",
+    to: "return",
+    test: "test/goal-plugin.test.js",
+  },
+  {
+    name: "the mirror's before-hook acts only on todowrite",
+    file: "src/goal-plugin.js",
+    // Half of design §5.3's mutant 7 (X3): both hooks fire for EVERY tool. Drop
+    // this gate and the plugin writes a `todos` property into bash's arguments,
+    // so every tool call in the session fails the host's argument decode. The
+    // negative lookahead is zero-width and selects the before-hook, whose guard
+    // is NOT followed directly by the mode guard and the sessionID read.
+    from: /if \(input\.tool !== "todowrite"\) return(?!\r?\n +if \(mirrorMode === "off"\) return\r?\n +const sessionID)/,
+    to: "",
+    test: "test/goal-plugin.test.js", // kills unit 47
+  },
+  {
+    name: "the mirror's after-hook acts only on todowrite",
+    file: "src/goal-plugin.js",
+    // The other half of mutant 7. Drop this gate and any tool at all stamps the
+    // mirror fresh and gets the mirror note appended to its own result.
+    // The positive lookahead is the exact complement of the record above.
+    from: /if \(input\.tool !== "todowrite"\) return(?=\r?\n +if \(mirrorMode === "off"\) return\r?\n +const sessionID)/,
+    to: "",
+    test: "test/goal-plugin.test.js", // kills unit 46
+  },
+  {
+    name: "the todowrite description suffix obeys the mirror kill switch",
+    file: "src/goal-plugin.js",
+    // Gap left open by wave 3: no anchor covered the tool.definition hook. The
+    // guard's text repeats in three hooks, so the anchor carries the following
+    // line, which is unique to this one. With the gate gone, `mirrorTodos: "off"`
+    // still rewrites the host's tool description — the one thing "off" promises
+    // it will never do. Killed by "the todowrite description carries the mirror
+    // clause whenever mirrorTodos is on" (unit 30) and by the wave-3 off-mode
+    // seam unit.
+    from:
+      'if (mirrorMode === "off") return\n      if (!output || typeof output.description !== "string") return',
+    to: 'if (!output || typeof output.description !== "string") return',
+    test: "test/goal-plugin.test.js",
+  },
+  {
+    name: "the panel's exception list is ordered by what a human must act on first",
+    file: "src/goal-sidebar-view.js",
+    // Gap left open by wave 4: this contract had no record for the panel file at
+    // all, so the exception list's group ORDER was guarded only by the live
+    // suite. Swapping the first two groups puts blockers above completions that
+    // still need evidence, which is the wrong end of the list to read first.
+    // Killed by "a fresh mirror renders only the actions that need attention"
+    // (unit 33) and by "the exception list keeps plan order within each group and
+    // caps at MAX_PANEL_ACTIONS". The wave-4 cross-half parity unit (38) does NOT
+    // kill it: its fixture carries no blocked action, so the swap is invisible
+    // there.
+    from:
+      '  (action) => action.status === "done" && !action.verified,\n  (action) => action.status === "blocked",',
+    to:
+      '  (action) => action.status === "blocked",\n  (action) => action.status === "done" && !action.verified,',
+    test: "test/goal-sidebar-panel.test.js",
+  },
+  {
+    name: "nothing is exempt from the tool-free strike when mirroring is off",
+    file: "src/goal-plugin.js",
+    // T15's `exempt` parameter, caller half. Exempting todowrite unconditionally
+    // would make v1.0.0's behaviour unreachable: with the mirror off, a todowrite
+    // is the model's own work and must keep resetting the no-tool-call brake.
+    // Killed by "todowrite still counts as work when mirroring is off" (unit 28).
+    from: 'mirrorMode === "plan" ? MIRROR_TOOL_NAMES : NO_EXEMPT_TOOL_NAMES',
+    to: "MIRROR_TOOL_NAMES",
+    test: "test/goal-plugin.test.js",
+  },
+  {
+    name: "the work predicate honours the exempt set it was handed",
+    file: "src/goal-plugin.js",
+    // T15's `exempt` parameter, predicate half — the complement of "the plugin's
+    // own tools are not the turn's work" above, which mutates the other operand
+    // of the same line. Ignoring the set silently restores the pre-v1.0.1 brake,
+    // so a goal whose model only refreshes the panel never pauses.
+    // Killed by "a turn whose only tool call was a mirror refresh does not clear
+    // the tool-free strike" (unit 27).
+    from: "    return !isPluginOwnToolName(name) && !exemptNames.has(name)",
+    to: "    return !isPluginOwnToolName(name)",
+    test: "test/goal-plugin.test.js",
+  },
   // <<< v101:T29
 
 
