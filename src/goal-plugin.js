@@ -5839,6 +5839,74 @@ function stampMirror(goal, args, now) {
 
 
 
+// >>> v101:T28 the ledger-isolation guard: no todo shape reaches goal.plan.actions
+/**
+ * `assertPlanLedgerIsolated(goal)` -> the same `goal`, unchanged, when every action in
+ * `goal.plan.actions` is still shaped like a plan action and not like a mirrored todo row.
+ * Throws otherwise. This is the CEV gate for the design's "todo -> plan: there is no such
+ * direction" invariant: the mirror projector only ever READS `goal.plan.actions` to build todo
+ * rows (T2/T3), so nothing may write a todo row's shape back into the ledger.
+ *
+ * Checked per action, throwing on the first violation found (content/priority keys, then
+ * status, then title prefix) so the thrown message names exactly what leaked:
+ * - `content` in action, or `priority` in action -- those are todo-row fields; a plan action's
+ *   rendered content/priority are computed fresh by `mirrorRow`/`mirrorRowPriority` on every
+ *   projection and never stored on the action itself.
+ * - `action.status` is not one of `PLAN_ACTION_STATUSES` -- a todo row's `status` vocabulary
+ *   (`pending`/`in_progress`/`completed`) overlaps two of the four plan values but not
+ *   `done`/`blocked`, so a stray `"completed"` written onto a plan action is caught here too.
+ * - `action.title` starts with an `aN` id (the default id shape `normalizePlanActionId` assigns)
+ *   followed immediately by `MIRROR_ID_SEPARATOR` -- the exact shape `projectPlanToTodos` renders
+ *   a row's `content` in, so a title carrying it means a rendered todo row's content string was
+ *   written back into the ledger's title field.
+ */
+function assertPlanLedgerIsolated(goal) {
+  const actions = goal?.plan?.actions
+  if (!Array.isArray(actions)) return goal
+  actions.forEach((action, index) => {
+    if (!isPlainObject(action)) return
+    if ("content" in action) {
+      throw new Error(`goal.plan.actions[${index}] carries a todo-shaped "content" key`)
+    }
+    if ("priority" in action) {
+      throw new Error(`goal.plan.actions[${index}] carries a todo-shaped "priority" key`)
+    }
+    if (!PLAN_ACTION_STATUS_SET.has(action.status)) {
+      throw new Error(
+        `goal.plan.actions[${index}] has status ${JSON.stringify(action.status)}, outside PLAN_ACTION_STATUSES`,
+      )
+    }
+    if (planActionTitleCarriesMirrorPrefix(action.title)) {
+      throw new Error(`goal.plan.actions[${index}] title carries a mirrored-row id prefix`)
+    }
+  })
+  return goal
+}
+
+/**
+ * `planActionTitleCarriesMirrorPrefix(title)` -> boolean: true when `title` starts with an `aN`
+ * id immediately followed by `MIRROR_ID_SEPARATOR` -- the same prefix `projectPlanToTodos` renders
+ * into a mirrored row's `content`, so finding it in a plan action's `title` means the row leaked
+ * back into the ledger rather than staying a read-only projection.
+ */
+function planActionTitleCarriesMirrorPrefix(title) {
+  if (typeof title !== "string") return false
+  const idMatch = /^a\d+/.exec(title)
+  if (!idMatch) return false
+  return title.startsWith(`${idMatch[0]}${MIRROR_ID_SEPARATOR}`)
+}
+
+/**
+ * Exported directly (not through the `testInternals` bag, which the scaffold froze before this
+ * wave existed -- CONTRACTS: "do NOT edit the testInternals export object") so wave-5 units can
+ * import it. See T28's report for the deferred follow-up to fold it into `testInternals` at the
+ * next integration.
+ */
+export { assertPlanLedgerIsolated }
+// <<< v101:T28
+
+
+
 async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) {
   if (pluginOptions.completionAudit && pluginOptions.registerAgents === false) {
     throw new TypeError("completionAudit requires registerAgents to remain enabled")
