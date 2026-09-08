@@ -1383,11 +1383,30 @@ function promoteNextOrderedGoal(sessionID) {
   return next
 }
 
+// v1.0.1 todo mirror (T17, X2): the one-line handback appended to a goal-end
+// response. The mirror is one-way and the host's todo surface is GET-only, so
+// the rows this plan wrote stay on screen after the goal record is gone. This
+// is the last turn on which the plugin has any prompt surface in this session
+// (the system block and the continuation block both go silent once the goal is
+// deleted), so it is the only moment it can hand the list back. Empty string
+// when nothing was ever mirrored, which is what gates every call site.
+function mirrorHandbackLine(goal) {
+  const rows = goal?.mirror?.rows
+  if (!Array.isArray(rows) || rows.length === 0) return ""
+  return `The Todo list still shows this plan's ${rows.length} rows. It is yours again: your next todowrite replaces it.`
+}
+
 // Discard the currently focused goal entirely (used when it completes or is
 // replaced). Backgrounded goals for the session are left intact.
 function cleanupGoal(sessionID) {
   const goal = goalStates.get(sessionID)
   if (goal) {
+    // v1.0.1 todo mirror (T17, X2): take the terminal snapshot BEFORE the goal
+    // record goes away. Every goal-end route reaches this function, so a later
+    // empty `todowrite` has the last mirrored rows to re-emit instead of wiping
+    // the list. snapshotMirror is a no-op when nothing was mirrored, and T12's
+    // after-hook drops the snapshot on the next non-empty `todowrite`.
+    snapshotMirror(sessionID, goal, Date.now())
     // seenTokens entries for this goal's message IDs are intentionally NOT deleted
     // here. resetGoalBudget also leaves them in place. The message.updated handler
     // uses the presence of an ID in seenTokens combined with its absence from the
@@ -4443,6 +4462,9 @@ function buildAgentToolHandlers({
         )
         const ordered = sessionOrdered.has(sessionID)
         const completedResult = rememberGoalResult(sessionID, goal, "achieved", "", evidence)
+        // v1.0.1 todo mirror (T17, X2): read the handback before cleanupGoal
+        // takes the record away. "" when nothing was mirrored.
+        const completionHandback = mirrorHandbackLine(goal)
         cleanupGoal(sessionID)
         // Advance an ordered sequence just like the marker path does.
         const promoted = ordered ? promoteNextOrderedGoal(sessionID) : null
@@ -4507,7 +4529,11 @@ function buildAgentToolHandlers({
             },
           )
         }
-        return AGENT_COMPLETE_SUCCESS
+        // v1.0.1 todo mirror (T17, X2): the sentinel stays the first line so the
+        // caller's completion check still recognizes it.
+        return completionHandback
+          ? `${AGENT_COMPLETE_SUCCESS}\n\n${completionHandback}`
+          : AGENT_COMPLETE_SUCCESS
       }
       if (status === "blocked") {
         const blockerText = typeof args.blocker === "string" ? args.blocker.trim() : ""
@@ -4739,6 +4765,9 @@ function buildAgentToolHandlers({
     // Record the clear in the ledger before cleanupGoal removes the goal object.
     const goals = listSessionGoals(sessionID)
     const clearedGoal = goalStates.get(sessionID) || goals[0] || null
+    // v1.0.1 todo mirror (T17, X2): read the handback before cleanupGoal takes
+    // the record away. "" when nothing was mirrored.
+    const clearHandback = mirrorHandbackLine(clearedGoal)
     const hadState = goals.length > 0 || lastGoalResults.has(sessionID)
     const ledgerDurable =
       goals.length > 0 &&
@@ -4761,9 +4790,11 @@ function buildAgentToolHandlers({
     if (!clearStillCurrent) {
       return "Clear persistence finished after goal state changed; current state was left untouched."
     }
-    return durable === false
-      ? "Goal cleared in memory, but terminal state could not be persisted. It may reappear after restart."
-      : "Goal cleared."
+    const clearText =
+      durable === false
+        ? "Goal cleared in memory, but terminal state could not be persisted. It may reappear after restart."
+        : "Goal cleared."
+    return clearHandback ? `${clearText}\n\n${clearHandback}` : clearText
   }
 
   return { getGoal, getGoalHistory, setGoal, updateGoal, clearGoal, getPlan, setPlan, updateAction }
@@ -4889,10 +4920,14 @@ function buildAgentTools(
       }
       const message = await handlers.updateGoal(sessionID, args)
       if (args.status === "complete") {
-        if (
-          message !== AGENT_COMPLETE_SUCCESS ||
-          currentGoal(sessionID, before.goalId, before.runId)
-        ) {
+        // v1.0.1 todo mirror (T17, X2): a successful completion may carry the
+        // todo handback line after a blank line, so the sentinel is matched as
+        // the FIRST LINE rather than the whole string. Every other return on the
+        // complete path is a different sentence, so this stays exact.
+        const archived =
+          message === AGENT_COMPLETE_SUCCESS ||
+          message.startsWith(`${AGENT_COMPLETE_SUCCESS}\n\n`)
+        if (!archived || currentGoal(sessionID, before.goalId, before.runId)) {
           return goalToolFailure("completion_rejected", message)
         }
       }
@@ -7074,6 +7109,10 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         // focused one; background goals from `/goal add` would survive otherwise).
         const goals = listSessionGoals(sessionID)
         const clearedGoal = goalStates.get(sessionID) || goals[0] || null
+        // v1.0.1 todo mirror (T17, X2): read the handback before cleanupGoal
+        // takes the record away. "" when nothing was mirrored. This one line is
+        // the whole user-facing half of X2 for `/goal stop` and `/goal clear`.
+        const clearHandback = mirrorHandbackLine(clearedGoal)
         const hadState = goals.length > 0 || lastGoalResults.has(sessionID)
         const ledgerDurable =
           goals.length > 0 &&
@@ -7095,13 +7134,14 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         }
         // Hand the session title back to the user now that no goal owns it.
         if (clearStillCurrent) await restoreSessionTitle(sessionID)
+        const clearText = !clearStillCurrent
+          ? "Clear persistence finished after goal state changed; current state was left untouched."
+          : durable === false
+            ? "Goal cleared in memory, but terminal state could not be persisted. It may reappear after restart."
+            : "Goal cleared."
         replaceCommandOutputText(
           output,
-          !clearStillCurrent
-            ? "Clear persistence finished after goal state changed; current state was left untouched."
-            : durable === false
-              ? "Goal cleared in memory, but terminal state could not be persisted. It may reappear after restart."
-              : "Goal cleared.",
+          clearHandback ? `${clearText}\n\n${clearHandback}` : clearText,
         )
         return
       }
@@ -8158,6 +8198,12 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
               "",
               evidence,
             )
+            // v1.0.1 todo mirror (T17, X2): read the handback before
+            // cleanupGoal takes the record away. The marker path has no tool
+            // result to carry it, so it rides the completion announcement —
+            // the only surface left once the goal record is gone.
+            const completionHandback = mirrorHandbackLine(activeGoalAfterMessages)
+            const completionHandbackSuffix = completionHandback ? `\n\n${completionHandback}` : ""
             cleanupGoal(sessionID)
             // Ordered sequence: auto-promote the next goal so the
             // session keeps working through the sequence without manual /goal focus.
@@ -8209,14 +8255,16 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
             if (auditMessagesEnabled) {
               await announceAudit(
                 sessionID,
-                activePromoted
+                (activePromoted
                   ? "Audit result: completion accepted — goal archived as achieved; next ordered goal active."
-                  : "Audit result: completion accepted — goal archived as achieved.",
+                  : "Audit result: completion accepted — goal archived as achieved.") +
+                  completionHandbackSuffix,
               )
             } else {
               announceLifecycle(
                 sessionID,
-                activePromoted ? "Goal achieved; next ordered goal active." : "Goal achieved.",
+                (activePromoted ? "Goal achieved; next ordered goal active." : "Goal achieved.") +
+                  completionHandbackSuffix,
                 {
                   goal: activePromoted || activeGoalAfterMessages,
                   transition: activePromoted ? "achieved-promoted" : "achieved",

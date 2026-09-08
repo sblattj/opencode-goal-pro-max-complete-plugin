@@ -14526,6 +14526,137 @@ test("/goal resume restores the nudge budget without touching the fingerprint or
 
 // >>> v101:T17 tests - the goal-end snapshot and the handback line
 // T17 units: 41, 48.
+const T17_MIRRORED_ROWS = [
+  { content: "a1 · Ship the todo mirror", status: "in_progress", priority: "high" },
+  { content: "a2 · Prove it with a test", status: "pending", priority: "medium" },
+]
+// The exact bytes from the contracts, spelled out here rather than imported so a
+// silent edit to the source string fails this test instead of following it.
+const T17_HANDBACK =
+  "The Todo list still shows this plan's 2 rows. It is yours again: your next todowrite replaces it."
+
+function t17MirrorRows() {
+  return T17_MIRRORED_ROWS.map((row) => ({ ...row }))
+}
+
+// Unit 41 (X2, gap 5). Rows the mirror wrote stay in the host's SQLite after the
+// goal record is deleted — the todo surface is GET-only, so the plugin cannot
+// clear them. Every goal-end route funnels through cleanupGoal, so the snapshot
+// is taken there once; the three routes a user can actually reach are driven
+// end to end here.
+test("stopping, clearing or completing a goal records a terminal snapshot of the mirrored rows", async () => {
+  const { hooks } = await createHooks()
+
+  for (const ending of ["stop", "clear"]) {
+    const sessionID = `t17-snapshot-${ending}`
+    await runGoal(hooks, sessionID, "ship it")
+    currentGoal(sessionID).mirror.rows = t17MirrorRows()
+    // Nothing is recorded while the goal is still alive: the snapshot is the
+    // handback's fallback, not a running copy.
+    assert.equal(readMirrorTerminal(sessionID), undefined, `${ending}: no snapshot before the end`)
+
+    await runGoal(hooks, sessionID, ending)
+    assert.equal(currentGoal(sessionID), null, `${ending}: the goal record is gone`)
+    const snapshot = readMirrorTerminal(sessionID)
+    assert.deepEqual(snapshot.rows, T17_MIRRORED_ROWS, `${ending}: the rows outlive the goal`)
+    assert.ok(snapshot.at > 0, `${ending}: the snapshot carries a timestamp`)
+  }
+
+  // Genuine completion through the canonical tool.
+  const completed = "t17-snapshot-complete"
+  await runGoal(hooks, completed, "ship it")
+  currentGoal(completed).mirror.rows = t17MirrorRows()
+  assert.equal(readMirrorTerminal(completed), undefined)
+  const result = JSON.parse(
+    await hooks.tool.goal_complete.execute({ summary: "suite green" }, { sessionID: completed }),
+  )
+  assert.equal(result.ok, true)
+  assert.equal(currentGoal(completed), null)
+  assert.deepEqual(readMirrorTerminal(completed).rows, T17_MIRRORED_ROWS)
+
+  // The control that keeps the native meaning of an empty todowrite intact: a
+  // goal that never mirrored anything leaves nothing behind to re-emit.
+  const bare = "t17-snapshot-never-mirrored"
+  await runGoal(hooks, bare, "ship it")
+  await runGoal(hooks, bare, "stop")
+  assert.equal(currentGoal(bare), null)
+  assert.equal(readMirrorTerminal(bare), undefined)
+})
+
+// Unit 48 (X2, gap 5). The handback is the plugin's last word in the session:
+// once the goal record is deleted the system block and the continuation block
+// both go silent, so a line not carried on the goal-end response is never said
+// at all. All four goal-end responses carry it, and none of them carries it
+// when there was nothing to hand back.
+test("the goal-end response carries the todo handback line only when rows were mirrored", async () => {
+  const lifecycle = []
+  const { hooks } = await createHooks({
+    messages: async () => ({
+      data: [message("Done.\n[goal:evidence] suite green\n[goal:complete]")],
+    }),
+    options: {
+      minDelayMs: 1,
+      auditMessages: false,
+      lifecycleMessenger: async (_sessionID, text) => lifecycle.push(text),
+    },
+  })
+
+  // `/goal stop` and `/goal clear`: the routed command response.
+  for (const ending of ["stop", "clear"]) {
+    const sessionID = `t17-handback-${ending}`
+    await runGoal(hooks, sessionID, "ship it")
+    currentGoal(sessionID).mirror.rows = t17MirrorRows()
+    const text = await runGoal(hooks, sessionID, ending)
+    assert.match(text, /Goal cleared/, `${ending}: the existing response is preserved`)
+    assert.ok(text.includes(T17_HANDBACK), `${ending}: the handback is appended verbatim`)
+  }
+
+  // Genuine completion through the canonical tool: the tool result.
+  const completed = "t17-handback-complete"
+  await runGoal(hooks, completed, "ship it")
+  currentGoal(completed).mirror.rows = t17MirrorRows()
+  const result = JSON.parse(
+    await hooks.tool.goal_complete.execute({ summary: "suite green" }, { sessionID: completed }),
+  )
+  // ok:true is the load-bearing half: the caller recognizes a completion by the
+  // sentinel string, so the handback must ride BEHIND it, never replace it.
+  assert.equal(result.ok, true)
+  assert.ok(result.message.startsWith("Goal marked complete and archived."))
+  assert.ok(result.message.includes(T17_HANDBACK))
+
+  // Genuine completion through the `[goal:complete]` marker: that path has no
+  // tool result, so the line rides the completion announcement instead.
+  const marker = "t17-handback-marker"
+  await runGoal(hooks, marker, "ship it")
+  currentGoal(marker).mirror.rows = t17MirrorRows()
+  lifecycle.length = 0
+  await hooks.event({
+    event: {
+      type: "session.status",
+      properties: { sessionID: marker, status: { type: "idle" } },
+    },
+  })
+  assert.equal(currentGoal(marker), null)
+  assert.equal(lifecycle.length, 1)
+  assert.match(lifecycle[0], /Goal achieved/)
+  assert.ok(lifecycle[0].includes(T17_HANDBACK))
+
+  // The control, on both surfaces: nothing was ever mirrored, so nothing is
+  // handed back and the v1.0.0 responses are byte-for-byte unchanged.
+  const bareStopped = "t17-handback-never-mirrored"
+  await runGoal(hooks, bareStopped, "ship it")
+  const bareStopText = await runGoal(hooks, bareStopped, "stop")
+  assert.match(bareStopText, /Goal cleared/)
+  assert.doesNotMatch(bareStopText, /It is yours again/)
+
+  const bareCompleted = "t17-handback-never-mirrored-complete"
+  await runGoal(hooks, bareCompleted, "ship it")
+  const bareResult = JSON.parse(
+    await hooks.tool.goal_complete.execute({ summary: "suite green" }, { sessionID: bareCompleted }),
+  )
+  assert.equal(bareResult.ok, true)
+  assert.equal(bareResult.message, "Goal marked complete and archived.")
+})
 // <<< v101:T17
 
 
