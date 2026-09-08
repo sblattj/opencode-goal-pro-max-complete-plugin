@@ -13461,6 +13461,197 @@ test("an empty mirror never records a terminal snapshot", () => {
 
 // >>> v101:T10 tests - the before-hook signature, tool gate and guard ladder
 // T10 units: 7, 8, 9, 10, 11, 47.
+//
+// `testInternals` is destructured inside each test rather than at module scope so
+// that parallel wave-2 regions cannot collide on one const.
+//
+// Every unit here drives the REAL hook returned by `createHooks`, with a goal set
+// through the real `/goal <condition>` command path and a plan recorded through the
+// real `goal_plan_set` handler - so a regression anywhere in that chain turns these
+// red rather than being papered over by a hand-built goal record.
+
+async function t10Hooks(sessionID, actions, overrides = {}) {
+  const { hooks } = await createHooks(overrides)
+  await runGoal(hooks, sessionID, "ship the todo mirror")
+  if (actions) {
+    const { handlers } = makeAgentHandlers()
+    await handlers.setPlan(sessionID, { actions })
+  }
+  return hooks
+}
+
+function t10Row(content, overrides = {}) {
+  return { content, status: "pending", priority: "medium", ...overrides }
+}
+
+test("todowrite args are rewritten in place, because a reassigned args object is dropped by the host", async () => {
+  const { MIRROR_ID_SEPARATOR } = testInternals
+  const sessionID = "t10-args-in-place"
+  const hooks = await t10Hooks(sessionID, [
+    { id: "a1", title: "Ship the mirror" },
+    { id: "a2", title: "Prove it" },
+  ])
+
+  // The host reads its OWN args object back after the hook returns, so the write
+  // has to be a property write. Keeping a reference here is what makes that
+  // falsifiable: `output.args = {...}` would leave `args` untouched below.
+  const args = { todos: [t10Row("my own note")] }
+  const output = { args }
+  await hooks["tool.execute.before"](
+    { tool: "todowrite", sessionID, callID: "t10-in-place-call" },
+    output,
+  )
+
+  assert.equal(output.args, args, "the hook must not replace the caller's args object")
+  assert.deepEqual(
+    args.todos.map((row) => row.content),
+    [
+      `a1${MIRROR_ID_SEPARATOR}Ship the mirror`,
+      `a2${MIRROR_ID_SEPARATOR}Prove it`,
+      "my own note",
+    ],
+  )
+  // Exactly the three native fields on every row, plan rows and kept extras alike.
+  for (const row of args.todos) {
+    assert.deepEqual(Object.keys(row).sort(), ["content", "priority", "status"])
+  }
+  // The extras the projection kept are recorded on the goal for the after-hook's
+  // note, and nothing was dropped by the cap.
+  const goal = currentGoal(sessionID)
+  assert.deepEqual(goal.mirror.extra.map((row) => row.content), ["my own note"])
+  assert.equal(goal.mirror.lastDropped, 0)
+})
+
+test("a NON-EMPTY todowrite is left alone when the session has no goal, and reaches the host unchanged", async () => {
+  const { hooks } = await createHooks()
+  const sessionID = "t10-no-goal-session"
+  assert.equal(currentGoal(sessionID), null)
+
+  const todos = [t10Row("native item", { priority: "high" })]
+  const args = { todos }
+  await hooks["tool.execute.before"](
+    { tool: "todowrite", sessionID, callID: "t10-no-goal-call" },
+    { args },
+  )
+
+  // Identity, not just deep equality: an untouched call must reach the host as the
+  // very array the model wrote.
+  assert.equal(args.todos, todos)
+  assert.deepEqual(args, { todos: [{ content: "native item", status: "pending", priority: "high" }] })
+})
+
+test("a NON-EMPTY todowrite is left alone when the goal is stopped", async () => {
+  const sessionID = "t10-stopped-goal"
+  const hooks = await t10Hooks(sessionID, [{ id: "a1", title: "Ship the mirror" }])
+  const { handlers } = makeAgentHandlers()
+
+  await handlers.updateGoal(sessionID, { status: "paused" })
+  assert.equal(currentGoal(sessionID).stopped, true)
+
+  const todos = [t10Row("native item")]
+  const args = { todos }
+  await hooks["tool.execute.before"](
+    { tool: "todowrite", sessionID, callID: "t10-stopped-call" },
+    { args },
+  )
+  assert.equal(args.todos, todos, "a paused goal must not redraw the list")
+
+  // The control: the same session and the same plan, resumed, DOES mirror - so the
+  // pass above is the `stopped` guard and not a plan that never existed.
+  await handlers.updateGoal(sessionID, { status: "resumed" })
+  const resumedArgs = { todos: [t10Row("native item")] }
+  await hooks["tool.execute.before"](
+    { tool: "todowrite", sessionID, callID: "t10-resumed-call" },
+    { args: resumedArgs },
+  )
+  assert.equal(resumedArgs.todos.length, 2)
+  assert.equal(resumedArgs.todos[1].content, "native item")
+})
+
+test("a NON-EMPTY todowrite is left alone before a plan exists, and the result says to record one", async () => {
+  // T10 owns the before-hook half of this unit: with a goal but zero plan actions
+  // the ladder returns and the model's list reaches the host untouched. The
+  // tool-result half - the "record one with goal_plan_set" hint - is written into
+  // the after-hook by T13.
+  const sessionID = "t10-no-plan-yet"
+  const hooks = await t10Hooks(sessionID, null)
+  assert.equal(currentGoal(sessionID).plan.actions.length, 0)
+
+  const todos = [t10Row("native item")]
+  const args = { todos }
+  await hooks["tool.execute.before"](
+    { tool: "todowrite", sessionID, callID: "t10-no-plan-call" },
+    { args },
+  )
+  assert.equal(args.todos, todos)
+
+  // The control: recording a plan into the same live goal flips the same call to
+  // mirrored, so the pass above is the empty-plan guard.
+  const { handlers } = makeAgentHandlers()
+  await handlers.setPlan(sessionID, { actions: [{ id: "a1", title: "Ship the mirror" }] })
+  const plannedArgs = { todos: [t10Row("native item")] }
+  await hooks["tool.execute.before"](
+    { tool: "todowrite", sessionID, callID: "t10-planned-call" },
+    { args: plannedArgs },
+  )
+  assert.equal(plannedArgs.todos.length, 2)
+})
+
+test("a control-command turn still blocks todowrite before any mirroring happens", async () => {
+  const { hooks } = await createHooks()
+  const sessionID = "t10-control-turn"
+  await runRoutedCommand(hooks, sessionID, "ship the todo mirror")
+  const { handlers } = makeAgentHandlers()
+  await handlers.setPlan(sessionID, { actions: [{ id: "a1", title: "Ship the mirror" }] })
+
+  // The control: outside a control turn this exact call mirrors.
+  const beforeArgs = { todos: [t10Row("native item")] }
+  await hooks["tool.execute.before"](
+    { tool: "todowrite", sessionID, callID: "t10-pre-control-call" },
+    { args: beforeArgs },
+  )
+  assert.equal(beforeArgs.todos.length, 2)
+
+  await runRoutedCommand(hooks, sessionID, "status")
+
+  const args = {}
+  await assert.rejects(
+    () => hooks["tool.execute.before"](
+      { tool: "todowrite", sessionID, callID: "t10-control-call" },
+      { args },
+    ),
+    /control command.*todowrite.*blocked/i,
+  )
+  // The throw wins outright: no projection ran, so no `todos` key was invented on
+  // a call the host will never execute.
+  assert.equal(Object.prototype.hasOwnProperty.call(args, "todos"), false)
+})
+
+test("the before-hook ignores tools other than todowrite and never adds a todos key to their args", async () => {
+  const sessionID = "t10-other-tools"
+  const hooks = await t10Hooks(sessionID, [{ id: "a1", title: "Ship the mirror" }])
+
+  const args = { command: "ls" }
+  const output = { args }
+  await hooks["tool.execute.before"](
+    { tool: "bash", sessionID, callID: "t10-bash-call" },
+    output,
+  )
+  // Writing a `todos` property into another tool's args is the catastrophic
+  // failure: the host's argument decode would reject every call in the session.
+  assert.equal(Object.prototype.hasOwnProperty.call(args, "todos"), false)
+  assert.deepEqual(args, { command: "ls" })
+  assert.equal(output.args, args)
+
+  // The control: same session, same live plan, tool "todowrite" - the mirror does
+  // fire, so the pass above is the tool gate and not a dead mirror.
+  const mirrored = { args: { todos: [t10Row("native item")] } }
+  await hooks["tool.execute.before"](
+    { tool: "todowrite", sessionID, callID: "t10-todowrite-control-call" },
+    mirrored,
+  )
+  assert.equal(mirrored.args.todos.length, 2)
+})
 // <<< v101:T10
 
 
