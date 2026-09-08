@@ -5462,11 +5462,9 @@ function resetMirrorForNewGoal(goal) {
 // >>> v101:T7 the mirrorTodos option
 /**
  * `normalizeMirrorMode(value)` -> `"plan" | "off"` (anything not in `MIRROR_MODES` -> `"plan"`).
- * SCAFFOLD STUB: returns `"plan"` unconditionally so the factory's option read is live from wave 1;
- * T7 replaces this with the real normalizer.
  */
 function normalizeMirrorMode(value) {
-  return "plan"
+  return MIRROR_MODES.has(value) ? value : "plan"
 }
 // <<< v101:T7
 

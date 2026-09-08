@@ -13269,6 +13269,14 @@ test("extras are cleared when a new goal is set", () => {
 
 // >>> v101:T7 tests - normalizeMirrorMode and the mirrorTodos option
 // T7 units: 24.
+test("mirrorTodos normalizes to plan or off, defaulting to plan", () => {
+  assert.equal(testInternals.normalizeMirrorMode(undefined), "plan")
+  assert.equal(testInternals.normalizeMirrorMode("plan"), "plan")
+  assert.equal(testInternals.normalizeMirrorMode("off"), "off")
+  assert.equal(testInternals.normalizeMirrorMode("OFF"), "plan")
+  assert.equal(testInternals.normalizeMirrorMode(0), "plan")
+  assert.equal(testInternals.normalizeMirrorMode("adopt"), "plan")
+})
 // <<< v101:T7
 
 
