@@ -4187,6 +4187,10 @@ function buildAgentToolHandlers({
   auditMessagesEnabled = false,
   announceLifecycle = () => {},
   commandName = "goal",
+  // v1.0.1 T14: the todo-mirror mode, so `updateAction` can emit the staleness
+  // nudge. Defaults to the same value `normalizeMirrorMode(undefined)` gives, so
+  // a caller that builds handlers directly gets the shipped behaviour.
+  mirrorMode = "plan",
 }) {
   // Use persistTerminalState (which logs on failure) for terminal operations when
   // available; fall back to plain persist for callers that don't wire it up (e.g.
@@ -4707,7 +4711,12 @@ function buildAgentToolHandlers({
     goal.lastStatus = `Action ${id} → ${action.status}; ${planStatusLabel(goal.plan)}.`
     pushHistory(goal, "plan-action", `Action ${id} set to ${action.status}.`)
     await persist(sessionID)
-    return [`Action ${id} updated: ${action.status}.`, `Progress: ${planStatusLabel(goal.plan)}.`].join(" ")
+    const result = [`Action ${id} updated: ${action.status}.`, `Progress: ${planStatusLabel(goal.plan)}.`].join(" ")
+    // v1.0.1 T14: this edit just changed what the plan says, so the mirrored Todo
+    // list no longer matches it. The nudge is the capability probe — it costs one
+    // of three per goal-run and is emitted only while the mirror reads stale.
+    const nudge = mirrorNudgeLine(goal, mirrorMode)
+    return nudge ? `${result}\n${nudge}` : result
   }
 
   async function clearGoal(sessionID) {
@@ -5568,24 +5577,52 @@ function dropMirrorTerminal(sessionID) {
  * mirrorFingerprint(projectPlanToTodos(goal.plan, goal.mirror.extra)) === goal.mirror.fingerprint`.
  */
 function mirrorIsFresh(goal) {
-  throw new Error("v1.0.1 T14: not implemented")
+  const mirror = goal?.mirror
+  // `at === 0` is "nothing was ever mirrored", which is stale by definition: the
+  // panel holds whatever the model last wrote, not this plan. Comparing
+  // fingerprints alone would call that fresh whenever the plan is empty, because
+  // the empty projection hashes to a constant.
+  if (!mirror || !(mirror.at > 0)) return false
+  // The comparison is against a FRESH projection of the current plan, never
+  // against the stored rows: the stored rows are what the host was told, and the
+  // question is whether that is still what the plan says.
+  return mirrorFingerprint(projectPlanToTodos(goal.plan, mirror.extra)) === mirror.fingerprint
 }
 
 /**
  * `mirrorState(goal, mirrorMode)` -> `"fresh" | "stale" | "off"`.
  */
 function mirrorState(goal, mirrorMode) {
-  throw new Error("v1.0.1 T14: not implemented")
+  if (mirrorMode === "off") return "off"
+  return mirrorIsFresh(goal) ? "fresh" : "stale"
 }
+
+/**
+ * The nudge line (CONTRACTS Strings, T14/T19), exact bytes; the em dash is U+2014.
+ */
+const MIRROR_NUDGE_LINE =
+  "Todo panel is stale — call todowrite({todos: []}) once; the plan is copied into it for you."
 
 /**
  * `mirrorNudgeLine(goal, mirrorMode)` -> string: returns the nudge line and increments
  * `goal.mirror.nudges` ONLY when mode is plan, a live plan with >=1 action exists, the mirror is
  * stale, and `nudges < MIRROR_MAX_NUDGES`; otherwise `""` with no side effect. Wire ONE emission
  * into the `goal_action_update` tool result (function `updateAction`), after its existing text.
+ *
+ * The counter is a per-goal-run TOTAL (design X5): a landed mirror does not refund it, so the
+ * worst case under a `todowrite: "ask"` permission is three modals per goal rather than three per
+ * staleness episode. Only `/goal resume` (T16) zeroes it.
  */
 function mirrorNudgeLine(goal, mirrorMode) {
-  throw new Error("v1.0.1 T14: not implemented")
+  if (mirrorMode !== "plan") return ""
+  if (!goal || goal.stopped) return ""
+  const actions = goal.plan?.actions
+  if (!Array.isArray(actions) || actions.length === 0) return ""
+  if (mirrorState(goal, mirrorMode) !== "stale") return ""
+  const mirror = goal.mirror
+  if (!mirror || !(mirror.nudges < MIRROR_MAX_NUDGES)) return ""
+  mirror.nudges += 1
+  return MIRROR_NUDGE_LINE
 }
 // <<< v101:T14
 
@@ -6102,6 +6139,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
     auditMessagesEnabled,
     announceLifecycle,
     commandName,
+    mirrorMode,
   })
 
   const abortAcceptedContinuation = async (sessionID) => {
