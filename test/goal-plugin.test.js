@@ -1476,11 +1476,15 @@ test("prompt builders stay within compact deterministic budgets", () => {
   // are the whole point of splitting spend from context pressure.
   assert.ok(buildContinueMessage(goal).length <= 560)
   assert.ok(buildContinueMessage(goal, { budgetWrapup: true }).length <= 680)
-  assert.ok(buildCompactionContext(goal).length <= block.length + 650)
+  // v1.0.1 T20: this fixture carries no `goal.mirror`/`goal.plan`, so it is
+  // truthfully "never mirrored" (stale) under the default "plan" mode; pin the
+  // pre-existing, mirror-unrelated budget with an explicit "off" so this stays
+  // a check on the core compaction context, not a second copy of unit 50.
+  assert.ok(buildCompactionContext(goal, { mirrorMode: "off" }).length <= block.length + 650)
   assert.ok(buildAuditPrompt(goal, "done").length <= block.length + 700)
 
   goal.lastCheckpoint = { summary: "a".repeat(10_000), timestamp: now }
-  assert.ok(buildCompactionContext(goal).length <= block.length + 900)
+  assert.ok(buildCompactionContext(goal, { mirrorMode: "off" }).length <= block.length + 900)
 })
 
 test("blocked reason is extracted from line before marker", () => {
@@ -14682,6 +14686,82 @@ test("the goal-end response carries the todo handback line only when rows were m
 
 // >>> v101:T20 tests - the compaction stale line
 // T20 units: 50.
+const T20_STALE_LINE =
+  "The session's Todo list is stale — it shows an older copy of the plan; one todowrite({todos: []}) refreshes it."
+
+test("compaction context names a stale mirror only while stale", async () => {
+  const { hooks } = await createHooks()
+  const { handlers } = makeAgentHandlers()
+  const sid = "t20-compaction-stale"
+  await handlers.setGoal(sid, { objective: "ship the release" })
+  await handlers.setPlan(sid, { actions: [{ id: "a1", title: "write it" }] })
+  const goal = currentGoal(sid)
+
+  // Never mirrored is truthfully STALE (design §4.3(f)/P2: "stale, never
+  // mirrored" is the pre-release record's honest state), so under "plan" mode
+  // the compaction context carries the stale line...
+  assert.equal(goal.mirror.at, 0)
+  const staleNeverMirrored = buildCompactionContext(goal, { mirrorMode: "plan" })
+  assert.equal(staleNeverMirrored.includes(T20_STALE_LINE), true)
+
+  // ...but under "off" mode the mirror concept is bypassed entirely, whatever
+  // the internal freshness. This IS the v1.0.0 output for this goal - there is
+  // no other way left to invoke the pre-mirror behaviour, so this is the
+  // control the "byte-identical to today's" claim is checked against.
+  const offControl = buildCompactionContext(goal, { mirrorMode: "off" })
+  assert.equal(offControl.includes(T20_STALE_LINE), false)
+
+  // Structural proof, not a coincidence: the "plan"-mode stale output differs
+  // from the "off" control by EXACTLY the one inserted line, in place, with
+  // every other line identical and in the same order.
+  const offLines = offControl.split("\n")
+  const staleLines = staleNeverMirrored.split("\n")
+  assert.equal(staleLines.length, offLines.length + 1)
+  const insertedAt = staleLines.findIndex((line, i) => line !== offLines[i])
+  assert.equal(staleLines[insertedAt], T20_STALE_LINE)
+  assert.deepEqual(
+    staleLines.filter((_, i) => i !== insertedAt),
+    offLines,
+  )
+
+  // Make the mirror genuinely fresh through the real todowrite hooks (not a
+  // hand-set field), then re-check both modes for that SAME state.
+  const call = { args: { todos: [] } }
+  await hooks["tool.execute.before"]({ tool: "todowrite", sessionID: sid, callID: "t20-call-1" }, call)
+  await hooks["tool.execute.after"](
+    { tool: "todowrite", sessionID: sid, callID: "t20-call-1", args: call.args },
+    { title: "todowrite", output: "ok", metadata: {} },
+  )
+  assert.equal(testInternals.mirrorIsFresh(goal), true)
+  const freshPlan = buildCompactionContext(goal, { mirrorMode: "plan" })
+  const freshOff = buildCompactionContext(goal, { mirrorMode: "off" })
+  assert.equal(freshPlan.includes(T20_STALE_LINE), false)
+  assert.equal(freshPlan, freshOff, "fresh and off must be byte-identical for the same goal state")
+
+  // Edit the plan: the mirror goes stale again, and the line reappears under
+  // "plan" while "off" stays untouched.
+  await handlers.updateAction(sid, { id: "a1", status: "in_progress" })
+  assert.equal(testInternals.mirrorIsFresh(goal), false)
+  assert.equal(buildCompactionContext(goal, { mirrorMode: "plan" }).includes(T20_STALE_LINE), true)
+  assert.equal(buildCompactionContext(goal, { mirrorMode: "off" }).includes(T20_STALE_LINE), false)
+
+  // The production call site: experimental.session.compacting must actually
+  // thread mirrorMode through from the plugin's own closure, not just the pure
+  // function tested above.
+  const compactOutput = { context: [] }
+  await hooks["experimental.session.compacting"]({ sessionID: sid }, compactOutput)
+  assert.equal(compactOutput.context[0].includes(T20_STALE_LINE), true)
+
+  // Same wiring, "off" plugin instance: the hook-level control.
+  const { hooks: offHooks } = await createHooks({ options: { mirrorTodos: "off" } })
+  const offSid = "t20-compaction-off-hook"
+  await handlers.setGoal(offSid, { objective: "ship the other thing" })
+  await handlers.setPlan(offSid, { actions: [{ id: "b1", title: "do it" }] })
+  assert.equal(currentGoal(offSid).mirror.at, 0, "never mirrored, so plan mode would call this stale")
+  const offCompactOutput = { context: [] }
+  await offHooks["experimental.session.compacting"]({ sessionID: offSid }, offCompactOutput)
+  assert.equal(offCompactOutput.context[0].includes(T20_STALE_LINE), false)
+})
 // <<< v101:T20
 
 
