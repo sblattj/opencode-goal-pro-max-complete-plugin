@@ -5040,7 +5040,7 @@ function buildAgentTools(
     }),
     goal_plan_set: toolHelper({
       description:
-        "Record the ordered action plan for the current goal. Decompose the objective into concrete actions; each needs a stable `id` and a `title`. Replaces the whole plan, preserving already-recorded claim/evidence/verdict for actions you keep by id.",
+        "Record the ordered action plan for the current goal. Decompose the objective into concrete actions; each needs a stable `id` and a `title`. Replaces the whole plan, preserving already-recorded claim/evidence/verdict for actions you keep by id. The session's Todo list is redrawn from this plan on the next todowrite call.",
       args: {
         actions: schema.array(
           schema.object({
@@ -5062,7 +5062,7 @@ function buildAgentTools(
     }),
     goal_action_update: toolHelper({
       description:
-        "Update one action of the goal plan. An action may only become `done` with a claim, the minimum evidence that could have falsified it (real command output, file content, or response — not your own report), and verdict `pass`. A `blocked` action must state its reason in `claim`.",
+        "Update one action of the goal plan. An action may only become `done` with a claim, the minimum evidence that could have falsified it (real command output, file content, or response — not your own report), and verdict `pass`. A `blocked` action must state its reason in `claim`. The session's Todo list is redrawn from this plan on the next todowrite call.",
       args: {
         id: schema.string(),
         status: schema.enum(PLAN_ACTION_STATUSES).optional(),
