@@ -397,12 +397,24 @@ function isPluginOwnToolName(name) {
   return false
 }
 
-function messageHasWorkToolCall(message) {
+// The default exemption set, shared rather than allocated per call: the stall
+// brakes ask this question once per message per turn.
+const NO_EXEMPT_TOOL_NAMES = new Set()
+
+// `exempt` names tools whose calls are not the model's own work. A todowrite
+// under the plan mirror is the plugin redrawing the Todo panel from the plan,
+// so counting it as work would let a talk-only turn clear the tool-free strike
+// simply by refreshing the panel. Exact, lowercased names only: unlike
+// `isPluginOwnToolName`, a host-namespaced spelling is not matched, because the
+// exemption must never swallow a tool the model really did call.
+function messageHasWorkToolCall(message, exempt = NO_EXEMPT_TOOL_NAMES) {
   const parts = Array.isArray(message?.parts) ? message.parts : []
-  return parts.some(
-    (part) =>
-      part && TOOL_PART_TYPES.has(part.type) && !isPluginOwnToolName(toolPartName(part)),
-  )
+  const exemptNames = exempt && typeof exempt.has === "function" ? exempt : NO_EXEMPT_TOOL_NAMES
+  return parts.some((part) => {
+    if (!part || !TOOL_PART_TYPES.has(part.type)) return false
+    const name = toolPartName(part)
+    return !isPluginOwnToolName(name) && !exemptNames.has(name)
+  })
 }
 
 const GOAL_MODES = new Set(["normal", "ordered"])
@@ -3548,9 +3560,9 @@ function turnWasTruncated(messages, turnMessages, visibilityLimit) {
 // `assistantMessagesForTurn` so the brakes judge the WHOLE turn: a tool part
 // anywhere in it is real work, and the output/reasoning tokens of a turn are
 // the sum over its steps, not the tail message's share of them.
-function turnCallsTool(turnMessages) {
+function turnCallsTool(turnMessages, exempt = NO_EXEMPT_TOOL_NAMES) {
   return (Array.isArray(turnMessages) ? turnMessages : []).some((message) =>
-    messageHasWorkToolCall(message),
+    messageHasWorkToolCall(message, exempt),
   )
 }
 
@@ -8156,7 +8168,14 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         // whole turn: a tool part on ANY of the turn's assistant messages is
         // enough, because the model's closing summary is its own text-only
         // message and is the one this used to read.
-        const turnHasToolCall = turnCallsTool(turnMessages)
+        // Under the plan mirror a todowrite call is the plugin's own panel
+        // refresh, not the model's work, so it is exempted from the tool-free
+        // strike. With `mirrorTodos: "off"` nothing is exempt and todowrite
+        // counts as work exactly as it did in v1.0.0.
+        const turnHasToolCall = turnCallsTool(
+          turnMessages,
+          mirrorMode === "plan" ? MIRROR_TOOL_NAMES : NO_EXEMPT_TOOL_NAMES,
+        )
         // A turn whose head fell outside the visibility window was never fully
         // observed: its tool calls and most of its output tokens are simply not
         // in the list. Charging a stall brake on that evidence reproduces the
