@@ -14676,6 +14676,82 @@ test("the goal-end response carries the todo handback line only when rows were m
 
 // >>> v101:T19 tests - the continuation nudge line
 // T19 units: 20.
+test("mirroring the plan once produces no continuation nudge; a plan edit adds exactly one, and re-mirroring silences it again", async () => {
+  const { hooks } = await createHooks()
+  const sessionID = "t19-continuation-nudge"
+  const goal = await t12MirrorSetup(sessionID, [
+    { id: "a1", title: "write the code" },
+    { id: "a2", title: "run the tests" },
+  ])
+
+  // 1. Mirror once through the real hooks: the model calls the taught refresh
+  // idiom (an empty todowrite), the before-hook re-projects the plan into it
+  // (T11), and the after-hook stamps the mirror fresh from what actually landed
+  // (T12). Only the stamp makes `mirrorIsFresh` true.
+  const seeded = { todos: [] }
+  await hooks["tool.execute.before"](
+    { tool: "todowrite", sessionID, callID: "t19-seed-before" },
+    { args: seeded },
+  )
+  assert.ok(seeded.todos.length > 0, "the before-hook must have re-projected the plan")
+  await hooks["tool.execute.after"](
+    { tool: "todowrite", sessionID, callID: "t19-seed-after", args: seeded },
+    { title: "todowrite", output: "", metadata: {} },
+  )
+  assert.equal(testInternals.mirrorIsFresh(goal), true)
+  assert.equal(goal.mirror.nudges, 0)
+
+  // A fresh mirror: the continuation carries no nudge line, and nothing is spent.
+  const freshMessage = buildContinueMessage(goal, { mirrorMode: "plan" })
+  assert.equal(freshMessage.includes(T14_NUDGE_LINE), false)
+  assert.equal(goal.mirror.nudges, 0)
+
+  // The "byte-for-byte today" property: a fresh mirror never has anything to say,
+  // so mode "plan" and mode "off" render an identical continuation for the same
+  // goal — the existing `.filter(Boolean)` elides the empty nudge either way.
+  assert.equal(freshMessage, buildContinueMessage(goal, { mirrorMode: "off" }))
+
+  // 2. Update an action: the plan changes under the mirror, so it reads stale.
+  // Drive the update through handlers built with `mirrorMode: "off"` so the
+  // tool-result's OWN nudge (T14, wired into `updateAction`) does not also spend
+  // the budget here — this unit isolates T19's emission, inside the continuation.
+  const { handlers: offHandlers } = makeAgentHandlers({ mirrorMode: "off" })
+  const updateResult = await offHandlers.updateAction(sessionID, { id: "a1", status: "in_progress" })
+  assert.equal(updateResult.includes(T14_NUDGE_LINE), false)
+  assert.equal(goal.mirror.nudges, 0)
+  assert.equal(testInternals.mirrorIsFresh(goal), false)
+
+  // Exactly one nudge line, and the budget now reads 1.
+  const staleMessage = buildContinueMessage(goal, { mirrorMode: "plan" })
+  assert.equal(
+    staleMessage.split("\n").filter((line) => line === T14_NUDGE_LINE).length,
+    1,
+  )
+  assert.equal(goal.mirror.nudges, 1)
+
+  // Mode "off" never adds it, however stale the mirror, and spends nothing.
+  const staleOffMessage = buildContinueMessage(goal, { mirrorMode: "off" })
+  assert.equal(staleOffMessage.includes(T14_NUDGE_LINE), false)
+  assert.equal(goal.mirror.nudges, 1)
+
+  // 3. Mirror again: fresh once more, so the nudge falls silent — and the second
+  // call above must not have spent any further budget while it was stale.
+  const reprojected = { todos: t12ProjectedRows(goal) }
+  await hooks["tool.execute.before"](
+    { tool: "todowrite", sessionID, callID: "t19-remirror-before" },
+    { args: reprojected },
+  )
+  await hooks["tool.execute.after"](
+    { tool: "todowrite", sessionID, callID: "t19-remirror-after", args: reprojected },
+    { title: "todowrite", output: "", metadata: {} },
+  )
+  assert.equal(testInternals.mirrorIsFresh(goal), true)
+
+  const freshAgainMessage = buildContinueMessage(goal, { mirrorMode: "plan" })
+  assert.equal(freshAgainMessage.includes(T14_NUDGE_LINE), false)
+  assert.equal(goal.mirror.nudges, 1, "landing the refresh must not refund or spend the budget")
+  assert.equal(freshAgainMessage, buildContinueMessage(goal, { mirrorMode: "off" }))
+})
 // <<< v101:T19
 
 
