@@ -14898,6 +14898,103 @@ test("both descriptions end with the sentence; the unchanged descriptions of the
 
 // >>> v101:T22 tests - the tool.definition todowrite suffix
 // T22 units: 30, 31, 52.
+//
+// `TODOWRITE_MIRROR_DESCRIPTION` is module-scope in src/goal-plugin.js but is not
+// exported through `testInternals` (CONTRACTS names no export for it, matching the
+// precedent set for `mirrorResultNote`/`mirrorHandbackLine` per int2/REPORT.md §7),
+// so these tests hardcode the exact suffix bytes from CONTRACTS "todowrite
+// description suffix (T22)", the same pattern the T13 tests already use for
+// `mirrorResultNote`'s literal text.
+const T22_MIRROR_CLAUSE =
+  "GOAL PLUGIN: if a <goal_plan> block is present in your context, this session's todo list is drawn from that plan — plan actions are written here for you, and items of your own are kept below them. Use goal_plan_set / goal_action_update to change the work, and follow the refresh instruction in that block when it asks for one. With no <goal_plan> block, this tool behaves normally."
+
+const T22_HOST_DESCRIPTION =
+  "Use this tool to create and manage a structured task list for your current session. This helps track progress and give the user visibility into your plan."
+
+test("the todowrite description carries the mirror clause whenever mirrorTodos is on", async () => {
+  const { hooks } = await createHooks()
+
+  const planOutput = { description: T22_HOST_DESCRIPTION, parameters: { todos: {} } }
+  await hooks["tool.definition"]({ toolID: "todowrite" }, planOutput)
+  assert.equal(planOutput.description, `${T22_HOST_DESCRIPTION}\n\n${T22_MIRROR_CLAUSE}`)
+  // The append never touches the sibling `parameters` field.
+  assert.deepEqual(planOutput.parameters, { todos: {} })
+
+  // The absence, under the kill switch: the description comes back byte for
+  // byte the host's own text, not merely "still contains the host text".
+  const { hooks: offHooks } = await createHooks({ options: { mirrorTodos: "off" } })
+  const offOutput = { description: T22_HOST_DESCRIPTION, parameters: { todos: {} } }
+  await offHooks["tool.definition"]({ toolID: "todowrite" }, offOutput)
+  assert.equal(offOutput.description, T22_HOST_DESCRIPTION)
+  assert.deepEqual(offOutput.parameters, { todos: {} })
+})
+
+test("the description suffix is appended, not substituted", async () => {
+  const { hooks } = await createHooks()
+  const multilineHostText = `${T22_HOST_DESCRIPTION}\n\nUsage notes:\n- Mark exactly one task in_progress at a time.\n- Complete tasks as you finish them.`
+  const output = { description: multilineHostText, parameters: {} }
+  await hooks["tool.definition"]({ toolID: "todowrite" }, output)
+
+  // The host's own text, in full, is an unmodified PREFIX of the result — the
+  // plugin never rewrites or truncates a single byte of it.
+  assert.equal(output.description.startsWith(multilineHostText), true)
+  assert.equal(output.description, `${multilineHostText}\n\n${T22_MIRROR_CLAUSE}`)
+})
+
+test("the todowrite description is identical before a goal is set, while one is active, and after it stops", async () => {
+  const { hooks } = await createHooks()
+  const sessionID = "t22-description-stability"
+
+  // Before any goal exists in this session.
+  const before = { description: T22_HOST_DESCRIPTION, parameters: {} }
+  await hooks["tool.definition"]({ toolID: "todowrite" }, before)
+
+  // While an active goal with a recorded plan exists — the hook takes no
+  // sessionID at all, so this cannot see it even if it wanted to (F23).
+  const { handlers } = makeAgentHandlers()
+  await handlers.setGoal(sessionID, { objective: "ship the todo mirror" })
+  await handlers.setPlan(sessionID, { actions: [{ id: "a1", title: "write the code" }] })
+  assert.equal(currentGoal(sessionID).plan.actions.length, 1)
+
+  const during = { description: T22_HOST_DESCRIPTION, parameters: {} }
+  await hooks["tool.definition"]({ toolID: "todowrite" }, during)
+
+  // After `/goal stop` — one of the plugin's CLEAR_COMMANDS, so this is the
+  // same terminal state `clearGoal` produces for the slash command.
+  await handlers.clearGoal(sessionID)
+  assert.equal(currentGoal(sessionID), null)
+
+  const after = { description: T22_HOST_DESCRIPTION, parameters: {} }
+  await hooks["tool.definition"]({ toolID: "todowrite" }, after)
+
+  assert.equal(before.description, `${T22_HOST_DESCRIPTION}\n\n${T22_MIRROR_CLAUSE}`)
+  assert.equal(during.description, before.description)
+  assert.equal(after.description, before.description)
+})
+
+test("the tool.definition hook ignores tools other than todowrite", async () => {
+  const { hooks } = await createHooks()
+  const output = { description: "Run a shell command and return its output.", parameters: { command: "string" } }
+  const before = structuredClone(output)
+
+  await assert.doesNotReject(() => hooks["tool.definition"]({ toolID: "bash" }, output))
+  assert.deepEqual(output, before)
+})
+
+test("the tool.definition hook tolerates a missing output or a non-string description", async () => {
+  const { hooks } = await createHooks()
+
+  await assert.doesNotReject(() => hooks["tool.definition"]({ toolID: "todowrite" }, undefined))
+  await assert.doesNotReject(() => hooks["tool.definition"]({ toolID: "todowrite" }, null))
+
+  const noDescription = { parameters: {} }
+  await assert.doesNotReject(() => hooks["tool.definition"]({ toolID: "todowrite" }, noDescription))
+  assert.equal(noDescription.description, undefined)
+
+  const nonStringDescription = { description: 42, parameters: {} }
+  await assert.doesNotReject(() => hooks["tool.definition"]({ toolID: "todowrite" }, nonStringDescription))
+  assert.equal(nonStringDescription.description, 42)
+})
 // <<< v101:T22
 
 
