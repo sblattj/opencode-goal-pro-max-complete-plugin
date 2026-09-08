@@ -14,7 +14,9 @@ install is **two entries in two different files**: `opencode.json` registers the
 *server* half (the `/goal` command, the tools, the hooks, and the sidebar
 payload), and `tui.json` — beside it, in the same config directory — registers
 the *TUI* half (the sidebar panel). The server half works alone; you get the
-status line and no panel.
+status line and no panel. See [Install](../docs/reference.md#install) in the
+reference for why a spec must name the package **before** the source, and what
+happens silently when it does not.
 
 > **`<tag>` is a placeholder: these files do not install as shipped.** Replace
 > `<tag>` with a released tag. And note the trap in `tui.json`: a `github:` spec
