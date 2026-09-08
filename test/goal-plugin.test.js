@@ -14688,6 +14688,29 @@ test("the goal-end response carries the todo handback line only when rows were m
 
 // >>> v101:T21 tests - the two plan tool descriptions
 // T21 units: 51.
+test("both descriptions end with the sentence; the unchanged descriptions of the other goal tools do not contain it", async () => {
+  const schema = {
+    string: () => ({ optional: () => "str?" }),
+    number: () => ({ optional: () => "num?" }),
+    array: () => ({ optional: () => "array?" }),
+    object: () => "object",
+    enum: () => ({ optional: () => "enum?" }),
+  }
+  const toolHelper = (def) => def
+  toolHelper.schema = schema
+
+  const { handlers } = makeAgentHandlers()
+  const tools = buildAgentTools(toolHelper, handlers)
+
+  const APPEND = " The session's Todo list is redrawn from this plan on the next todowrite call."
+  assert.ok(tools.goal_plan_set.description.endsWith(APPEND))
+  assert.ok(tools.goal_action_update.description.endsWith(APPEND))
+
+  for (const name of Object.keys(tools)) {
+    if (name === "goal_plan_set" || name === "goal_action_update") continue
+    assert.ok(!tools[name].description.includes(APPEND), `${name} description must not contain the mirror sentence`)
+  }
+})
 // <<< v101:T21
 
 
