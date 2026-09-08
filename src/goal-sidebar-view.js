@@ -168,21 +168,94 @@ function normalizeAction(raw) {
 }
 
 // >>> v101:T24 exception-list filter for the mirrored action list (G2)
-// Reserved. T24 filters `goalPanelModel`'s action list to done-unverified, then blocked, then
-// in_progress when `plan.mirror` exists and its state is not "off".
+// The exception list. While the native Todo section is drawing this plan, the panel stops
+// repeating rows that section already shows and keeps only what it cannot express: a
+// completion with no passing verdict, then a blocker, then the work in flight. `pending`
+// and verified-`done` rows are dropped, so a clean plan renders zero rows and the progress
+// line carries the whole story.
+//
+// The groups are listed in the order a human has to act on them, and each group keeps plan
+// order internally, so the list is stable from render to render.
+const PANEL_EXCEPTION_GROUPS = [
+  (action) => action.status === "done" && !action.verified,
+  (action) => action.status === "blocked",
+  (action) => action.status === "in_progress",
+]
+
+// Filtering is a decision about THIS plugin's own mirror mode, never a belief about what
+// another panel currently shows. A v2 payload carries no `plan.mirror` at all, and an `off`
+// mirror means the plugin never touched the Todo list; both render every action, exactly as
+// they did before v1.0.1. The payload is arbitrary JSON from another process, so a
+// non-object `mirror` is treated as absent rather than trusted.
+function mirrorFiltersPanelActions(mirror) {
+  return isRecord(mirror) && mirror.state !== "off"
+}
+
+function panelExceptionList(actions) {
+  return PANEL_EXCEPTION_GROUPS.flatMap((inGroup) => actions.filter(inGroup))
+}
 // <<< v101:T24
 
 
 
 // >>> v101:T25 mirror suffix on the progress line
-// Reserved. T25 adds the ` · todo mirror fresh (n)` / ` · todo list stale` suffix and the
-// `{ liveTodoCount }` options argument.
+// Computes both the progress-line suffix and the `model.mirror` facts consumed by T26 and
+// the types seat from the same inputs, so the two surfaces can never disagree about
+// whether there is drift. `liveTodoCount` is the option `goalPanelModel` was called with;
+// only a finite number counts (T26's own read is guarded to fall back to `undefined` on any
+// throw/absence). Returns `facts: null` when there is nothing to report — no `plan.mirror`,
+// or `state === "off"` — so `goalPanelModel` can omit the `mirror` key from the model
+// entirely rather than set it to `undefined`, which is what unit 35 requires: an `off`
+// mirror (or a v2 payload with no `plan.mirror` at all) must render a model with exactly
+// the same OWN KEYS as today, not an extra `mirror: undefined` a strict deep-equal would
+// still see.
+function mirrorProgress(mirror, liveTodoCount) {
+  if (!isRecord(mirror) || mirror.state === "off") return { suffix: "", facts: null }
+  const rows = wholeNumber(mirror.rows)
+  const live = Number.isFinite(liveTodoCount) ? liveTodoCount : null
+  const drift = (mirror.state === "fresh" || mirror.state === "stale") && live !== null && live !== rows
+  const facts = { state: mirror.state, rows, extra: wholeNumber(mirror.extra), liveTodoCount: live, drift }
+  if (drift) return { suffix: ` · mirror drift (${live}≠${rows})`, facts }
+  if (mirror.state === "fresh") return { suffix: ` · todo mirror fresh (${live !== null ? live : rows})`, facts }
+  if (mirror.state === "stale") return { suffix: " · todo list stale", facts }
+  return { suffix: "", facts }
+}
 // <<< v101:T25
 
 
 
 // >>> v101:T26 live drift check
-// Reserved. T26 reads the live todo count in `GoalPanel` and renders the drift suffix.
+// The live row count of the host's OWN todo list, read exactly the way opencode's builtin Todo
+// section reads it: `api.state.session.todo(sessionID)`
+// (`packages/tui/src/feature-plugins/sidebar/todo.tsx:11` `View`, typed at
+// `packages/plugin/src/tui.ts:390` `TuiState.session.todo`). The adapter behind that method returns
+// `sync.data.todo[sessionID] ?? []` (`packages/tui/src/plugin/adapters.tsx:131` `todo`) - a read off
+// the same Solid store every other panel read comes from, so calling this INSIDE `GoalPanel`'s
+// `createMemo` subscribes the memo and the suffix re-renders when the host's list changes, the same
+// way the builtin Todo section does.
+//
+// Deliberately NOT an import. `src/goal-sidebar-view.js` imports nothing but its own sibling
+// module, `bundle:tui` runs `--packages external` (package.json `bundle:tui`), and the unit tests
+// import this file straight into node, where `solid-js` does not resolve at all. Reaching the count
+// through the `api` object the host already hands `GoalPanel` keeps all three true.
+//
+// Every failure mode collapses to `undefined` - "no live count" - which `mirrorProgress` (T25)
+// reads as "fall back to the payload's own row count" rather than as drift. A host older than the
+// reader, a host that throws, and a host that answers with something that is not an array are all
+// cases where the panel knows nothing about the live list; inventing a drift claim out of that
+// would be worse than saying nothing.
+function readLiveTodoCount(api, sessionID) {
+  if (!sessionID) return undefined
+  try {
+    const session = api?.state?.session
+    if (typeof session?.todo !== "function") return undefined
+    const todos = session.todo(sessionID)
+    return Array.isArray(todos) ? todos.length : undefined
+  } catch {
+    // A panel that throws takes the sidebar down with it.
+    return undefined
+  }
+}
 // <<< v101:T26
 
 
@@ -202,7 +275,7 @@ function normalizeAction(raw) {
  * The payload crosses a process boundary as arbitrary JSON, so every field is
  * validated here rather than trusted.
  */
-export function goalPanelModel(raw) {
+export function goalPanelModel(raw, { liveTodoCount } = {}) {
   if (!isRecord(raw)) return null
   const objective = boundedText(raw.objective, 120)
   if (!objective) return null
@@ -237,16 +310,19 @@ export function goalPanelModel(raw) {
 
   const plan = isRecord(raw.plan) ? raw.plan : {}
   const planTotal = wholeNumber(plan.total)
-  const actions = (Array.isArray(plan.actions) ? plan.actions : [])
-    .map(normalizeAction)
-    .filter(Boolean)
-    .slice(0, MAX_PANEL_ACTIONS)
-  const hiddenActions = Math.max(0, planTotal - actions.length)
+  const listed = (Array.isArray(plan.actions) ? plan.actions : []).map(normalizeAction).filter(Boolean)
+  const filtered = mirrorFiltersPanelActions(plan.mirror)
+  const shortlist = filtered ? panelExceptionList(listed) : listed
+  const actions = shortlist.slice(0, MAX_PANEL_ACTIONS)
+  // Under the exception list the `+N more` count is over the FILTERED list: it promises the
+  // rows the cap dropped, never the `pending` actions the Todo section is already showing.
+  const hiddenActions = Math.max(0, (filtered ? shortlist.length : planTotal) - actions.length)
   const progress = planTotal
     ? `${wholeNumber(plan.verified)}/${planTotal} actions verified${
         wholeNumber(plan.blocked) ? `, ${wholeNumber(plan.blocked)} blocked` : ""
       }`
     : ""
+  const { suffix: mirrorSuffix, facts: mirrorFacts } = mirrorProgress(plan.mirror, liveTodoCount)
 
   // Ordered by what a human needs first when they glance at a stuck run: why it
   // stopped, then what it was told to satisfy.
@@ -266,10 +342,11 @@ export function goalPanelModel(raw) {
     objective,
     stats,
     sequence,
-    progress,
+    progress: `${progress}${mirrorSuffix}`,
     actions,
     hiddenActions,
     notes,
+    ...(mirrorFacts ? { mirror: mirrorFacts } : {}),
   }
 }
 
@@ -332,7 +409,13 @@ export function createGoalSidebar(runtime) {
 
   function GoalPanel(props) {
     const theme = () => props.api.theme.current
-    const model = createMemo(() => goalPanelModel(readGoalPayload(props.api, props.session_id)))
+    // v101:T26 edit (outside the T26 region, the one call site): the live todo count is read in
+    // the SAME memo as the payload, so both the drift check and its inputs are tracked together.
+    const model = createMemo(() =>
+      goalPanelModel(readGoalPayload(props.api, props.session_id), {
+        liveTodoCount: readLiveTodoCount(props.api, props.session_id),
+      }),
+    )
     // Every accessor below can run after the goal is cleared, between the model
     // going null and Show tearing the branch down, so each one falls back.
     const read = (pick, fallback = "") => () => {

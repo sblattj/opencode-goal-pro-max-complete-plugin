@@ -561,18 +561,360 @@ test("the shared budget formatters are the ones the panel and the title both use
 
 // >>> v101:T24 tests - the exception-list filter
 // T24 units: 33, 34.
+
+// A `plan.mirror` record shaped like the one `buildSidebarMetadata` publishes in v3.
+function mirror(state, overrides = {}) {
+  return { state, rows: 5, extra: 0, at: 1_757_280_000, ...overrides }
+}
+
+test("a fresh mirror renders only the actions that need attention", () => {
+  // Plan order deliberately interleaves the groups, so an implementation that merely
+  // dropped `pending` rows without regrouping would render a different order.
+  const actions = [
+    { id: "a1", title: "pending work", status: "pending", verdict: null },
+    { id: "a2", title: "in flight", status: "in_progress", verdict: null },
+    { id: "a3", title: "claimed done", status: "done", verdict: null },
+    { id: "a4", title: "waiting on review", status: "blocked", verdict: null },
+    { id: "a5", title: "proven done", status: "done", verdict: "pass" },
+    { id: "a6", title: "done, verdict fail", status: "done", verdict: "fail" },
+  ]
+  const plan = { total: 6, verified: 1, blocked: 1, mirror: mirror("fresh"), actions }
+
+  const model = goalPanelModel(payload({ plan }))
+  assert.deepEqual(
+    model.actions.map((action) => action.title),
+    ["claimed done", "done, verdict fail", "waiting on review", "in flight"],
+  )
+  // The two rows the Todo section can express on its own are the ones dropped: an
+  // untouched `pending` action and a completion that already carries its verdict.
+  assert.deepEqual(
+    model.actions.map((action) => action.mark),
+    ["●", "●", "⛔", "◐"],
+  )
+  assert.equal(model.hiddenActions, 0)
+  // The progress line still counts the WHOLE plan, so nothing is lost by filtering rows.
+  // v101:T25 edit: a fresh mirror now also carries the progress-line suffix (unit 35's
+  // sibling unit); this test predates T25, so the expectation is extended, not the model.
+  assert.equal(model.progress, "1/6 actions verified, 1 blocked · todo mirror fresh (5)")
+
+  // A stale mirror is still a mirror: the Todo section holds an older copy of these rows,
+  // so the panel keeps filtering rather than duplicating the list.
+  assert.deepEqual(
+    goalPanelModel(payload({ plan: { ...plan, mirror: mirror("stale") } })).actions.map((a) => a.title),
+    ["claimed done", "done, verdict fail", "waiting on review", "in flight"],
+  )
+
+  // Controls that must come out DIFFERENT: `off` is the plugin's own statement that it
+  // never touched the Todo list, and a non-object `mirror` is junk from another process.
+  // Both fall back to today's rendering — every action, in plan order.
+  for (const junk of [mirror("off"), "fresh", 3, null, undefined, ["fresh"]]) {
+    assert.deepEqual(
+      goalPanelModel(payload({ plan: { ...plan, mirror: junk } })).actions.map((a) => a.title),
+      actions.map((action) => action.title),
+      `mirror ${JSON.stringify(junk)} must render every action`,
+    )
+  }
+})
+
+test("a fully verified plan renders the progress line and no rows", () => {
+  const actions = Array.from({ length: 4 }, (_, index) => ({
+    id: `a${index}`,
+    title: `action ${index}`,
+    status: "done",
+    verdict: "pass",
+  }))
+  const plan = { total: 4, verified: 4, blocked: 0, mirror: mirror("fresh"), actions }
+
+  const model = goalPanelModel(payload({ plan }))
+  assert.deepEqual(model.actions, [])
+  // Zero rows must not resurrect the `+N more` line: there is nothing more to show.
+  assert.equal(model.hiddenActions, 0)
+  // v101:T25 edit: extended for the new fresh-mirror suffix (see the note above).
+  assert.equal(model.progress, "4/4 actions verified · todo mirror fresh (5)")
+
+  // The same plan with the mirror off is the control: it still renders all four rows.
+  const off = goalPanelModel(payload({ plan: { ...plan, mirror: mirror("off") } }))
+  assert.equal(off.actions.length, 4)
+  assert.equal(off.progress, "4/4 actions verified")
+})
+
+test("the exception list keeps plan order within each group and caps at MAX_PANEL_ACTIONS", () => {
+  // 24 actions, one of each status in turn: 6 pending, 6 done-unverified, 6 blocked,
+  // 6 in_progress. The exception list is 18 rows, which the cap trims to 12.
+  const shape = [
+    { status: "pending", verdict: null },
+    { status: "done", verdict: null },
+    { status: "blocked", verdict: null },
+    { status: "in_progress", verdict: null },
+  ]
+  const actions = Array.from({ length: 24 }, (_, index) => ({
+    id: `a${index}`,
+    title: `action ${index}`,
+    ...shape[index % shape.length],
+  }))
+  const model = goalPanelModel(
+    payload({ plan: { total: 24, verified: 0, blocked: 6, mirror: mirror("fresh"), actions } }),
+  )
+
+  assert.equal(model.actions.length, 12)
+  assert.deepEqual(
+    model.actions.map((action) => action.title),
+    [
+      // every done-unverified action, in plan order...
+      "action 1",
+      "action 5",
+      "action 9",
+      "action 13",
+      "action 17",
+      "action 21",
+      // ...then the blocked ones, also in plan order, until the cap bites.
+      "action 2",
+      "action 6",
+      "action 10",
+      "action 14",
+      "action 18",
+      "action 22",
+    ],
+  )
+  // 18 exceptions less the 12 shown. `plan.total` is 24, so counting against the plan
+  // rather than the filtered list would promise 12 rows that the panel would never show.
+  assert.equal(model.hiddenActions, 6)
+})
 // <<< v101:T24
 
 
 
 // >>> v101:T25 tests - the mirror suffix on the progress line
-// T25 units: 35.
+// T25 units: 35 ("mirror off renders every action, exactly as v2 did" — design §5.2 line 725;
+// the task brief's own gloss on this unit, "under \"off\" the model's action list, progress
+// line and every field equal the v2 rendering of the same plan", is what the assertions below
+// prove, but the design-assigned NAME is kept verbatim per CONTRACTS ("33-38 as listed in
+// design §5.2") since that string, not the brief's paraphrase, is the one other seats/anchors
+// can cite), plus "the progress line names a fresh mirror with the live count and a stale one
+// without it" (new for T25, not in design §5.2's numbered list).
+
+test("mirror off renders every action, exactly as v2 did", () => {
+  const actions = [
+    { id: "a1", title: "pending work", status: "pending", verdict: null },
+    { id: "a2", title: "in flight", status: "in_progress", verdict: null },
+    { id: "a3", title: "claimed done", status: "done", verdict: null },
+  ]
+  const planWithOff = { total: 3, verified: 1, blocked: 0, mirror: mirror("off"), actions }
+  const planNoMirrorKey = { total: 3, verified: 1, blocked: 0, actions } // v2: no `mirror` key at all
+
+  const withOff = goalPanelModel(payload({ plan: planWithOff }))
+  const v2 = goalPanelModel(payload({ plan: planNoMirrorKey }))
+  assert.deepEqual(withOff, v2)
+  assert.ok(!("mirror" in withOff), "an off mirror must not leak a `mirror` key onto the model")
+  assert.equal(withOff.actions.length, 3)
+  assert.equal(withOff.progress, "1/3 actions verified")
+
+  // A `liveTodoCount` is ignored outright while the mirror is off: still byte-equal to v2.
+  const withOffAndLive = goalPanelModel(payload({ plan: planWithOff }), { liveTodoCount: 99 })
+  assert.deepEqual(withOffAndLive, v2)
+})
+
+test("the progress line names a fresh mirror with the live count and a stale one without it", () => {
+  const plan = { total: 2, verified: 1, blocked: 0, mirror: mirror("fresh", { rows: 5 }), actions: [] }
+
+  // No live count supplied: the suffix falls back to the payload's own `mirror.rows`.
+  const noLive = goalPanelModel(payload({ plan }))
+  assert.equal(noLive.progress, "1/2 actions verified · todo mirror fresh (5)")
+  assert.deepEqual(noLive.mirror, { state: "fresh", rows: 5, extra: 0, liveTodoCount: null, drift: false })
+
+  // A finite live count that agrees with the payload names the live number instead — they
+  // happen to be equal here, which also proves this is not double-counting anything.
+  const liveAgrees = goalPanelModel(payload({ plan }), { liveTodoCount: 5 })
+  assert.equal(liveAgrees.progress, "1/2 actions verified · todo mirror fresh (5)")
+  assert.equal(liveAgrees.mirror.liveTodoCount, 5)
+  assert.equal(liveAgrees.mirror.drift, false)
+
+  // Stale carries NO count at all: the payload's row count is a snapshot the panel does not
+  // want to imply is still accurate once the mirror has gone stale.
+  const stalePlan = { ...plan, mirror: mirror("stale", { rows: 5 }) }
+  const stale = goalPanelModel(payload({ plan: stalePlan }))
+  assert.equal(stale.progress, "1/2 actions verified · todo list stale")
+  assert.deepEqual(stale.mirror, { state: "stale", rows: 5, extra: 0, liveTodoCount: null, drift: false })
+
+  // A live count that disagrees overrides BOTH the fresh and the stale suffix with drift —
+  // proved here from `goalPanelModel`'s side alone; T26 owns supplying the real live count.
+  const freshDrift = goalPanelModel(payload({ plan }), { liveTodoCount: 7 })
+  assert.equal(freshDrift.progress, "1/2 actions verified · mirror drift (7≠5)")
+  assert.equal(freshDrift.mirror.drift, true)
+
+  const staleDrift = goalPanelModel(payload({ plan: stalePlan }), { liveTodoCount: 7 })
+  assert.equal(staleDrift.progress, "1/2 actions verified · mirror drift (7≠5)")
+  assert.equal(staleDrift.mirror.drift, true)
+
+  // Non-finite live counts behave exactly like "no live count was supplied".
+  for (const junk of [undefined, NaN, "5", null]) {
+    const model = goalPanelModel(payload({ plan }), { liveTodoCount: junk })
+    assert.equal(model.progress, "1/2 actions verified · todo mirror fresh (5)", `liveTodoCount ${String(junk)}`)
+  }
+})
 // <<< v101:T25
 
 
 
 // >>> v101:T26 tests - the live drift check
-// T26 units: 37.
+// T26 units: 37, plus "a live count that matches the payload renders as fresh" and
+// "GoalPanel tolerates a host without a todo state reader" (the latter two are new for T26 and
+// are not in design 5.2's numbered list). Unit 37's NAME is design 5.2's verbatim string, per
+// CONTRACTS ("33-38 as listed in design 5.2"); the brief's paraphrase of what it has to prove -
+// `goalPanelModel(payloadWithRows5, { liveTodoCount: 7 })` renders `mirror drift (7 vs 5)` and
+// NOT "fresh" - is asserted inside it.
+//
+// These drive the WHOLE panel, not just `goalPanelModel`. T25 already proved the model half from
+// an argument someone else supplied; what is unproven until here is that `GoalPanel` goes and
+// GETS that argument off the host, and that it survives a host that cannot answer.
+
+// Find the progress line by its content rather than by row index, so an extra line elsewhere in
+// the panel (a note, a sequence line) cannot silently re-point these assertions at another row.
+function panelProgress(runtime, node) {
+  return renderLines(runtime, node)
+    .map((entry) => entry.text)
+    .find((text) => text.includes("actions verified"))
+}
+
+function todoRows(count) {
+  return Array.from({ length: count }, (_, index) => ({ content: `row ${index}`, status: "pending" }))
+}
+
+// Mount the real `GoalPanel` over one session whose plan carries a mirror of 5 rows, with `todo`
+// installed on the fake host at exactly the place the real adapter puts it
+// (packages/tui/src/plugin/adapters.tsx:131 `todo`). Passing `undefined` installs NOTHING, which
+// is what a host older than that surface looks like from inside the panel.
+async function mountMirrorPanel(todo, planOverrides = {}) {
+  const runtime = fakeRuntime()
+  const { tui } = createGoalSidebar(runtime)
+  const plan = {
+    total: 2,
+    verified: 1,
+    blocked: 0,
+    mirror: mirror("fresh", { rows: 5 }),
+    actions: [],
+    ...planOverrides,
+  }
+  const sessions = new Map([["ses_mirror", { id: "ses_mirror", metadata: { goal: payload({ plan }) } }]])
+  const { api, registrations } = fakeApi(sessions)
+  if (todo !== undefined) api.state.session.todo = todo
+  await tui(api, {}, { spec: "opencode-goal-pro-max-complete-plugin" })
+  const render = (sessionID = "ses_mirror") =>
+    panelProgress(runtime, registrations[0].slots.sidebar_content({}, { session_id: sessionID }))
+  return { render, api }
+}
+
+test("a live todo count that disagrees with the payload renders as drift, not agreement", async () => {
+  // The model half, in the brief's exact shape: 5 rows in the payload, 7 live.
+  const payloadWithRows5 = payload({
+    plan: { total: 2, verified: 1, blocked: 0, mirror: mirror("fresh", { rows: 5 }), actions: [] },
+  })
+  const drifted = goalPanelModel(payloadWithRows5, { liveTodoCount: 7 })
+  assert.equal(drifted.progress, "1/2 actions verified · mirror drift (7≠5)")
+  assert.ok(!drifted.progress.includes("fresh"), "drift REPLACES the fresh suffix, it never sits beside it")
+  assert.equal(drifted.mirror.drift, true)
+  assert.equal(drifted.mirror.liveTodoCount, 7)
+
+  // The panel half: same numbers, but nobody hands `GoalPanel` the 7 - it has to read it off the
+  // host. This is the assertion the model-level test above cannot make.
+  const seven = await mountMirrorPanel(() => todoRows(7))
+  assert.equal(seven.render(), "1/2 actions verified · mirror drift (7≠5)")
+
+  // The control that must come out DIFFERENT: identical panel, identical payload, a host whose
+  // list agrees. A `GoalPanel` that ignored the host and echoed `mirror.rows` would read "fresh"
+  // for both, so this pair is what makes the drift claim falsifiable.
+  const five = await mountMirrorPanel(() => todoRows(5))
+  assert.equal(five.render(), "1/2 actions verified · todo mirror fresh (5)")
+
+  // An EMPTY host list is a live count of 0, not "no live count": the case a truthiness guard
+  // would silently swallow, and the one that matters most (the user cleared their Todo list).
+  const calls = []
+  const empty = await mountMirrorPanel((sessionID) => {
+    calls.push(sessionID)
+    return []
+  })
+  assert.equal(empty.render(), "1/2 actions verified · mirror drift (0≠5)")
+  // The panel asks about ITS OWN session, never some other one.
+  assert.ok(calls.length > 0, "the panel must actually call the host's todo reader")
+  assert.deepEqual([...new Set(calls)], ["ses_mirror"])
+
+  // Drift overrides a STALE mirror too, and keeps the drift wording rather than "todo list stale".
+  const staleDrift = await mountMirrorPanel(() => todoRows(7), { mirror: mirror("stale", { rows: 5 }) })
+  assert.equal(staleDrift.render(), "1/2 actions verified · mirror drift (7≠5)")
+})
+
+test("a live count that matches the payload renders as fresh", async () => {
+  // Agreement renders the SAME bytes as "no live count at all", so the rendered string alone
+  // cannot tell the two apart - a panel that never asked the host would pass on it. The spy is
+  // what gives this test polarity: the count on screen has to have been READ, not assumed.
+  const asked = []
+  const fresh = await mountMirrorPanel((sessionID) => {
+    asked.push(sessionID)
+    return todoRows(5)
+  })
+  assert.equal(fresh.render(), "1/2 actions verified · todo mirror fresh (5)")
+  assert.ok(asked.length > 0, "the fresh count must come from the host, not from the payload")
+  assert.deepEqual([...new Set(asked)], ["ses_mirror"])
+
+  // A stale mirror whose live count agrees is still stale: agreement on the COUNT is not
+  // freshness, and the panel must not upgrade the server's own verdict.
+  const stale = await mountMirrorPanel(() => todoRows(5), { mirror: mirror("stale", { rows: 5 }) })
+  assert.equal(stale.render(), "1/2 actions verified · todo list stale")
+
+  // With the mirror `off` the live count is not consulted for anything, even when it disagrees
+  // loudly: the plugin never touched the Todo list, so it has no claim to make about it.
+  const off = await mountMirrorPanel(() => todoRows(9), { mirror: mirror("off", { rows: 5 }) })
+  assert.equal(off.render(), "1/2 actions verified")
+
+  // A v2 payload has no `mirror` key at all; a live count must not conjure a suffix onto it.
+  const v2 = await mountMirrorPanel(() => todoRows(9), { mirror: undefined })
+  assert.equal(v2.render(), "1/2 actions verified")
+})
+
+test("GoalPanel tolerates a host without a todo state reader", async () => {
+  // With no live count the suffix falls back to the payload's own row count.
+  const fallback = "1/2 actions verified · todo mirror fresh (5)"
+
+  // No reader at all. `fakeApi` publishes only `state.session.get`, which is exactly the shape of
+  // a host that predates the todo surface - and of every other panel test in this file.
+  const bare = await mountMirrorPanel(undefined)
+  assert.equal(bare.api.state.session.todo, undefined, "this case is only meaningful with no reader present")
+  assert.equal(bare.render(), fallback)
+
+  // A reader that throws must not take the sidebar down with it; the panel renders without the
+  // live count rather than not rendering.
+  const thrower = await mountMirrorPanel(() => {
+    throw new Error("host refused")
+  })
+  assert.equal(thrower.render(), fallback)
+
+  // Anything that is not an array is not a row count, however number-ish or length-ish it looks.
+  for (const junk of [undefined, null, 7, "12345", { length: 7 }, new Set([1, 2, 3]), NaN]) {
+    const odd = await mountMirrorPanel(() => junk)
+    assert.equal(odd.render(), fallback, `todo() -> ${String(junk)} must not produce a live count`)
+  }
+
+  // A `todo` that is not callable is never called. Swapping it on a MOUNTED panel also proves the
+  // read is live: the same element tree answers differently after the host object changed.
+  const swapped = await mountMirrorPanel(() => todoRows(7))
+  assert.equal(swapped.render(), "1/2 actions verified · mirror drift (7≠5)")
+  for (const notCallable of ["nope", 42, null, {}, [], undefined]) {
+    swapped.api.state.session.todo = notCallable
+    assert.equal(swapped.render(), fallback, `a ${String(notCallable)} todo must not be called`)
+  }
+  swapped.api.state.session.todo = () => todoRows(7)
+  assert.equal(swapped.render(), "1/2 actions verified · mirror drift (7≠5)", "and back again")
+
+  // No session id: the panel is hidden outright, and the reader is not consulted for a session
+  // the panel does not have.
+  const unasked = []
+  const nameless = await mountMirrorPanel((sessionID) => {
+    unasked.push(sessionID)
+    return todoRows(7)
+  })
+  assert.equal(nameless.render(""), undefined, "an empty session id renders no panel at all")
+  assert.deepEqual(unasked, [])
+})
 // <<< v101:T26
 
 
