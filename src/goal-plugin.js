@@ -207,6 +207,9 @@ function createRuntimeState() {
     // The terminal render for a goal's mirrored todo rows after the goal
     // record itself is gone (stop/clear/completion): sessionID -> { rows, at }.
     mirrorTerminals: new Map(),
+    // v1.0.1 T38: a one-shot <existing_todos> offer queued at /goal set,
+    // drained into the goal's FIRST continuation only: sessionID -> row[].
+    existingTodoOffers: new Map(),
     pendingCommandTurns: new Map(),
     activeCommandTurns: new Map(),
     commandOutputs: new WeakMap(),
@@ -5634,6 +5637,71 @@ function dropMirrorTerminal(sessionID) {
 
 
 
+// v1.0.1 T38: the <existing_todos> offer queue (design §4.3(c), CONTRACTS
+// T38). `/goal set` stores a session's pre-existing native todo rows here —
+// read-only, best-effort, never adopted into the plan — and
+// buildContinueMessage's caller (below) drains the entry into the goal's
+// FIRST continuation only, deleting it immediately so later continuations
+// are unaffected. Modelled on mirrorTerminals (T9) above, but delivered
+// once rather than kept as a lifecycle snapshot.
+const existingTodoOffers = runtimeCollection("existingTodoOffers")
+
+/**
+ * Best-effort read of the session's existing native todo list at the moment
+ * a goal is set (`sessionApi.todo`, GET /session/{id}/todo), queued for the
+ * <existing_todos> offer. Any throw, a missing/unavailable
+ * `client.session.todo`, or a non-array result is logged and skipped — this
+ * must never block /goal set. Nothing here touches `goal.mirror.extra` or
+ * `goal.plan.actions`: the rows are offered, never adopted.
+ */
+async function captureExistingTodosOffer(client, sessionApi, sessionID) {
+  // Clear any prior goal's undelivered offer first: a goal that ended before
+  // ever producing a continuation must not leak its queued rows into the
+  // NEXT goal set in this session.
+  existingTodoOffers.delete(sessionID)
+  let rows
+  try {
+    rows = await sessionApi.todo(sessionID)
+  } catch (error) {
+    await logPluginWarning(
+      client,
+      `goal set: reading the session's existing todo list for the <existing_todos> offer failed (${error?.message || error}); skipped.`,
+    )
+    return
+  }
+  if (!Array.isArray(rows)) {
+    await logPluginWarning(
+      client,
+      "goal set: the session's existing todo list did not return an array; skipped the <existing_todos> offer.",
+    )
+    return
+  }
+  if (rows.length === 0) return
+  existingTodoOffers.set(sessionID, rows.map((row) => mirrorRow(row)))
+}
+
+/**
+ * Renders and drains one session's queued <existing_todos> offer (CONTRACTS
+ * T38 strings), appending it to `continuationText` when present. The entry
+ * is deleted on this first read so only the goal's FIRST continuation
+ * carries it; `continuationText` is returned unchanged when nothing is
+ * queued.
+ */
+function withExistingTodosOffer(continuationText, sessionID) {
+  const rows = existingTodoOffers.get(sessionID)
+  if (!rows) return continuationText
+  existingTodoOffers.delete(sessionID)
+  const block = [
+    "<existing_todos>",
+    `This session already has ${rows.length} native todo items. They are NOT the plan. Either record them as the plan with goal_plan_set (rewriting each as a falsifiable claim about the end state), or ignore them — the first todowrite after a plan exists redraws the list from the plan and keeps yours below it.`,
+    ...rows.map((row) => `- ${row.content} (${row.status})`),
+    "</existing_todos>",
+  ].join("\n")
+  return `${continuationText}\n\n${block}`
+}
+
+
+
 // >>> v101:T14 mirror staleness, the mirror state, and the nudge budget
 /**
  * `mirrorIsFresh(goal)` -> boolean: `goal.mirror.at > 0 &&
@@ -7526,6 +7594,10 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       // v1.0.1 T6: a new goal record always starts with a clean mirror (X6) —
       // extras from a prior goal never leak into this one.
       resetMirrorForNewGoal(goal)
+      // v1.0.1 T38: best-effort offer of the session's pre-existing native
+      // todo rows in the goal's first continuation (design §4.3(c)). Never
+      // adopts anything and never blocks /goal set on failure.
+      await captureExistingTodosOffer(client, sessionApi, sessionID)
 
       pushHistory(
         goal,
@@ -8411,7 +8483,13 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
                 ...continuationContextInput(claimedGoal),
                 parts: [
                   makeContinuationPart(
-                    buildContinueMessage(claimedGoal, { budgetWrapup: true, mirrorMode }),
+                    // v1.0.1 T38: drain any queued <existing_todos> offer
+                    // into the FIRST continuation actually sent (design
+                    // §4.3(c)); a no-op when nothing is queued.
+                    withExistingTodosOffer(
+                      buildContinueMessage(claimedGoal, { budgetWrapup: true, mirrorMode }),
+                      sessionID,
+                    ),
                     continueToken,
                   ),
                 ],
@@ -8709,13 +8787,19 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
             ...continuationContextInput(activeGoalBeforePrompt),
             parts: [
               makeContinuationPart(
-                buildContinueMessage(activeGoalBeforePrompt, {
-                  budgetWrapup,
-                  completionUnverified,
-                  blockerUnstated,
-                  completionRejection,
-                  mirrorMode,
-                }),
+                // v1.0.1 T38: drain any queued <existing_todos> offer into
+                // the FIRST continuation actually sent (design §4.3(c)); a
+                // no-op when nothing is queued.
+                withExistingTodosOffer(
+                  buildContinueMessage(activeGoalBeforePrompt, {
+                    budgetWrapup,
+                    completionUnverified,
+                    blockerUnstated,
+                    completionRejection,
+                    mirrorMode,
+                  }),
+                  sessionID,
+                ),
                 continueToken,
               ),
             ],

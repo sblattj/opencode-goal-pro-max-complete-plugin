@@ -399,6 +399,9 @@ async function createHooks(overrides = {}) {
       // Only wired when a test asks for it, so every other test still proves
       // the plugin works against a host that offers neither.
       ...(overrides.sessionGet ? { get: overrides.sessionGet } : {}),
+      // v1.0.1 T38: GET /session/{id}/todo, for the <existing_todos> offer.
+      // Only wired when a test asks for it, matching sessionGet above.
+      ...(overrides.todo ? { todo: overrides.todo } : {}),
     },
     ...(overrides.config ? { config: overrides.config } : {}),
   }
@@ -14782,6 +14785,76 @@ test("mirroring the plan once produces no continuation nudge; a plan edit adds e
 
 // >>> v101:T38 tests - the <existing_todos> offer on /goal set
 // T38 units: 29.
+test("setting a goal in a session with existing todos offers them to the model without adopting them", async () => {
+  let sourceTurn = 0
+  const nativeTodos = [
+    { id: "todo-1", content: "write the launch checklist", status: "pending", priority: "medium" },
+    { id: "todo-2", content: "notify the on-call rotation", status: "in_progress", priority: "high" },
+  ]
+  const { calls, hooks } = await createHooks({
+    todo: async () => nativeTodos,
+    messages: async () => ({
+      data: [message("working on it", undefined, `msg-t38-existing-todos-${sourceTurn}`)],
+    }),
+    onPromptAsync: () => {
+      sourceTurn += 1
+    },
+    options: { minDelayMs: 1 },
+  })
+  const sessionID = "t38-existing-todos"
+
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID, arguments: "ship the release" },
+    { parts: [] },
+  )
+
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID, status: { type: "idle" } } },
+  })
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID, status: { type: "idle" } } },
+  })
+
+  assert.equal(calls.length, 2, "two continuations must have been sent")
+  const firstText = calls[0].body?.parts?.[0]?.text ?? calls[0].parts?.[0]?.text
+  const secondText = calls[1].body?.parts?.[0]?.text ?? calls[1].parts?.[0]?.text
+
+  assert.match(firstText, /<existing_todos>/)
+  assert.match(firstText, /They are NOT the plan/)
+  assert.match(firstText, /- write the launch checklist \(pending\)/)
+  assert.match(firstText, /- notify the on-call rotation \(in_progress\)/)
+  assert.match(firstText, /<\/existing_todos>/)
+
+  assert.doesNotMatch(secondText, /<existing_todos>/)
+  assert.doesNotMatch(secondText, /They are NOT the plan/)
+
+  const goal = currentGoal(sessionID)
+  assert.equal(goal.plan.actions.length, 0, "no todo is ever adopted into the plan")
+  assert.equal(goal.mirror.extra.length, 0, "the offer never touches goal.mirror.extra")
+})
+
+test("a failing todo read never blocks /goal set", async () => {
+  const { hooks, logs } = await createHooks({
+    todo: async () => {
+      throw new Error("todo route unavailable")
+    },
+  })
+  const sessionID = "t38-existing-todos-failure"
+
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID, arguments: "ship the release" },
+    { parts: [] },
+  )
+
+  const goal = currentGoal(sessionID)
+  assert.ok(goal, "the goal must still be set despite the failing todo read")
+  assert.equal(goal.condition, "ship the release")
+  assert.equal(goal.mirror.extra.length, 0)
+  assert.ok(
+    logs.some((entry) => /existing todo list/.test(entry?.body?.message || "")),
+    "the failure must be logged",
+  )
+})
 // <<< v101:T38
 
 
