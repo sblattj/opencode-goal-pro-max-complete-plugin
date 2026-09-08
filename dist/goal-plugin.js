@@ -15596,7 +15596,8 @@ function buildSidebarMetadata(goal, now = Date.now(), context = {}) {
         id: action.id,
         title: summarizeText(action.title, 120),
         status: action.status,
-        verdict: action.verdict
+        verdict: action.verdict,
+        verified: planActionVerified(action)
       }))
     },
     successCriteria: bounded(goal.successCriteria),
@@ -19957,7 +19958,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       }
       if (!goal || goal.stopped || goal.plan.actions.length === 0)
         return;
-      const { extra, dropped } = pickExtras(output.args.todos, goal);
+      const { extra, dropped } = Array.isArray(output.args.todos) ? pickExtras(output.args.todos, goal) : { extra: goal.mirror.extra, dropped: 0 };
       goal.mirror.extra = extra;
       goal.mirror.lastDropped = dropped;
       const rows = projectPlanToTodos(goal.plan, extra);
