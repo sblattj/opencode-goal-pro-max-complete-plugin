@@ -118,8 +118,15 @@ They are documented rather than worked around, and `mirrorTodos: "off"` removes 
 1. **The suffixed `todowrite` description reaches sessions that have no goal.** The
    `tool.definition` hook carries no session id, and OpenCode caches one plugin instance per project
    directory, so the suffix is served to every session in the same project — ordinary `build`
-   sessions and custom subagents included. There is no blanket "subagents cannot `todowrite`" rule:
-   only the `general` and `explore` agents deny the tool, and everything else inherits allow. The
+   sessions and custom subagents included. Primary sessions (`build`, `plan`) inherit `"*": "allow"`
+   and can act on the suffix; **subagents are the opposite**. Every subagent spawned through the
+   `task` tool gets `todowrite` denied by default — the host appends a `todowrite` `*` deny to the
+   child session unless the subagent's own ruleset already names `todowrite`
+   (`packages/opencode/src/agent/subagent-permissions.ts`, `deriveSubagentSessionPermission`, applied
+   twice on the spawn path in `packages/opencode/src/tool/task.ts`). Agent *definitions* are the
+   softer story — only `general` and `explore` deny the tool there — but it is the child *session's*
+   ruleset that decides, so the suffix reaches sessions that can act on it and sessions that cannot.
+   (Measured against OpenCode 1.18.29.) The
    suffix is deliberately *static*, so it never flips mid-conversation and never invalidates a
    cached prompt prefix, and it is *self-checking*: it ends by telling the model that with no
    `<goal_plan>` block the tool behaves normally, which is true — in a session that has never held a
@@ -130,9 +137,10 @@ They are documented rather than worked around, and `mirrorTodos: "off"` removes 
    `/goal resume`), which bounds the prompts it asks for by name; the plan block's standing
    instruction to call `todowrite({todos: []})` when the list drifts is not budgeted, so a model
    that follows it eagerly can ask more often. `mirrorTodos: "off"` removes both.
-3. **On hosts where `todowrite` is denied, the mirror never becomes fresh.** The `general` and
-   `explore` agents deny the tool outright, so the before-hook never gets to mirror anything and no
-   write ever lands. The mirror then reads `stale` for the whole run rather than `off`, which has
+3. **On hosts where `todowrite` is denied, the mirror never becomes fresh.** `general` denies the
+   tool outright, `explore` denies everything but a read-only allow-list, and every `task`-spawned
+   subagent inherits a default deny (hazard 1), so the before-hook never gets to mirror anything and
+   no write ever lands. The mirror then reads `stale` for the whole run rather than `off`, which has
    two visible consequences: the Goal panel's progress line carries ` · todo list stale`, and the
    panel still shows the **exception list**, so `pending` actions appear only in `/goal status`. The
    nudge self-suppresses once its budget is spent. **No configuration introspection is performed** —
