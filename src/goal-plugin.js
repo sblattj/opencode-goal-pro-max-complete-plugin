@@ -5345,6 +5345,12 @@ const MIRROR_MAX_NUDGES = 3          // per goal-run total; refunded only by /go
 const MIRROR_ID_SEPARATOR = " · "    // between the action id and the title in a mirrored row
 const MIRROR_TOOL_NAMES = new Set(["todowrite"])
 const MIRROR_MODES = new Set(["plan", "off"])
+// T22's static todowrite description suffix (CONTRACTS "todowrite description
+// suffix (T22)"). Module scope because the `tool.definition` hook has no
+// sessionID and must emit byte-identical text across every call (X4/F23); the
+// hook body lives in the v101:T22 region below.
+const TODOWRITE_MIRROR_DESCRIPTION =
+  "GOAL PLUGIN: if a <goal_plan> block is present in your context, this session's todo list is drawn from that plan — plan actions are written here for you, and items of your own are kept below them. Use goal_plan_set / goal_action_update to change the work, and follow the refresh instruction in that block when it asks for one. With no <goal_plan> block, this tool behaves normally."
 // <<< v101:CONST
 
 
@@ -7121,7 +7127,14 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
     },
     "tool.definition": async (input, output) => {
       // >>> v101:T22 todowrite description suffix (X4)
-      // Reserved. T22 fills this (todowrite only, skipped when the mode is off, never gated on goal state).
+      // Static text only: the hook carries no sessionID and this plugin instance is
+      // cached per directory, so every session in the project shares one description
+      // (design §4.4(E), F23). Never gate this on goal state (F23's whole point is
+      // that a goal starting/stopping in a sibling session must not flip this text).
+      if (input?.toolID !== "todowrite") return
+      if (mirrorMode === "off") return
+      if (!output || typeof output.description !== "string") return
+      output.description = `${output.description}\n\n${TODOWRITE_MIRROR_DESCRIPTION}`
       // <<< v101:T22
 
 
