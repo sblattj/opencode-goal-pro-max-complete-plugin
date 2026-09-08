@@ -3104,7 +3104,14 @@ function buildCompactionProgressSummary(goal, { maxCheckpoints = 3, maxEvents = 
   return lines
 }
 
-function buildCompactionContext(goal) {
+// The todo mirror's compaction-stale line (CONTRACTS Strings, T20), exact bytes; the em dash is
+// U+2014. Added to buildCompactionContext ONLY while mirrorState(goal, mirrorMode) === "stale":
+// there is no todoread, so after a compaction the model cannot rediscover that the Todo panel no
+// longer matches the plan on its own (design §4.3(e)).
+const MIRROR_COMPACTION_STALE_LINE =
+  "The session's Todo list is stale — it shows an older copy of the plan; one todowrite({todos: []}) refreshes it."
+
+function buildCompactionContext(goal, { mirrorMode } = {}) {
   // Preserve the active goal across an OpenCode session compaction. Without
   // this, a compaction can drop the goal objective and budget state from the
   // working context, so the assistant loses the thread mid-run even though the
@@ -3129,6 +3136,7 @@ function buildCompactionContext(goal) {
     ...(formatPlanForPrompt(goal.plan)
       ? ["<goal_plan>", formatPlanForPrompt(goal.plan), `progress: ${planStatusLabel(goal.plan)}`, "</goal_plan>"]
       : []),
+    mirrorState(goal, mirrorMode) === "stale" ? MIRROR_COMPACTION_STALE_LINE : null,
     "After compaction, continue from the next concrete unfinished step while the goal is active. Verify the result against the goal objective before ending; output [goal:complete] (preceded by a [goal:evidence] line) only when fully satisfied, or [goal:blocked] (preceded by a concrete blocker) only if user input is required.",
   ]
     .filter(Boolean)
@@ -8978,7 +8986,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       if (currentRuntime().disposed || loadResult.kind !== "active") return
       const goal = goalStates.get(input.sessionID)
       if (!goal) return
-      const context = buildCompactionContext(goal)
+      const context = buildCompactionContext(goal, { mirrorMode })
       if (Array.isArray(output.context)) {
         output.context.push(context)
       } else {
