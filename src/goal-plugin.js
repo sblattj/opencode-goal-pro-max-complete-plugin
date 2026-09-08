@@ -864,6 +864,14 @@ function buildSidebarMetadata(goal, now = Date.now(), context = {}) {
         title: summarizeText(action.title, 120),
         status: action.status,
         verdict: action.verdict,
+        // v3: the server's OWN answer to "is this action verified?". The panel
+        // cannot re-derive it: the full gate reads `claim` and `evidence`, and
+        // neither is published (they are goal-private prose, often long). A
+        // consumer that infers verification from `status` + `verdict` alone
+        // silently passes a `done` action recorded with a passing verdict but no
+        // ledger — which `goal_plan_set` accepts, because only
+        // `goal_action_update` enforces the gate.
+        verified: planActionVerified(action),
       })),
     },
     successCriteria: bounded(goal.successCriteria),

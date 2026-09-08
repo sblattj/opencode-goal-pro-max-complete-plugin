@@ -828,6 +828,33 @@ const mutants = [
     test: "test/goal-sidebar-panel.test.js",
   },
   {
+    name: "the payload publishes the server's own CEV verdict, not a re-derivation",
+    file: "src/goal-plugin.js",
+    // The v1.0.1 review finding, in one mutant. The panel cannot re-derive
+    // verification: the payload carries no claim and no evidence, and
+    // `goal_plan_set` accepts a `done` action with a passing verdict and neither.
+    // Replacing the call with the derivation a consumer WOULD reach for turns
+    // that action green and drops it from the exception list, while the server's
+    // own progress count and mirrored todo row still call it unverified. Killed
+    // by "a done action with a passing verdict but no ledger is an exception on
+    // the panel, as it is on the wire".
+    from: "verified: planActionVerified(action),",
+    to: 'verified: action.status === "done" && action.verdict === "pass",',
+    test: "test/goal-sidebar-panel.test.js",
+  },
+  {
+    name: "the panel trusts the published verdict over its own derivation",
+    file: "src/goal-sidebar-view.js",
+    // The other half of the same property: publishing the boolean is useless if
+    // the panel keeps re-deriving it. With this mutant the wire is correct and
+    // the panel still hides an unsubstantiated completion. The mutant keeps the
+    // v2 fallback intact, so it is the PREFERENCE that is under test, not the
+    // fallback.
+    from: 'typeof raw.verified === "boolean" ? raw.verified : verdict === "pass"',
+    to: 'verdict === "pass"',
+    test: "test/goal-sidebar-panel.test.js",
+  },
+  {
     name: "nothing is exempt from the tool-free strike when mirroring is off",
     file: "src/goal-plugin.js",
     // T15's `exempt` parameter, caller half. Exempting todowrite unconditionally
