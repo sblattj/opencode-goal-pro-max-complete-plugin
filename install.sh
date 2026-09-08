@@ -10,7 +10,12 @@
 #
 #   sh install.sh status
 #
-# Set GOAL_PLUGIN_REF to install a specific tag or branch (default: main).
+# `install` is supplied only when the first argument is not already a
+# subcommand, so a bare `sh install.sh` still installs.
+#
+# Set GOAL_PLUGIN_REF to a tag or a BRANCH (default: main) to install a specific
+# one. A commit SHA does not work: the clone fallback uses `git clone --branch`,
+# which does not accept one.
 #
 # Exit codes are the CLI's own (0 ok, 1 failed, 2 usage, 3 refused), except 2
 # from this script when neither npx nor git+node is available.
@@ -20,11 +25,19 @@ OWNER_REPO="sblattj/opencode-goal-pro-max-complete-plugin"
 REPO_URL="https://github.com/${OWNER_REPO}.git"
 REF="${GOAL_PLUGIN_REF:-}"
 
+# Default to `install` only when the caller did not name a subcommand, so
+# `sh install.sh status` reaches `status` instead of becoming `install status`,
+# which the CLI rejects with exit 2.
+case "${1:-}" in
+  install|uninstall|status|verify|help) ;;
+  *) set -- install "$@" ;;
+esac
+
 if command -v npx >/dev/null 2>&1; then
   if [ -n "$REF" ]; then
-    exec npx -y "github:${OWNER_REPO}#${REF}" install "$@"
+    exec npx -y "github:${OWNER_REPO}#${REF}" "$@"
   fi
-  exec npx -y "github:${OWNER_REPO}" install "$@"
+  exec npx -y "github:${OWNER_REPO}" "$@"
 fi
 
 if command -v git >/dev/null 2>&1 && command -v node >/dev/null 2>&1; then
@@ -36,7 +49,7 @@ if command -v git >/dev/null 2>&1 && command -v node >/dev/null 2>&1; then
   else
     git clone --quiet --depth 1 "$REPO_URL" "$workdir/package"
   fi
-  node "$workdir/package/scripts/cli.mjs" install "$@"
+  node "$workdir/package/scripts/cli.mjs" "$@"
   exit $?
 fi
 

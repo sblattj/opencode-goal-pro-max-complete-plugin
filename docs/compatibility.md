@@ -86,11 +86,13 @@ remains registered as additional protection for hosts that support it.
 
 **Status: not supported, and not yet tested.**
 
-The package declares `engines.opencode` and the `@opencode-ai/plugin` peer as
-`>=1.17.15 <2`. That bound is deliberate: no claim in this repository is made
-without a verified run behind it, and the project has not yet exercised the
-plugin against an OpenCode 2 build. Treat OpenCode 2 as unverified rather than
-as known-broken.
+The package declares `engines.opencode` as `>=1.17.15 <2`. There is no
+`peerDependencies` entry: the host supplies the plugin API, so a peer range
+would only add an install-time warning about something OpenCode already
+controls. That bound is deliberate: no claim in this repository is made without
+a verified run behind it, and the project has not yet exercised the plugin
+against an OpenCode 2 build. Treat OpenCode 2 as unverified rather than as
+known-broken.
 
 ### What already exists in this direction
 

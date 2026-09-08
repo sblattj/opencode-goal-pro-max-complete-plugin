@@ -146,7 +146,7 @@ The **full text** is injected into every continuation turn. For the compact surf
 The plugin stops when it sees one of these at the end of an assistant response:
 
 ```
-[goal:evidence] ran npm test (508 passing), verified the build output
+[goal:evidence] ran npm test (555 passing), verified the build output
 [goal:complete]
 ```
 
@@ -457,17 +457,17 @@ If a goal does not continue:
 3. If a goal control reports that another process owns the session, close that owner and retry, or fork. If it reports an older, incomplete, tampered, or unsupported lease, close and upgrade every process that could own the session first; if it persists, remove only the affected shard's adjacent `.lock` file or legacy directory **and** its `.lock.claims-v2` directory. Keep the state and ledger. Never point two copies of one session at different state paths — that creates divergent histories.
 4. Check OpenCode's structured logs for persistence, SDK-shape, prompt, or auditor errors.
 5. Confirm the project directory and the state-path precedence above. A daemon started elsewhere makes a relative path surprising.
-6. From an install, run the shipped verifier — `npx opencode-goal-pro-max-complete-plugin`, which is `npm run verify` — when diagnosing registration problems. The packaging contracts (`npm run smoke`, `npm run smoke:packed-host`, and the rest of the ladder) live in a git checkout only: `package.json` `files` ships `scripts/verify.mjs` and nothing else from `scripts/`, so running them inside `node_modules` fails with `MODULE_NOT_FOUND`.
+6. From an install, run the shipped verifier — `npx opencode-goal-pro-max-complete-plugin verify`, or `npx -y github:sblattj/opencode-goal-pro-max-complete-plugin verify` without one; both delegate to the `npm run verify` script (`scripts/verify.mjs`). A bare invocation with no subcommand prints the usage and exits 0. Use it when diagnosing registration problems. The packaging contracts (`npm run smoke`, `npm run smoke:packed-host`, and the rest of the ladder) live in a git checkout only: `package.json` `files` ships `scripts/verify.mjs` and nothing else from `scripts/`, so running them inside `node_modules` fails with `MODULE_NOT_FOUND`.
 
 Do not paste `state.json`, its ledger, or verbose logs into a public issue without reviewing them: they can contain goal text, assistant checkpoints, blockers, local paths, and command evidence. Prefer the bounded status/history output. There is intentionally no broad "dump diagnostics" tool — exposing process-wide session state or persistence paths to the model would add more privacy risk than troubleshooting value.
 
 ## Development
 
 ```sh
-npm test                     # 544 unit tests
+npm test                     # 555 unit tests
 npm run test:coverage        # tests with coverage
 npm run type:check           # compile installed-package consumers (NodeNext + Bundler)
-npm run test:mutation        # 81 critical mutants must all be killed (~2.3 min)
+npm run test:mutation        # 83 critical mutants must all be killed (~2.3 min)
 npm run benchmark:behavior   # 6 deterministic autonomy scenarios, no provider call
 npm run smoke                # package export + command hook, no model call
 npm run smoke:packed-host    # install the packed tarball, exercise the host contract

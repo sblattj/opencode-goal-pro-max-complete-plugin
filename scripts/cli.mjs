@@ -63,6 +63,16 @@ function parseArgs(argv) {
       const [name, inline] = arg.includes("=") ? [arg.slice(0, arg.indexOf("=")), arg.slice(arg.indexOf("=") + 1)] : [arg, null]
       const value = inline ?? rest.shift()
       if (!value) return { ...options, error: `${name} needs a directory` }
+      // `install --data-dir --dry-run` used to install for real into a directory
+      // named "--dry-run". A value that looks like a flag is a typo, not a path;
+      // the `=` form stays literal for the one person who really has such a
+      // directory.
+      if (inline === null && value.startsWith("-")) {
+        return {
+          ...options,
+          error: `${name} needs a directory, but the next argument is ${value}; write ${name}=${value} if that really is one`,
+        }
+      }
       if (name === "--config-dir") options.configDir = value
       if (name === "--data-dir") options.dataDir = value
       continue

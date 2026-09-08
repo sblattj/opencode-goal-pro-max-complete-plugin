@@ -637,6 +637,28 @@ const mutants = [
     test: "test/install.test.js",
   },
   {
+    // A trailing comma is legal input (every global config file is read with
+    // ConfigParse.jsonc), and it is a real byte in the text `applyEdits`
+    // rewrites. Scanning the trailing-comma-BLANKED text made the last element
+    // of such an array look unseparated, merged its deletion with the one
+    // before it, and left an orphan `, ,` — a config OpenCode can no longer
+    // parse, written by a command that exited 0.
+    name: "the plugin-array editor sees a trailing comma as a real separator",
+    file: "scripts/install.mjs",
+    from: '    const forward = skipWhitespace(scan, end)\n    if (scan[forward] === ",") {',
+    to: '    const forward = skipWhitespace(blankTrailingCommas(scan), end)\n    if (blankTrailingCommas(scan)[forward] === ",") {',
+    test: "test/install.test.js",
+  },
+  {
+    // The guard that makes an editor bug a refusal rather than a bricked
+    // config: the rewrite must hold exactly the survivors plus the addition.
+    name: "a rewrite is checked against the entries it was supposed to produce",
+    file: "scripts/install.mjs",
+    from: "  if (JSON.stringify(got) !== JSON.stringify(expected)) {",
+    to: "  if (false) {",
+    test: "test/install.test.js",
+  },
+  {
     name: "the terminal render carries the learned context ceiling",
     file: "src/goal-plugin.js",
     from: "    modelContextTokens: goal.modelContextTokens,\n    modelKey: goal.modelKey,\n",
