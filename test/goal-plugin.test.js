@@ -120,6 +120,8 @@ const {
   snapshotMirror,
   readMirrorTerminal,
   dropMirrorTerminal,
+  // v1.0.1 T13
+  MIRROR_MAX_EXTRAS,
 } = testInternals
 
 function sessionStatePath(stateFilePath, sessionID) {
@@ -13610,7 +13612,158 @@ test("the after-hook ignores tools other than todowrite", async () => {
 
 
 // >>> v101:T13 tests - the after-hook result note
-// T13 units: 13, 15b, 18 (15b = "dropped extras are named in the tool result only when the cap trimmed them").
+// T13 units: 18, 15b (15b = "dropped extras are named in the tool result only when the cap
+// trimmed them"), and the result half of 10 (the "left alone" half is T10/T11's guard; this
+// drives the after-hook directly with the non-empty list that guard leaves behind).
+test("the tool result names the plan rows written and the model rows kept", async () => {
+  const { hooks } = await createHooks()
+  const sessionID = "session-mirror-result-note"
+  const { handlers } = makeAgentHandlers()
+  await handlers.setGoal(sessionID, { objective: "ship it" })
+  await handlers.setPlan(sessionID, {
+    actions: [
+      {
+        id: "a1",
+        title: "write the code",
+        status: "done",
+        claim: "the code is written",
+        evidence: "tests pass",
+        verdict: "pass",
+      },
+      { id: "a2", title: "run the tests" },
+      { id: "a3", title: "ship it" },
+      { id: "a4", title: "tell the team" },
+    ],
+  })
+  const goal = currentGoal(sessionID)
+  const placeholderTodos = [{ content: "placeholder", status: "pending", priority: "medium" }]
+
+  // Two rows of the model's own kept, none dropped: the plural form.
+  goal.mirror.extra = [
+    { content: "my own note", status: "pending", priority: "medium" },
+    { content: "another one", status: "pending", priority: "low" },
+  ]
+  goal.mirror.lastDropped = 0
+  const output = { title: "todowrite", output: "", metadata: {} }
+  await hooks["tool.execute.after"](
+    { tool: "todowrite", sessionID, callID: "call-note-1", args: { todos: placeholderTodos } },
+    output,
+  )
+  assert.equal(output.output, "\n\nMirrored from the goal plan (1/4 verified). 2 items of your own kept.")
+
+  // One row kept: the singular form.
+  goal.mirror.extra = [{ content: "solo note", status: "pending", priority: "medium" }]
+  const output2 = { title: "todowrite", output: "ok", metadata: {} }
+  await hooks["tool.execute.after"](
+    { tool: "todowrite", sessionID, callID: "call-note-2", args: { todos: placeholderTodos } },
+    output2,
+  )
+  assert.equal(output2.output, "ok\n\nMirrored from the goal plan (1/4 verified). 1 item of your own kept.")
+
+  // Zero rows of the model's own kept: no second sentence at all.
+  goal.mirror.extra = []
+  const output3 = { title: "todowrite", output: "ok", metadata: {} }
+  await hooks["tool.execute.after"](
+    { tool: "todowrite", sessionID, callID: "call-note-3", args: { todos: placeholderTodos } },
+    output3,
+  )
+  assert.equal(output3.output, "ok\n\nMirrored from the goal plan (1/4 verified).")
+
+  // The guard: `output.output` is only ever touched when it is already a string.
+  goal.mirror.extra = [{ content: "solo note", status: "pending", priority: "medium" }]
+  const nonStringOutput = { title: "todowrite", output: { not: "a string" }, metadata: {} }
+  await hooks["tool.execute.after"](
+    { tool: "todowrite", sessionID, callID: "call-note-4", args: { todos: placeholderTodos } },
+    nonStringOutput,
+  )
+  assert.deepEqual(nonStringOutput.output, { not: "a string" })
+})
+
+test("dropped extras are named in the tool result only when the cap trimmed them", async () => {
+  const { hooks } = await createHooks()
+  const sessionID = "session-mirror-result-dropped"
+  const { handlers } = makeAgentHandlers()
+  await handlers.setGoal(sessionID, { objective: "ship it" })
+  await handlers.setPlan(sessionID, {
+    actions: [
+      { id: "a1", title: "one" },
+      { id: "a2", title: "two" },
+      { id: "a3", title: "three" },
+      { id: "a4", title: "four" },
+    ],
+  })
+  const goal = currentGoal(sessionID)
+  const placeholderTodos = [{ content: "placeholder", status: "pending", priority: "medium" }]
+
+  // 14 model rows offered, the cap trims 4: the exact A2 example (CONTRACTS.md).
+  goal.mirror.extra = Array.from({ length: MIRROR_MAX_EXTRAS }, (_, i) => ({
+    content: `note ${i}`,
+    status: "pending",
+    priority: "medium",
+  }))
+  goal.mirror.lastDropped = 4
+  const output = { title: "todowrite", output: "", metadata: {} }
+  await hooks["tool.execute.after"](
+    { tool: "todowrite", sessionID, callID: "call-dropped-1", args: { todos: placeholderTodos } },
+    output,
+  )
+  assert.equal(
+    output.output,
+    `\n\nMirrored from the goal plan (0/4 verified). ${MIRROR_MAX_EXTRAS} items of your own kept (4 dropped, cap ${MIRROR_MAX_EXTRAS}).`,
+  )
+  assert.equal(output.output, "\n\nMirrored from the goal plan (0/4 verified). 10 items of your own kept (4 dropped, cap 10).")
+
+  // 3 model rows, none trimmed: no parenthetical at all.
+  goal.mirror.extra = [
+    { content: "one", status: "pending", priority: "medium" },
+    { content: "two", status: "pending", priority: "medium" },
+    { content: "three", status: "pending", priority: "medium" },
+  ]
+  goal.mirror.lastDropped = 0
+  const output2 = { title: "todowrite", output: "", metadata: {} }
+  await hooks["tool.execute.after"](
+    { tool: "todowrite", sessionID, callID: "call-dropped-2", args: { todos: placeholderTodos } },
+    output2,
+  )
+  assert.equal(output2.output, "\n\nMirrored from the goal plan (0/4 verified). 3 items of your own kept.")
+
+  // `lastDropped` absent (never set by a before-hook call in this test) falls
+  // back to 0 via `?? 0`, not to `undefined dropped, cap N`.
+  delete goal.mirror.lastDropped
+  const output3 = { title: "todowrite", output: "", metadata: {} }
+  await hooks["tool.execute.after"](
+    { tool: "todowrite", sessionID, callID: "call-dropped-3", args: { todos: placeholderTodos } },
+    output3,
+  )
+  assert.equal(output3.output, "\n\nMirrored from the goal plan (0/4 verified). 3 items of your own kept.")
+})
+
+test("a NON-EMPTY todowrite is left alone before a plan exists, and the result says to record one", async () => {
+  const { hooks } = await createHooks()
+  const sessionID = "session-mirror-no-plan-result"
+  const { handlers } = makeAgentHandlers()
+  await handlers.setGoal(sessionID, { objective: "ship it" })
+  const goal = currentGoal(sessionID)
+  assert.equal(goal.plan.actions.length, 0, "a fresh goal carries no plan yet")
+  assert.equal(goal.stopped, false)
+
+  // T13 covers only the result half here: the before-hook leaving a NON-EMPTY
+  // todowrite's `args.todos` untouched before a plan exists is T10/T11's guard
+  // (`!goal || goal.stopped || goal.plan.actions.length === 0`). This drives the
+  // after-hook directly with the model's own non-empty list — exactly what that
+  // guard leaves behind — and checks only the tool-result note.
+  const modelTodos = [{ content: "my own todo", status: "pending", priority: "medium" }]
+  const output = { title: "todowrite", output: "Updated 1 todo.", metadata: {} }
+  await hooks["tool.execute.after"](
+    { tool: "todowrite", sessionID, callID: "call-no-plan", args: { todos: modelTodos } },
+    output,
+  )
+
+  assert.equal(
+    output.output,
+    "Updated 1 todo.\n\nNo goal plan is recorded yet — record one with goal_plan_set, and the Todo list will be redrawn from it.",
+  )
+})
 // <<< v101:T13
 
 
