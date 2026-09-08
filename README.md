@@ -30,6 +30,8 @@ While a goal runs, its state rides the session title on every client, and the TU
 
 Objective label, sequence position, turns used, elapsed time against the clock, token spend against the budget, and verified actions of the total. Every command, flag, tool, option and default is in [docs/reference.md](docs/reference.md).
 
+The sidebar's Todo section is drawn from the same plan: while a plan exists, every `todowrite` is redrawn from the plan's actions, with any items of the model's own kept below them. `mirrorTodos: "off"` restores the host's stock behaviour.
+
 ## Why the name
 
 "pro max complete" is a claim about process, not feature count: every behaviour is pinned by a test, most safety properties are pinned by a mutation that must turn the suite red, and each number below was re-measured on this tree before it was written down.
