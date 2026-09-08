@@ -62,11 +62,12 @@ export interface GoalPanelModel {
   sequence: string
   /**
    * `3/7 actions verified`, otherwise empty. When the payload carries a v3
-   * `plan.mirror` whose `state` is not `"off"`, one of three suffixes is
-   * appended (see {@link mirror}): `" · todo mirror fresh (5)"`,
+   * `plan.mirror` whose `state` is one this release knows, one of three
+   * suffixes is appended (see {@link mirror}): `" · todo mirror fresh (5)"`,
    * `" · todo list stale"`, or `" · mirror drift (7≠5)"`. No suffix is
-   * appended for a v2 payload (no `plan.mirror`) or a `mirror.state` of
-   * `"off"` — the line renders exactly as it did before v1.0.1.
+   * appended for a v2 payload (no `plan.mirror`), for a `mirror.state` of
+   * `"off"`, or for a state this release does not recognise — the line
+   * renders exactly as it did before v1.0.1.
    */
   progress: string
   /**
@@ -97,8 +98,20 @@ export interface GoalPanelModel {
    * this key entirely, they do not set it to `undefined`.
    */
   mirror?: {
-    /** Always `"fresh"` or `"stale"` here — an `"off"` mirror omits the whole key instead. */
-    state: "fresh" | "stale"
+    /**
+     * The payload's `plan.mirror.state`, forwarded verbatim. This plugin's own
+     * server writes exactly `"fresh"`, `"stale"` or `"off"` (the union on
+     * `GoalSidebarStatus["plan"]["mirror"]` in the server types), and an
+     * `"off"` mirror omits this whole key rather than appearing here — but the
+     * payload is JSON written by whichever server version the host is running,
+     * so a panel from an older release can be handed a state it has never heard
+     * of. It keeps such a mirror ACTIVE, because {@link actions} filters out only
+     * an `"off"` mirror rather than filtering in a known state, and reports it
+     * here unchanged while standing down both the {@link progress} suffix and
+     * {@link drift}. Hence `string`: an exhaustive `switch` over two literals
+     * would be a claim about the server that this side cannot make.
+     */
+    state: string
     /** `plan.mirror.rows` from the payload, coerced to a non-negative integer. */
     rows: number
     /** `plan.mirror.extra` from the payload, coerced to a non-negative integer. */

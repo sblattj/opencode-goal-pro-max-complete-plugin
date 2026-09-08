@@ -769,6 +769,53 @@ test("the progress line names a fresh mirror with the live count and a stale one
   }
 })
 
+test("a mirror state this release does not know stays active, reports itself, and claims no drift", () => {
+  // The payload is arbitrary JSON written by whichever server version the host is
+  // running, so a panel shipped today can be handed a state a later release invented.
+  // T24 keys the exception list on the mirror NOT being off, so such a state keeps
+  // filtering; the suffix and the drift comparison are keyed on the two states this
+  // release can actually reason about, and both stand down. That is what makes
+  // `GoalPanelModel["mirror"]["state"]` a `string` in tui.d.ts rather than the
+  // server's own two-value union: the panel hands back what it was given.
+  const actions = [
+    { id: "a1", title: "pending work", status: "pending", verdict: null },
+    { id: "a2", title: "in flight", status: "in_progress", verdict: null },
+  ]
+  const plan = { total: 2, verified: 0, blocked: 0, mirror: mirror("rebuilding", { rows: 5 }), actions }
+
+  const model = goalPanelModel(payload({ plan }), { liveTodoCount: 7 })
+  // Still an ACTIVE mirror: the `pending` row is filtered out, exactly as under "fresh".
+  assert.deepEqual(model.actions.map((action) => action.title), ["in flight"])
+  // No suffix is invented for a state whose meaning this release does not know...
+  assert.equal(model.progress, "0/2 actions verified")
+  // ...and no drift is claimed from it either, though 7 vs 5 does drift under "fresh".
+  assert.deepEqual(model.mirror, {
+    state: "rebuilding",
+    rows: 5,
+    extra: 0,
+    liveTodoCount: 7,
+    drift: false,
+  })
+  // The facts are still PRESENT, which is what makes the filtering above legible: a
+  // model with no `mirror` key means "no active mirror" everywhere else in the panel.
+  assert.ok("mirror" in model, "an active mirror must publish its facts even in an unknown state")
+
+  // CONTROL: the same numbers under a state this release DOES know do drift, so the
+  // assertions above are about the state, not about 7 and 5.
+  const known = goalPanelModel(payload({ plan: { ...plan, mirror: mirror("fresh", { rows: 5 }) } }), {
+    liveTodoCount: 7,
+  })
+  assert.equal(known.progress, "0/2 actions verified · mirror drift (7≠5)")
+  assert.equal(known.mirror.drift, true)
+
+  // CONTROL: `"off"` is still the one state that stands the whole mirror down.
+  const off = goalPanelModel(payload({ plan: { ...plan, mirror: mirror("off", { rows: 5 }) } }), {
+    liveTodoCount: 7,
+  })
+  assert.equal(off.actions.length, 2)
+  assert.ok(!("mirror" in off), "an off mirror must not leak a `mirror` key onto the model")
+})
+
 // Tests - the live drift check
 // T26 units: 37, plus "a live count that matches the payload renders as fresh" and
 // "GoalPanel tolerates a host without a todo state reader" (the latter two are new for T26 and
