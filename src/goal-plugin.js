@@ -1619,6 +1619,7 @@ function resetGoalBudget(goal) {
   goal.compactionSourceAssistantMessageID = ""
   goal.skipNextTerminalCheck = false
   goal.history = [...(goal.history || [])].slice(-MAX_HISTORY_ENTRIES)
+  goal.mirror.nudges = 0 // v101:T16 — a fresh budget window re-earns the full nudge budget; fingerprint/rows untouched.
 }
 
 function currentGoal(sessionID, goalID, runID) {
