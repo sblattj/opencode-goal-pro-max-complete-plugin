@@ -31,6 +31,29 @@ test("the shipped skill has usable frontmatter", async () => {
   assert.ok(text.slice(match[0].length).trim().length > 1000, "the body must be the real skill, not a stub")
 })
 
+test("the skill's description advertises every surface its body teaches", async () => {
+  // The description is the WHOLE trigger surface: OpenCode matches a skill on its
+  // frontmatter, never on its body, so a section the description does not name only
+  // ever fires when something else in the description already did. v1.0.1 taught the
+  // todo mirror in the body and left the 1.0.0 description byte-identical, which is
+  // what this pairing catches: each row asserts the body still teaches the topic AND
+  // that the description still says so.
+  const text = await readFile(skillFile, "utf8")
+  const match = /^---\n([\s\S]*?)\n---\n/.exec(text)
+  assert.ok(match, "SKILL.md must open with a YAML frontmatter block")
+  const description = /^description:\s*(.+)$/m.exec(match[1])[1]
+  const body = text.slice(match[0].length)
+  for (const [topic, taughtBy, advertisedBy] of [
+    ["the todo mirror", /todowrite/, /todo/i],
+    ["the plan tools", /goal_plan_set/, /goal_\*/],
+    ["the evidence markers", /\[goal:evidence\]/, /\[goal:evidence\]/],
+    ["the sidebar panel", /Goal panel/, /sidebar/i],
+  ]) {
+    assert.match(body, taughtBy, `the body must still teach ${topic}`)
+    assert.match(description, advertisedBy, `the description must name ${topic}`)
+  }
+})
+
 test("the shipped skill names no host, no path and no package", async () => {
   const text = await readFile(skillFile, "utf8")
   for (const forbidden of [/ferry/i, /\/Users\//, /opencode-goal-pro-max/i, /node_modules/]) {
