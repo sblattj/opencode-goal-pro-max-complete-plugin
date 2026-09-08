@@ -12819,6 +12819,36 @@ test("the terminal sidebar render keeps the context ceiling learned from the mod
 
 // >>> v101:T4 tests - mirrorFingerprint
 // T4 units: 26.
+test("the mirror fingerprint ignores plan edits that do not change a rendered row", () => {
+  const { mirrorFingerprint } = testInternals
+  const rowsA = [
+    { content: "a1 · Ship the thing", status: "pending", priority: "high", claim: "first draft" },
+    { content: "a2 · Ship the other thing", status: "in_progress", priority: "medium", claim: "still working" },
+  ]
+  // Same content/status/priority, but the `claim` field (never rendered into the
+  // fingerprint payload) is completely different.
+  const rowsB = [
+    { content: "a1 · Ship the thing", status: "pending", priority: "high", claim: "totally different claim text" },
+    { content: "a2 · Ship the other thing", status: "in_progress", priority: "medium", claim: "unrelated evidence" },
+  ]
+  assert.equal(mirrorFingerprint(rowsA), mirrorFingerprint(rowsB))
+
+  const rowsC = [
+    { content: "a1 · Ship the thing, revised", status: "pending", priority: "high", claim: "first draft" },
+    { content: "a2 · Ship the other thing", status: "in_progress", priority: "medium", claim: "still working" },
+  ]
+  assert.notEqual(mirrorFingerprint(rowsA), mirrorFingerprint(rowsC))
+})
+
+test("the fingerprint of an empty row list is stable and non-empty", () => {
+  const { mirrorFingerprint } = testInternals
+  const first = mirrorFingerprint([])
+  const second = mirrorFingerprint([])
+  assert.equal(first, second)
+  assert.ok(first.length > 0)
+  // A non-array input hashes the same as `[]`, never `""`.
+  assert.equal(mirrorFingerprint(undefined), first)
+})
 // <<< v101:T4
 
 
