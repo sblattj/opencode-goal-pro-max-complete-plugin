@@ -115,7 +115,49 @@ function normalizeAction(raw) {
     verified: status === "done" && verdict === "pass"
   };
 }
-function goalPanelModel(raw) {
+var PANEL_EXCEPTION_GROUPS = [
+  (action) => action.status === "done" && !action.verified,
+  (action) => action.status === "blocked",
+  (action) => action.status === "in_progress"
+];
+function mirrorFiltersPanelActions(mirror) {
+  return isRecord(mirror) && mirror.state !== "off";
+}
+function panelExceptionList(actions) {
+  return PANEL_EXCEPTION_GROUPS.flatMap((inGroup) => actions.filter(inGroup));
+}
+function mirrorProgress(mirror, liveTodoCount) {
+  if (!isRecord(mirror) || mirror.state === "off")
+    return { suffix: "", facts: null };
+  const rows = wholeNumber(mirror.rows);
+  const live = Number.isFinite(liveTodoCount) ? liveTodoCount : null;
+  const drift = (mirror.state === "fresh" || mirror.state === "stale") && live !== null && live !== rows;
+  const facts = { state: mirror.state, rows, extra: wholeNumber(mirror.extra), liveTodoCount: live, drift };
+  if (drift)
+    return { suffix: ` · mirror drift (${live}≠${rows})`, facts };
+  if (mirror.state === "fresh")
+    return { suffix: ` · todo mirror fresh (${live !== null ? live : rows})`, facts };
+  if (mirror.state === "stale")
+    return { suffix: " · todo list stale", facts };
+  return { suffix: "", facts };
+}
+function readLiveTodoCount(api, sessionID) {
+  if (!sessionID)
+    return;
+  try {
+    const session = api?.state?.session;
+    if (typeof session?.todo !== "function")
+      return;
+    const todos = session.todo(sessionID);
+    return Array.isArray(todos) ? todos.length : undefined;
+  } catch {
+    return;
+  }
+}
+function actionNeedsEvidenceSuffix(action) {
+  return action.status === "done" && !action.verified ? " — needs claim/evidence/verdict" : "";
+}
+function goalPanelModel(raw, { liveTodoCount } = {}) {
   if (!isRecord(raw))
     return null;
   const objective = boundedText(raw.objective, 120);
@@ -142,9 +184,13 @@ function goalPanelModel(raw) {
   const sequence = isRecord(raw.sequence) && wholeNumber(raw.sequence.total) > 0 ? `step ${wholeNumber(raw.sequence.position)}/${wholeNumber(raw.sequence.total)}` : "";
   const plan = isRecord(raw.plan) ? raw.plan : {};
   const planTotal = wholeNumber(plan.total);
-  const actions = (Array.isArray(plan.actions) ? plan.actions : []).map(normalizeAction).filter(Boolean).slice(0, MAX_PANEL_ACTIONS);
-  const hiddenActions = Math.max(0, planTotal - actions.length);
+  const listed = (Array.isArray(plan.actions) ? plan.actions : []).map(normalizeAction).filter(Boolean);
+  const filtered = mirrorFiltersPanelActions(plan.mirror);
+  const shortlist = filtered ? panelExceptionList(listed) : listed;
+  const actions = shortlist.slice(0, MAX_PANEL_ACTIONS);
+  const hiddenActions = Math.max(0, (filtered ? shortlist.length : planTotal) - actions.length);
   const progress = planTotal ? `${wholeNumber(plan.verified)}/${planTotal} actions verified${wholeNumber(plan.blocked) ? `, ${wholeNumber(plan.blocked)} blocked` : ""}` : "";
+  const { suffix: mirrorSuffix, facts: mirrorFacts } = mirrorProgress(plan.mirror, liveTodoCount);
   const notes = [];
   const blockedReason = boundedText(raw.blockedReason);
   const stopReason = boundedText(raw.stopReason);
@@ -164,10 +210,11 @@ function goalPanelModel(raw) {
     objective,
     stats,
     sequence,
-    progress,
+    progress: `${progress}${mirrorSuffix}`,
     actions,
     hiddenActions,
-    notes
+    notes,
+    ...mirrorFacts ? { mirror: mirrorFacts } : {}
   };
 }
 function stateColor(theme, state) {
@@ -197,7 +244,7 @@ function actionColor(theme, action) {
 }
 function actionLine(action) {
   const verdict = action.verdict ? ` [${action.verdict}]` : "";
-  return `${action.mark} ${action.title}${verdict}`;
+  return `${action.mark} ${action.title}${verdict}${actionNeedsEvidenceSuffix(action)}`;
 }
 function createGoalSidebar(runtime) {
   const { createMemo, Show, For, jsx } = runtime;
@@ -222,7 +269,9 @@ function createGoalSidebar(runtime) {
   }
   function GoalPanel(props) {
     const theme = () => props.api.theme.current;
-    const model = createMemo(() => goalPanelModel(readGoalPayload(props.api, props.session_id)));
+    const model = createMemo(() => goalPanelModel(readGoalPayload(props.api, props.session_id), {
+      liveTodoCount: readLiveTodoCount(props.api, props.session_id)
+    }));
     const read = (pick, fallback = "") => () => {
       const current = model();
       return current ? pick(current) : fallback;
