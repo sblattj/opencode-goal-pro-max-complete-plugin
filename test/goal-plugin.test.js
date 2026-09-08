@@ -14670,6 +14670,28 @@ test("the goal-end response carries the todo handback line only when rows were m
 
 // >>> v101:T18 tests - the plan system-block sentence
 // T18 units: 49.
+test("the system-block sentence appears only under plan mode with a plan, and is byte-stable", () => {
+  const SYSTEM_BLOCK_SENTENCE =
+    "The session's Todo list is drawn from this plan: while a plan exists, todowrite redraws it from the plan's actions and keeps any items of your own below them. Change the work with goal_plan_set/goal_action_update, and call todowrite({todos: []}) to refresh the panel."
+
+  const goalWithPlan = {
+    plan: normalizePlan({ actions: [{ id: "a1", title: "write it" }] }),
+  }
+
+  const plan = buildPlanSystemLines(goalWithPlan, { mirrorMode: "plan" }).join("\n")
+  assert.equal(plan.includes(SYSTEM_BLOCK_SENTENCE), true)
+
+  const off = buildPlanSystemLines(goalWithPlan, { mirrorMode: "off" }).join("\n")
+  assert.equal(off.includes(SYSTEM_BLOCK_SENTENCE), false)
+
+  const goalNoPlan = { plan: emptyPlan() }
+  const noPlan = buildPlanSystemLines(goalNoPlan, { mirrorMode: "plan" }).join("\n")
+  assert.equal(noPlan.includes(SYSTEM_BLOCK_SENTENCE), false)
+
+  const first = buildPlanSystemLines(goalWithPlan, { mirrorMode: "plan" }).join("\n")
+  const second = buildPlanSystemLines(goalWithPlan, { mirrorMode: "plan" }).join("\n")
+  assert.equal(first, second)
+})
 // <<< v101:T18
 
 
