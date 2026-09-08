@@ -5290,7 +5290,43 @@ function mirrorRowSuffix(action) {
  * a comment.
  */
 function projectPlanToTodos(plan, extras) {
-  throw new Error("v1.0.1 T2: not implemented")
+  const actions = Array.isArray(plan?.actions) ? plan.actions : []
+  const tail = Array.isArray(extras) ? extras : []
+  const overflowed = actions.length > MIRROR_MAX_TODOS
+  // One row of the cap is spent on the overflow row itself, so a plan that runs
+  // past the cap shows 19 actions and one counted line rather than 20 actions
+  // and a silently dropped remainder.
+  const shown = overflowed ? actions.slice(0, MIRROR_MAX_TODOS - 1) : actions
+  const rows = []
+  // The running index counts only rows the model still has to act on: a
+  // completed row is never the "current" one, so it must not consume the single
+  // `high` slot.
+  let index = 0
+  for (const action of shown) {
+    const status = mirrorRowStatus(action)
+    const title = summarizeText(action.title, MIRROR_EXTRA_TEXT_LIMIT)
+    rows.push(
+      mirrorRow({
+        content: `${action.id}${MIRROR_ID_SEPARATOR}${title}${mirrorRowSuffix(action)}`,
+        status,
+        priority: mirrorRowPriority(action, index),
+      }),
+    )
+    if (status !== "completed") index += 1
+  }
+  if (overflowed) {
+    rows.push(
+      mirrorRow({
+        content: `+${actions.length - shown.length} more actions — /goal status`,
+        status: "pending",
+        priority: "low",
+      }),
+    )
+  }
+  // Extras arrive already coerced and bounded from `pickExtras`; re-bounding
+  // them here would truncate a row twice and drift from what was stored.
+  for (const extra of tail) rows.push(extra)
+  return rows
 }
 // <<< v101:T2
 
