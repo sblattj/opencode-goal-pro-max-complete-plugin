@@ -204,6 +204,9 @@ function createRuntimeState() {
     // from `goalStates`, so without this the sidebar would keep advertising a
     // running goal that finished.
     sidebarTerminals: new Map(),
+    // The terminal render for a goal's mirrored todo rows after the goal
+    // record itself is gone (stop/clear/completion): sessionID -> { rows, at }.
+    mirrorTerminals: new Map(),
     pendingCommandTurns: new Map(),
     activeCommandTurns: new Map(),
     commandOutputs: new WeakMap(),
@@ -5404,30 +5407,34 @@ function normalizeMirror(raw) {
 
 
 // >>> v101:T9 the mirrorTerminals collection and its snapshot accessors
+// The terminal render for a goal's mirrored todo rows after the goal record
+// itself is gone (stop/clear/completion), mirroring sidebarTerminals above
+// (F33): sessionID -> { rows, at }.
+const mirrorTerminals = runtimeCollection("mirrorTerminals")
+
 /**
- * `mirrorTerminals` = `runtimeCollection("mirrorTerminals")` beside `sidebarTerminals` (and the
- * matching `new Map()` in `createRuntimeState`); `snapshotMirror(sessionID, goal, now)` -> void
- * stores `{ rows: goal.mirror.rows, at: now }`, only when `goal.mirror.rows.length > 0`.
- * SCAFFOLD STUB: a no-op that returns undefined, so wave-2 hooks may call it before T9 lands.
+ * `snapshotMirror(sessionID, goal, now)` -> void: stores `{ rows: [...goal.mirror.rows], at: now }`
+ * so a later empty todowrite arriving after the goal has ended still has something to re-emit
+ * instead of wiping the list. Only stores a snapshot when there are rows to preserve.
  */
 function snapshotMirror(sessionID, goal, now) {
-  return undefined
+  const rows = goal?.mirror?.rows
+  if (!Array.isArray(rows) || rows.length === 0) return
+  mirrorTerminals.set(sessionID, { rows: [...rows], at: now })
 }
 
 /**
  * `readMirrorTerminal(sessionID)` -> `{ rows, at } | undefined`.
- * SCAFFOLD STUB: always `undefined`, so wave-2 hooks may call it before T9 lands.
  */
 function readMirrorTerminal(sessionID) {
-  return undefined
+  return mirrorTerminals.get(sessionID)
 }
 
 /**
  * `dropMirrorTerminal(sessionID)` -> void.
- * SCAFFOLD STUB: a no-op, so wave-2 hooks may call it before T9 lands.
  */
 function dropMirrorTerminal(sessionID) {
-  return undefined
+  mirrorTerminals.delete(sessionID)
 }
 // <<< v101:T9
 

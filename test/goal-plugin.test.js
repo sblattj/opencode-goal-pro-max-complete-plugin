@@ -108,6 +108,9 @@ const {
   goalSpendTokens,
   userInterventionDetected,
   xdgStateFilePath,
+  snapshotMirror,
+  readMirrorTerminal,
+  dropMirrorTerminal,
 } = testInternals
 
 function sessionStatePath(stateFilePath, sessionID) {
@@ -12849,6 +12852,39 @@ test("the terminal sidebar render keeps the context ceiling learned from the mod
 
 // >>> v101:T9 tests - mirrorTerminals snapshot accessors
 // T9 units: 41.
+test("the mirror terminal collection stores, reads and drops a session snapshot", () => {
+  const sessionID = "session-mirror-terminal-store"
+  const goal = { mirror: { rows: [{ content: "a1 · Ship it", status: "pending", priority: "high" }] } }
+  const now = 12345
+
+  snapshotMirror(sessionID, goal, now)
+  assert.deepEqual(readMirrorTerminal(sessionID), { rows: goal.mirror.rows, at: now })
+
+  // The stored snapshot is a defensive copy: mutating the goal's rows afterward
+  // must not reach through to the terminal.
+  goal.mirror.rows.push({ content: "a2 · Ship it more", status: "pending", priority: "low" })
+  assert.equal(readMirrorTerminal(sessionID).rows.length, 1)
+
+  dropMirrorTerminal(sessionID)
+  assert.equal(readMirrorTerminal(sessionID), undefined)
+})
+
+test("an empty mirror never records a terminal snapshot", () => {
+  const sessionID = "session-mirror-terminal-empty"
+
+  snapshotMirror(sessionID, { mirror: { rows: [] } }, Date.now())
+  assert.equal(readMirrorTerminal(sessionID), undefined)
+
+  snapshotMirror(sessionID, { mirror: {} }, Date.now())
+  assert.equal(readMirrorTerminal(sessionID), undefined)
+
+  snapshotMirror(sessionID, undefined, Date.now())
+  assert.equal(readMirrorTerminal(sessionID), undefined)
+
+  // Dropping a session that was never snapshotted is a silent no-op.
+  dropMirrorTerminal(sessionID)
+  assert.equal(readMirrorTerminal(sessionID), undefined)
+})
 // <<< v101:T9
 
 
