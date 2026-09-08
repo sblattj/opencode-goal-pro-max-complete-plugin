@@ -757,7 +757,164 @@ test("the progress line names a fresh mirror with the live count and a stale one
 
 
 // >>> v101:T26 tests - the live drift check
-// T26 units: 37.
+// T26 units: 37, plus "a live count that matches the payload renders as fresh" and
+// "GoalPanel tolerates a host without a todo state reader" (the latter two are new for T26 and
+// are not in design 5.2's numbered list). Unit 37's NAME is design 5.2's verbatim string, per
+// CONTRACTS ("33-38 as listed in design 5.2"); the brief's paraphrase of what it has to prove -
+// `goalPanelModel(payloadWithRows5, { liveTodoCount: 7 })` renders `mirror drift (7 vs 5)` and
+// NOT "fresh" - is asserted inside it.
+//
+// These drive the WHOLE panel, not just `goalPanelModel`. T25 already proved the model half from
+// an argument someone else supplied; what is unproven until here is that `GoalPanel` goes and
+// GETS that argument off the host, and that it survives a host that cannot answer.
+
+// Find the progress line by its content rather than by row index, so an extra line elsewhere in
+// the panel (a note, a sequence line) cannot silently re-point these assertions at another row.
+function panelProgress(runtime, node) {
+  return renderLines(runtime, node)
+    .map((entry) => entry.text)
+    .find((text) => text.includes("actions verified"))
+}
+
+function todoRows(count) {
+  return Array.from({ length: count }, (_, index) => ({ content: `row ${index}`, status: "pending" }))
+}
+
+// Mount the real `GoalPanel` over one session whose plan carries a mirror of 5 rows, with `todo`
+// installed on the fake host at exactly the place the real adapter puts it
+// (packages/tui/src/plugin/adapters.tsx:131 `todo`). Passing `undefined` installs NOTHING, which
+// is what a host older than that surface looks like from inside the panel.
+async function mountMirrorPanel(todo, planOverrides = {}) {
+  const runtime = fakeRuntime()
+  const { tui } = createGoalSidebar(runtime)
+  const plan = {
+    total: 2,
+    verified: 1,
+    blocked: 0,
+    mirror: mirror("fresh", { rows: 5 }),
+    actions: [],
+    ...planOverrides,
+  }
+  const sessions = new Map([["ses_mirror", { id: "ses_mirror", metadata: { goal: payload({ plan }) } }]])
+  const { api, registrations } = fakeApi(sessions)
+  if (todo !== undefined) api.state.session.todo = todo
+  await tui(api, {}, { spec: "opencode-goal-pro-max-complete-plugin" })
+  const render = (sessionID = "ses_mirror") =>
+    panelProgress(runtime, registrations[0].slots.sidebar_content({}, { session_id: sessionID }))
+  return { render, api }
+}
+
+test("a live todo count that disagrees with the payload renders as drift, not agreement", async () => {
+  // The model half, in the brief's exact shape: 5 rows in the payload, 7 live.
+  const payloadWithRows5 = payload({
+    plan: { total: 2, verified: 1, blocked: 0, mirror: mirror("fresh", { rows: 5 }), actions: [] },
+  })
+  const drifted = goalPanelModel(payloadWithRows5, { liveTodoCount: 7 })
+  assert.equal(drifted.progress, "1/2 actions verified · mirror drift (7≠5)")
+  assert.ok(!drifted.progress.includes("fresh"), "drift REPLACES the fresh suffix, it never sits beside it")
+  assert.equal(drifted.mirror.drift, true)
+  assert.equal(drifted.mirror.liveTodoCount, 7)
+
+  // The panel half: same numbers, but nobody hands `GoalPanel` the 7 - it has to read it off the
+  // host. This is the assertion the model-level test above cannot make.
+  const seven = await mountMirrorPanel(() => todoRows(7))
+  assert.equal(seven.render(), "1/2 actions verified · mirror drift (7≠5)")
+
+  // The control that must come out DIFFERENT: identical panel, identical payload, a host whose
+  // list agrees. A `GoalPanel` that ignored the host and echoed `mirror.rows` would read "fresh"
+  // for both, so this pair is what makes the drift claim falsifiable.
+  const five = await mountMirrorPanel(() => todoRows(5))
+  assert.equal(five.render(), "1/2 actions verified · todo mirror fresh (5)")
+
+  // An EMPTY host list is a live count of 0, not "no live count": the case a truthiness guard
+  // would silently swallow, and the one that matters most (the user cleared their Todo list).
+  const calls = []
+  const empty = await mountMirrorPanel((sessionID) => {
+    calls.push(sessionID)
+    return []
+  })
+  assert.equal(empty.render(), "1/2 actions verified · mirror drift (0≠5)")
+  // The panel asks about ITS OWN session, never some other one.
+  assert.ok(calls.length > 0, "the panel must actually call the host's todo reader")
+  assert.deepEqual([...new Set(calls)], ["ses_mirror"])
+
+  // Drift overrides a STALE mirror too, and keeps the drift wording rather than "todo list stale".
+  const staleDrift = await mountMirrorPanel(() => todoRows(7), { mirror: mirror("stale", { rows: 5 }) })
+  assert.equal(staleDrift.render(), "1/2 actions verified · mirror drift (7≠5)")
+})
+
+test("a live count that matches the payload renders as fresh", async () => {
+  // Agreement renders the SAME bytes as "no live count at all", so the rendered string alone
+  // cannot tell the two apart - a panel that never asked the host would pass on it. The spy is
+  // what gives this test polarity: the count on screen has to have been READ, not assumed.
+  const asked = []
+  const fresh = await mountMirrorPanel((sessionID) => {
+    asked.push(sessionID)
+    return todoRows(5)
+  })
+  assert.equal(fresh.render(), "1/2 actions verified · todo mirror fresh (5)")
+  assert.ok(asked.length > 0, "the fresh count must come from the host, not from the payload")
+  assert.deepEqual([...new Set(asked)], ["ses_mirror"])
+
+  // A stale mirror whose live count agrees is still stale: agreement on the COUNT is not
+  // freshness, and the panel must not upgrade the server's own verdict.
+  const stale = await mountMirrorPanel(() => todoRows(5), { mirror: mirror("stale", { rows: 5 }) })
+  assert.equal(stale.render(), "1/2 actions verified · todo list stale")
+
+  // With the mirror `off` the live count is not consulted for anything, even when it disagrees
+  // loudly: the plugin never touched the Todo list, so it has no claim to make about it.
+  const off = await mountMirrorPanel(() => todoRows(9), { mirror: mirror("off", { rows: 5 }) })
+  assert.equal(off.render(), "1/2 actions verified")
+
+  // A v2 payload has no `mirror` key at all; a live count must not conjure a suffix onto it.
+  const v2 = await mountMirrorPanel(() => todoRows(9), { mirror: undefined })
+  assert.equal(v2.render(), "1/2 actions verified")
+})
+
+test("GoalPanel tolerates a host without a todo state reader", async () => {
+  // With no live count the suffix falls back to the payload's own row count.
+  const fallback = "1/2 actions verified · todo mirror fresh (5)"
+
+  // No reader at all. `fakeApi` publishes only `state.session.get`, which is exactly the shape of
+  // a host that predates the todo surface - and of every other panel test in this file.
+  const bare = await mountMirrorPanel(undefined)
+  assert.equal(bare.api.state.session.todo, undefined, "this case is only meaningful with no reader present")
+  assert.equal(bare.render(), fallback)
+
+  // A reader that throws must not take the sidebar down with it; the panel renders without the
+  // live count rather than not rendering.
+  const thrower = await mountMirrorPanel(() => {
+    throw new Error("host refused")
+  })
+  assert.equal(thrower.render(), fallback)
+
+  // Anything that is not an array is not a row count, however number-ish or length-ish it looks.
+  for (const junk of [undefined, null, 7, "12345", { length: 7 }, new Set([1, 2, 3]), NaN]) {
+    const odd = await mountMirrorPanel(() => junk)
+    assert.equal(odd.render(), fallback, `todo() -> ${String(junk)} must not produce a live count`)
+  }
+
+  // A `todo` that is not callable is never called. Swapping it on a MOUNTED panel also proves the
+  // read is live: the same element tree answers differently after the host object changed.
+  const swapped = await mountMirrorPanel(() => todoRows(7))
+  assert.equal(swapped.render(), "1/2 actions verified · mirror drift (7≠5)")
+  for (const notCallable of ["nope", 42, null, {}, [], undefined]) {
+    swapped.api.state.session.todo = notCallable
+    assert.equal(swapped.render(), fallback, `a ${String(notCallable)} todo must not be called`)
+  }
+  swapped.api.state.session.todo = () => todoRows(7)
+  assert.equal(swapped.render(), "1/2 actions verified · mirror drift (7≠5)", "and back again")
+
+  // No session id: the panel is hidden outright, and the reader is not consulted for a session
+  // the panel does not have.
+  const unasked = []
+  const nameless = await mountMirrorPanel((sessionID) => {
+    unasked.push(sessionID)
+    return todoRows(7)
+  })
+  assert.equal(nameless.render(""), undefined, "an empty session id renders no panel at all")
+  assert.deepEqual(unasked, [])
+})
 // <<< v101:T26
 
 

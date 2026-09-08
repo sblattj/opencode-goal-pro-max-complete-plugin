@@ -225,7 +225,37 @@ function mirrorProgress(mirror, liveTodoCount) {
 
 
 // >>> v101:T26 live drift check
-// Reserved. T26 reads the live todo count in `GoalPanel` and renders the drift suffix.
+// The live row count of the host's OWN todo list, read exactly the way opencode's builtin Todo
+// section reads it: `api.state.session.todo(sessionID)`
+// (`packages/tui/src/feature-plugins/sidebar/todo.tsx:11` `View`, typed at
+// `packages/plugin/src/tui.ts:390` `TuiState.session.todo`). The adapter behind that method returns
+// `sync.data.todo[sessionID] ?? []` (`packages/tui/src/plugin/adapters.tsx:131` `todo`) - a read off
+// the same Solid store every other panel read comes from, so calling this INSIDE `GoalPanel`'s
+// `createMemo` subscribes the memo and the suffix re-renders when the host's list changes, the same
+// way the builtin Todo section does.
+//
+// Deliberately NOT an import. `src/goal-sidebar-view.js` imports nothing but its own sibling
+// module, `bundle:tui` runs `--packages external` (package.json `bundle:tui`), and the unit tests
+// import this file straight into node, where `solid-js` does not resolve at all. Reaching the count
+// through the `api` object the host already hands `GoalPanel` keeps all three true.
+//
+// Every failure mode collapses to `undefined` - "no live count" - which `mirrorProgress` (T25)
+// reads as "fall back to the payload's own row count" rather than as drift. A host older than the
+// reader, a host that throws, and a host that answers with something that is not an array are all
+// cases where the panel knows nothing about the live list; inventing a drift claim out of that
+// would be worse than saying nothing.
+function readLiveTodoCount(api, sessionID) {
+  if (!sessionID) return undefined
+  try {
+    const session = api?.state?.session
+    if (typeof session?.todo !== "function") return undefined
+    const todos = session.todo(sessionID)
+    return Array.isArray(todos) ? todos.length : undefined
+  } catch {
+    // A panel that throws takes the sidebar down with it.
+    return undefined
+  }
+}
 // <<< v101:T26
 
 
@@ -379,7 +409,13 @@ export function createGoalSidebar(runtime) {
 
   function GoalPanel(props) {
     const theme = () => props.api.theme.current
-    const model = createMemo(() => goalPanelModel(readGoalPayload(props.api, props.session_id)))
+    // v101:T26 edit (outside the T26 region, the one call site): the live todo count is read in
+    // the SAME memo as the payload, so both the drift check and its inputs are tracked together.
+    const model = createMemo(() =>
+      goalPanelModel(readGoalPayload(props.api, props.session_id), {
+        liveTodoCount: readLiveTodoCount(props.api, props.session_id),
+      }),
+    )
     // Every accessor below can run after the goal is cleared, between the model
     // going null and Show tearing the branch down, so each one falls back.
     const read = (pick, fallback = "") => () => {
