@@ -108,6 +108,8 @@ const {
   goalSpendTokens,
   userInterventionDetected,
   xdgStateFilePath,
+  mirrorRowStatus,
+  mirrorRowSuffix,
 } = testInternals
 
 function sessionStatePath(stateFilePath, sessionID) {
@@ -12801,6 +12803,44 @@ test("the terminal sidebar render keeps the context ceiling learned from the mod
 
 // >>> v101:T1 tests - mirrorRowStatus / mirrorRowSuffix
 // T1 units: 2, 3 (titles verbatim in CONTRACTS "Unit inventory" / design §5.1).
+test("a done action without a passing verdict mirrors as in-progress, not completed", () => {
+  const verified = { id: "a1", title: "Ship it", status: "done", claim: "shipped", evidence: "logs show it", verdict: "pass" }
+  assert.equal(mirrorRowStatus(verified), "completed")
+  assert.equal(mirrorRowSuffix(verified), "")
+
+  const noVerdict = { id: "a2", title: "Ship it", status: "done", claim: "shipped", evidence: "logs show it", verdict: null }
+  assert.equal(mirrorRowStatus(noVerdict), "in_progress")
+  assert.equal(mirrorRowSuffix(noVerdict), " — needs claim/evidence/verdict")
+
+  const noClaimOrEvidence = { id: "a3", title: "Ship it", status: "done", claim: "", evidence: "", verdict: "pass" }
+  assert.equal(mirrorRowStatus(noClaimOrEvidence), "in_progress")
+  assert.equal(mirrorRowSuffix(noClaimOrEvidence), " — needs claim/evidence/verdict")
+})
+
+test("a blocked action mirrors as in-progress and names the blocker in its content", () => {
+  const withReason = { id: "a4", title: "Get API key", status: "blocked", claim: "waiting on vendor to issue credentials", evidence: "", verdict: null }
+  assert.equal(mirrorRowStatus(withReason), "in_progress")
+  assert.equal(mirrorRowSuffix(withReason), " — BLOCKED: waiting on vendor to issue credentials")
+
+  const longReason = { id: "a5", title: "Get API key", status: "blocked", claim: "x".repeat(200), evidence: "", verdict: null }
+  const suffix = mirrorRowSuffix(longReason)
+  assert.ok(suffix.startsWith(" — BLOCKED: "))
+  assert.ok(suffix.length <= " — BLOCKED: ".length + 60)
+
+  const noReason = { id: "a6", title: "Get API key", status: "blocked", claim: "", evidence: "", verdict: null }
+  assert.equal(mirrorRowStatus(noReason), "in_progress")
+  assert.equal(mirrorRowSuffix(noReason), " — BLOCKED: no reason recorded")
+})
+
+test("pending and in-progress actions mirror with their own status and no suffix", () => {
+  const pending = { id: "a7", title: "Draft the spec", status: "pending", claim: "", evidence: "", verdict: null }
+  assert.equal(mirrorRowStatus(pending), "pending")
+  assert.equal(mirrorRowSuffix(pending), "")
+
+  const inProgress = { id: "a8", title: "Draft the spec", status: "in_progress", claim: "", evidence: "", verdict: null }
+  assert.equal(mirrorRowStatus(inProgress), "in_progress")
+  assert.equal(mirrorRowSuffix(inProgress), "")
+})
 // <<< v101:T1
 
 
