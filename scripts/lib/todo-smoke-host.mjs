@@ -158,6 +158,95 @@ export function routeByModel(routes, fallback = () => textTurn("ok")) {
 }
 
 /**
+ * Which tool CALL IDS already have a result in this conversation.
+ * `completedToolNames` keys on the tool name, which collapses a script that
+ * calls the same tool twice (two `todowrite`s, three `goal_action_update`s)
+ * into one step. This keys on the id the script itself minted, so repeats are
+ * distinguishable.
+ */
+export function completedCallIDs(messages) {
+  const done = new Set()
+  for (const message of Array.isArray(messages) ? messages : []) {
+    if (message?.role !== "tool") continue
+    if (message?.tool_call_id) done.add(message.tool_call_id)
+  }
+  return done
+}
+
+/**
+ * Every piece of text in the conversation, joined. OpenAI-format `content` is
+ * either a string or an array of parts, and both shapes arrive from OpenCode
+ * (system prompts and the plugin's continuation blocks are parts).
+ */
+export function conversationText(messages) {
+  const chunks = []
+  for (const message of Array.isArray(messages) ? messages : []) {
+    const content = message?.content
+    if (typeof content === "string") chunks.push(content)
+    else if (Array.isArray(content)) {
+      for (const part of content) if (typeof part?.text === "string") chunks.push(part.text)
+    }
+  }
+  return chunks.join("\n")
+}
+
+/**
+ * An ordered script keyed on CALL ID rather than tool name, with an optional
+ * gate per step. Each step is `{ id, tool, args, when? }`:
+ *
+ *   * `id` must be unique within the script; the mock replays the first step
+ *     whose call id has no result yet, so a tool may appear several times.
+ *   * `when({ body, text })` — when present, the step is SKIPPED (not blocked)
+ *     until it returns true, and the responder moves on to the next step. That
+ *     is what lets a script hold a `todowrite({todos: []})` back until the
+ *     driver has run `/goal stop` and prompted with a trigger token.
+ *
+ * When no step is eligible the mock answers with `finalText` and stops. A
+ * request with no tools (OpenCode's title/summary calls) always gets plain
+ * text — replaying a tool call there would hang the turn rather than fail it.
+ */
+export function stepResponder({ steps, finalText = "Done." }) {
+  const ids = steps.map((step) => step.id)
+  const duplicate = ids.find((id, index) => ids.indexOf(id) !== index)
+  if (duplicate !== undefined) throw new Error(`stepResponder: duplicate step id ${JSON.stringify(duplicate)}`)
+  return (body) => {
+    const tools = Array.isArray(body?.tools) ? body.tools : []
+    if (tools.length === 0) return textTurn("ok")
+    const done = completedCallIDs(body?.messages)
+    const text = conversationText(body?.messages)
+    for (const step of steps) {
+      const callID = `call_${step.id}`
+      if (done.has(callID)) continue
+      if (step.when && !step.when({ body, text })) continue
+      return toolCallTurn(callID, step.tool, step.args)
+    }
+    return textTurn(finalText)
+  }
+}
+
+/**
+ * Dispatch on a token that appears in the conversation, so one mock model can
+ * serve several independent scripts in the same run — one per session. Routing
+ * on the model id (`routeByModel`) needs one declared model per script;
+ * routing on a token the driver puts in the goal objective or the prompt needs
+ * none, and the token survives every plugin continuation because the objective
+ * is echoed into the `<goal>` block.
+ *
+ * `routes` is an object keyed by token; the FIRST key present wins, so declare
+ * them in the order a conversation could accumulate them.
+ */
+export function routeByConversation(routes, fallback = () => textTurn("ok")) {
+  const entries = Object.entries(routes)
+  return (body) => {
+    const text = conversationText(body?.messages)
+    for (const [token, responder] of entries) {
+      if (text.includes(token)) return responder(body)
+    }
+    return fallback(body)
+  }
+}
+
+/**
  * A mock OpenAI-compatible endpoint. `baseURL` is the value handed to the
  * provider block, i.e. it already carries the `/v1` prefix the AI SDK appends
  * `/chat/completions` to.

@@ -12,9 +12,13 @@ import test from "node:test"
 import {
   MOCK_MODEL_ID,
   MOCK_TODOS_MODEL_ID,
+  completedCallIDs,
   completedToolNames,
+  conversationText,
+  routeByConversation,
   routeByModel,
   scriptedResponder,
+  stepResponder,
   testProviderBlock,
   toolCallTurn,
 } from "../scripts/lib/todo-smoke-host.mjs"
@@ -102,6 +106,89 @@ test("a tool call is streamed as an empty-argument start plus an argument delta"
   })
   assert.equal(finish.choices[0].finish_reason, "tool_calls")
   assert.equal(done, "[DONE]")
+})
+
+test("completedCallIDs keys on the call id, so a script may call one tool twice", () => {
+  // `completedToolNames` collapses both `todowrite` calls of the safety script
+  // into one step, which would make the second one unreachable.
+  const messages = [assistantCall("call_a", "todowrite"), toolResult("call_a")]
+  assert.deepEqual([...completedToolNames(messages)], ["todowrite"])
+  assert.deepEqual([...completedCallIDs(messages)], ["call_a"])
+  assert.deepEqual([...completedCallIDs([assistantCall("call_a", "todowrite")])], [])
+  assert.deepEqual([...completedCallIDs(undefined)], [])
+})
+
+test("conversationText reads both string content and part-array content", () => {
+  assert.equal(
+    conversationText([
+      { role: "user", content: "first" },
+      { role: "system", content: [{ type: "text", text: "second" }, { type: "image" }] },
+      { role: "assistant", content: null },
+    ]),
+    "first\nsecond",
+  )
+  assert.equal(conversationText(undefined), "")
+})
+
+test("stepResponder replays each step once, keyed on its own call id", () => {
+  const respond = stepResponder({
+    steps: [
+      { id: "one", tool: "todowrite", args: { todos: [{ content: "a" }] } },
+      { id: "two", tool: "todowrite", args: { todos: [] } },
+    ],
+    finalText: "done",
+  })
+  const call = (messages) => respond({ tools: TOOLS, messages })[1].choices[0].delta.tool_calls[0]
+
+  const first = call([])
+  assert.equal(first.id, "call_one")
+  const afterFirst = [assistantCall("call_one", "todowrite"), toolResult("call_one")]
+  const second = call(afterFirst)
+  assert.equal(second.id, "call_two")
+  assert.equal(second.function.name, "todowrite")
+
+  const afterBoth = [...afterFirst, assistantCall("call_two", "todowrite"), toolResult("call_two")]
+  const finished = respond({ tools: TOOLS, messages: afterBoth })
+  assert.equal(finished[1].choices[0].delta.content, "done")
+})
+
+test("stepResponder skips a gated step until its trigger reaches the conversation", () => {
+  const respond = stepResponder({
+    steps: [
+      { id: "mirror", tool: "todowrite", args: { todos: [{ content: "a" }] } },
+      { id: "empty", tool: "todowrite", args: { todos: [] }, when: ({ text }) => text.includes("GO") },
+    ],
+    finalText: "waiting",
+  })
+  const landed = [assistantCall("call_mirror", "todowrite"), toolResult("call_mirror")]
+
+  // Gate closed: the step is skipped, not blocked, so the mock still answers.
+  const held = respond({ tools: TOOLS, messages: landed })
+  assert.equal(held[1].choices[0].delta.content, "waiting")
+
+  const opened = respond({ tools: TOOLS, messages: [...landed, { role: "user", content: "GO now" }] })
+  assert.equal(opened[1].choices[0].delta.tool_calls[0].id, "call_empty")
+
+  // A request with no tools is still plain text, gate or no gate.
+  assert.equal(respond({ tools: [], messages: [{ role: "user", content: "GO" }] })[1].choices[0].delta.content, "ok")
+})
+
+test("stepResponder refuses a script with a duplicate step id", () => {
+  assert.throws(
+    () => stepResponder({ steps: [{ id: "x", tool: "bash" }, { id: "x", tool: "bash" }] }),
+    /duplicate step id "x"/,
+  )
+})
+
+test("routeByConversation dispatches on the first token present in the conversation", () => {
+  const respond = routeByConversation({
+    "arm-a": () => toolCallTurn("c", "goal_plan_set", {}),
+    "arm-b": () => toolCallTurn("c", "bash", {}),
+  })
+  const named = (text) => respond({ messages: [{ role: "user", content: text }] })[1].choices[0].delta.tool_calls[0]
+  assert.equal(named("please arm-a now").function.name, "goal_plan_set")
+  assert.equal(named("please arm-b now").function.name, "bash")
+  assert.equal(respond({ messages: [{ role: "user", content: "neither" }] })[1].choices[0].delta.content, "ok")
 })
 
 test("the provider block declares every model as tool-calling and free", () => {
