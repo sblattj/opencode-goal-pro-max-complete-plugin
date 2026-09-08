@@ -15799,3 +15799,84 @@ test("with mirrorTodos off the <existing_todos> offer is neither read nor render
   assert.match(onText, /<existing_todos>/)
   assert.match(onText, /- write the launch checklist \(pending\)/)
 })
+
+// Tests - a todowrite that carried no list at all (v1.0.1 fix, review finding H-F1)
+//
+// `args.todos` missing, `null`, or any non-array is the shape the host answers
+// with `SchemaError(Missing key at ["todos"])` and a "rewrite the input" note
+// (`packages/opencode/src/tool/tool.ts` decodes the arguments INSIDE
+// `item.execute`, which runs after `plugin.trigger` fires this hook). It is not
+// the taught refresh idiom, so `isEmptyList` is false for it and it reaches the
+// non-empty path - where `pickExtras(undefined, goal)` returns `{extra: [],
+// dropped: 0}` by contract and used to assign that empty array over the model's
+// kept rows. A call that says NOTHING about the extras must not delete them, for
+// the same reason the empty-list branch keeps them: it carries no rows to
+// re-derive them from.
+test("a todowrite that carried no list keeps the model's own rows instead of deleting them", async () => {
+  const sessionID = "h-f1-malformed"
+  const hooks = await t10Hooks(sessionID, [
+    { id: "a1", title: "Mirror the plan" },
+    { id: "a2", title: "Prove the malformed call" },
+  ])
+
+  // One ordinary, non-empty call seeds an extra of the model's own.
+  const seeded = { args: { todos: [t10Row("my own note")] } }
+  await hooks["tool.execute.before"]({ tool: "todowrite", sessionID, callID: "h-f1-seed" }, seeded)
+  await hooks["tool.execute.after"](
+    { tool: "todowrite", sessionID, callID: "h-f1-seed", args: seeded.args },
+    { title: "todowrite", output: "ok", metadata: {} },
+  )
+  const goal = currentGoal(sessionID)
+  assert.deepEqual(goal.mirror.extra.map((row) => row.content), ["my own note"])
+  const seededContents = seeded.args.todos.map((row) => row.content)
+
+  // Three malformed shapes, each on its own call. Every one keeps the extra, and
+  // the rows written are byte-identical to the ones the seeding call produced.
+  for (const [label, args] of [
+    ["no todos key", {}],
+    ["todos: null", { todos: null }],
+    ["todos: a string", { todos: "clear the list" }],
+  ]) {
+    goal.mirror.lastDropped = 7
+    const call = { args }
+    await hooks["tool.execute.before"](
+      { tool: "todowrite", sessionID, callID: `h-f1-${label}` },
+      call,
+    )
+    assert.deepEqual(
+      goal.mirror.extra.map((row) => row.content),
+      ["my own note"],
+      `${label}: the model's own row must survive a call that never mentioned it`,
+    )
+    assert.deepEqual(
+      call.args.todos.map((row) => row.content),
+      seededContents,
+      `${label}: the projection keeps the extra below the plan rows`,
+    )
+    // Nothing was offered, so nothing was trimmed: the tool-result note must not
+    // repeat a drop count from an earlier call.
+    assert.equal(goal.mirror.lastDropped, 0, `${label}: the drop count is reset, not inherited`)
+  }
+
+  // CONTROL 1 - the extras are still REDEFINED by a call that does carry a list,
+  // so the guard above did not disable the extras path it sits in front of.
+  const replacing = { args: { todos: [t10Row("a different note")] } }
+  await hooks["tool.execute.before"](
+    { tool: "todowrite", sessionID, callID: "h-f1-replace" },
+    replacing,
+  )
+  assert.deepEqual(goal.mirror.extra.map((row) => row.content), ["a different note"])
+
+  // CONTROL 2 - outside a live plan the mirror still leaves a malformed call
+  // completely alone, so the host answers it with its own schema error rather
+  // than the plugin inventing a `todos` key on a call that never had one.
+  const bare = "h-f1-no-plan"
+  const bareHooks = await t10Hooks(bare, null)
+  const untouched = { args: { command: "ls" } }
+  await bareHooks["tool.execute.before"](
+    { tool: "todowrite", sessionID: bare, callID: "h-f1-bare" },
+    untouched,
+  )
+  assert.equal(Object.prototype.hasOwnProperty.call(untouched.args, "todos"), false)
+  assert.deepEqual(untouched.args, { command: "ls" })
+})
