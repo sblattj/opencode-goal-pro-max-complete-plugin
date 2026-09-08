@@ -36,8 +36,8 @@ Objective label, sequence position, turns used, elapsed time against the clock, 
 
 | Rung | Proves | Result |
 |---|---|---|
-| `npm test` | an executable spec for every documented behaviour | 508 of 508 pass |
-| `npm run test:mutation` | those tests are not vacuous | 80 of 80 critical mutants killed |
+| `npm test` | an executable spec for every documented behaviour | 544 of 544 pass |
+| `npm run test:mutation` | those tests are not vacuous | 81 of 81 critical mutants killed |
 | `npm run benchmark:behavior` | six end-to-end autonomy scenarios | 6 of 6, 0 model calls |
 | `npm run release:check` | the whole gate, in order | passes in about 2.5 to 3 minutes |
 
