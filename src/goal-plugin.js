@@ -4901,6 +4901,22 @@ function inactiveGoalToolResult(
   return null
 }
 
+// v1.0.1 wave 5 (T40): CONTRACTS "Tool-description append ... (T21)" was amended after int3 so the
+// goal_plan_set/goal_action_update redraw notice is gated on mirrorMode, matching every other
+// prompt surface (design SS4.6). `buildAgentTools` is a top-level function, not a closure of
+// `createGoalPlugin` — it cannot see that function's local `mirrorMode` const, so the mode is
+// threaded in as an explicit parameter (mirroring how buildContinueMessage/buildPlanSystemLines/
+// buildCompactionContext take it) rather than "hoisted", which would require nesting this function
+// inside createGoalPlugin. Default "off" follows the house convention documented above
+// MIRROR_COMPACTION_STALE_LINE: a caller that forgets to thread the mode gets v1.0.0 behaviour, the
+// safe failure mode.
+const MIRROR_PLAN_TOOL_DESCRIPTION_APPEND =
+  " The session's Todo list is redrawn from this plan on the next todowrite call."
+
+function planToolDescription(base, mirrorMode) {
+  return mirrorMode === "off" ? base : `${base}${MIRROR_PLAN_TOOL_DESCRIPTION_APPEND}`
+}
+
 function buildAgentTools(
   toolHelper,
   handlers,
@@ -4908,6 +4924,7 @@ function buildAgentTools(
   commandName = "goal",
   isDisposed = () => false,
   commandRegistered = true,
+  mirrorMode = "off",
 ) {
   const schema = toolHelper.schema
   const run = (handler) => async (args, ctx) => {
@@ -5060,8 +5077,10 @@ function buildAgentTools(
       execute: canonicalRun("plan_get", async (sessionID) => goalToolSuccess(await handlers.getPlan(sessionID))),
     }),
     goal_plan_set: toolHelper({
-      description:
-        "Record the ordered action plan for the current goal. Decompose the objective into concrete actions; each needs a stable `id` and a `title`. Replaces the whole plan, preserving already-recorded claim/evidence/verdict for actions you keep by id. The session's Todo list is redrawn from this plan on the next todowrite call.",
+      description: planToolDescription(
+        "Record the ordered action plan for the current goal. Decompose the objective into concrete actions; each needs a stable `id` and a `title`. Replaces the whole plan, preserving already-recorded claim/evidence/verdict for actions you keep by id.",
+        mirrorMode,
+      ),
       args: {
         actions: schema.array(
           schema.object({
@@ -5082,8 +5101,10 @@ function buildAgentTools(
       }),
     }),
     goal_action_update: toolHelper({
-      description:
-        "Update one action of the goal plan. An action may only become `done` with a claim, the minimum evidence that could have falsified it (real command output, file content, or response — not your own report), and verdict `pass`. A `blocked` action must state its reason in `claim`. The session's Todo list is redrawn from this plan on the next todowrite call.",
+      description: planToolDescription(
+        "Update one action of the goal plan. An action may only become `done` with a claim, the minimum evidence that could have falsified it (real command output, file content, or response — not your own report), and verdict `pass`. A `blocked` action must state its reason in `claim`.",
+        mirrorMode,
+      ),
       args: {
         id: schema.string(),
         status: schema.enum(PLAN_ACTION_STATUSES).optional(),
@@ -9175,6 +9196,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       commandName,
       () => runtime.disposed,
       registerCommand,
+      mirrorMode,
     )
   }
 
