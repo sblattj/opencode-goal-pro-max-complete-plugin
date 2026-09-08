@@ -6745,9 +6745,47 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
     },
     "tool.execute.after": async (input, output) => {
       // >>> v101:T12 todowrite mirror: the freshness stamp, only after the write landed
-      // Reserved. T12 fills this (tool gate, mode gate, terminal drop, and the stamp call written
-      // as the exact literal CONTRACTS shows for mutation anchor 3 - EXACTLY ONE occurrence in
-      // this file, so do not repeat that literal in a comment).
+      // The stamp lives in the AFTER hook because only this hook proves the host
+      // actually wrote the list. Between the two hooks the host decodes the args
+      // (F2) and asks for permission (F5); either can abort the call, and a mirror
+      // stamped fresh for a write that never landed would suppress the very nudge
+      // that repairs it. That is the whole point of G1/F4.
+      if (input.tool !== "todowrite") return
+      if (mirrorMode === "off") return
+      const sessionID = input?.sessionID
+      if (!sessionID) return
+      // The handback (X2) completing itself, step three: a terminal snapshot only
+      // survives while the goal is gone and nothing has redrawn the list. A real,
+      // non-empty todowrite is the model taking the list back, so the snapshot has
+      // done its job and must not re-emit stale plan rows on some later empty call.
+      const todos = input.args?.todos
+      if (Array.isArray(todos) && todos.length > 0 && readMirrorTerminal(sessionID)) {
+        dropMirrorTerminal(sessionID)
+      }
+      const goal = goalStates.get(sessionID)
+      if (goal) {
+        const now = Date.now()
+        stampMirror(goal, input.args, now)
+        // The stamp is the only durable evidence that the list on screen matches
+        // this plan, so it has to reach disk with the rest of the goal record.
+        await persist(sessionID)
+      }
+
+      /**
+       * `stampMirror(goal, args, now)` -> void: record what the host was actually
+       * handed — the fingerprint over `args.todos`, the moment it landed, and the
+       * rows themselves coerced through the one row coercer so a reloaded record is
+       * spelled exactly like a freshly projected one.
+       *
+       * `nudges` is a per-goal-run budget (X5) and `extra` is owned by the
+       * before-hook's `pickExtras`, so neither is touched here.
+       */
+      function stampMirror(goal, args, now) {
+        const written = Array.isArray(args?.todos) ? args.todos : []
+        goal.mirror.fingerprint = mirrorFingerprint(written)
+        goal.mirror.at = now
+        goal.mirror.rows = written.map((row) => mirrorRow(row))
+      }
       // <<< v101:T12
 
 
