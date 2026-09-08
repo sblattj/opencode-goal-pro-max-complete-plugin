@@ -14,7 +14,7 @@ npx -y github:sblattj/opencode-goal-pro-max-complete-plugin install
 
 No `npx`? `sh install.sh`, or `curl -fsSL https://raw.githubusercontent.com/sblattj/opencode-goal-pro-max-complete-plugin/main/install.sh | sh`; from a clone, `node scripts/cli.mjs install`. Manual two-file install, upgrade and uninstall: [docs/install.md](docs/install.md).
 
-Requires Node 18 or newer and OpenCode `>=1.17.15 <2` (`engines` in `package.json`). Re-running the installer is safe: `--dry-run` previews it, `--uninstall` reverses it, `status` reports what is currently wired.
+Requires Node 18 or newer and OpenCode `>=1.17.15 <2` (`engines` in `package.json`). Re-running the installer is safe: `--dry-run` previews it, `uninstall` reverses it, `status` reports what is currently wired.
 
 ## Use
 
@@ -36,8 +36,8 @@ Objective label, sequence position, turns used, elapsed time against the clock, 
 
 | Rung | Proves | Result |
 |---|---|---|
-| `npm test` | an executable spec for every documented behaviour | 544 of 544 pass |
-| `npm run test:mutation` | those tests are not vacuous | 81 of 81 critical mutants killed |
+| `npm test` | an executable spec for every documented behaviour | 555 of 555 pass |
+| `npm run test:mutation` | those tests are not vacuous | 83 of 83 critical mutants killed |
 | `npm run benchmark:behavior` | six end-to-end autonomy scenarios | 6 of 6, 0 model calls |
 | `npm run release:check` | the whole gate, in order | passes in about 2.5 to 3 minutes |
 

@@ -66,12 +66,24 @@ nothing at all — not even a timestamp.
 | `--config-dir DIR` | Override OpenCode's global config directory. |
 | `--data-dir DIR` | Override where the plugin copy is written. |
 | `--json` | Machine-readable summary instead of the report. |
+| `--version`, `-v` | Print the package version and exit. |
+| `--help`, `-h` | Print the usage and exit. Also what a bare invocation prints. |
+
+`--config-dir` and `--data-dir` take a directory, and a value that starts with
+`-` is rejected as a typo rather than taken literally: `install --data-dir
+--dry-run` is a usage error, not an install into a directory named `--dry-run`.
+Write `--data-dir=-weird` if you really do have such a path.
 
 Exit codes: `0` ok (including "already installed"), `1` failed, `2` usage error,
 `3` refused on purpose — an unusable destination path, or a config file the
 installer will not rewrite blind.
 
-`GOAL_PLUGIN_REF=v1.0.0 sh install.sh` installs a specific tag instead of `main`.
+`GOAL_PLUGIN_REF=v1.0.0 sh install.sh` installs a specific ref instead of `main`.
+It must be a **tag or a branch**: the `git clone` fallback passes it to
+`git clone --branch`, which does not accept a commit SHA. `install.sh` passes
+its arguments through, supplying `install` only when the first one is not
+already a subcommand, so `sh install.sh status` and `sh install.sh uninstall`
+work as written.
 
 ### What it will refuse to do
 
@@ -84,9 +96,19 @@ installer will not rewrite blind.
   exactly why this is worth refusing — the tools would work, `opencode debug
   config` would look right, and the sidebar would silently never appear.
 * **Rewrite a config file it could not parse.** It prints the file and stops.
+* **Write a rewrite that does not come out right.** Every edited config is
+  re-parsed and re-checked against the entries it should hold *before* the write
+  happens; a mismatch is exit `3` with nothing changed.
 * **Delete a directory it did not create.** `uninstall` removes the plugin copy
   only when the ownership marker inside it names this package, and removes the
   installed skill only when the file still matches the shipped bytes.
+
+One deliberate **non**-refusal: on Windows the drive colon in `C:\Users\…` is
+exempt from the first rule, because every absolute Windows path has one and
+refusing it would leave no installable destination at all. The install warns
+instead — the TUI half is unverified on Windows, the server half and the skill
+are not affected — so the sidebar not appearing there has a stated reason rather
+than a silent one.
 
 It *will* remove an entry naming an **older build of this same plugin** (the
 previous package name, a `github:` spec, a tarball, another local copy) and say

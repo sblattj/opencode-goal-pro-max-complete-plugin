@@ -5,7 +5,7 @@
 // test cannot agree with the code by copying it.
 import assert from "node:assert/strict"
 import test from "node:test"
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises"
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { pathToFileURL } from "node:url"
@@ -18,10 +18,12 @@ import {
   localPathOf,
   locatePluginArray,
   parseJsonc,
+  rewritePluginArray,
   runInstall,
   runStatus,
   runUninstall,
   specForDirectory,
+  unusablePathCharacter,
 } from "../scripts/install.mjs"
 
 const PACKAGE_NAME = "opencode-goal-pro-max-complete-plugin"
@@ -610,6 +612,210 @@ test("a directory of a skill install is created lazily, not left empty on a refu
     assert.ok(result.warnings.some((warning) => warning.includes("skill")))
     assert.equal(await readMaybe(f.skillFile), null)
     assert.equal(await readMaybe(join(dirname(f.skillFile), "SKILL.md")), null)
+  } finally {
+    await f.cleanup()
+  }
+})
+
+// ---------------------------------------------------------------------------
+// Regressions from the 1.0.0 installer review
+// ---------------------------------------------------------------------------
+
+test("every array shape survives every removal, trailing comma included", () => {
+  // The shape that used to brick a config: a trailing comma plus two or more
+  // consecutive removals ending at the LAST element left an orphan `, ,`, and
+  // the installer still exited 0 saying "Restart opencode to load it."
+  const bricked = editPluginArray('{\n  "plugin": [\n    "keep",\n    "a",\n    "b",\n  ]\n}\n', {
+    remove: [1, 2],
+    add: null,
+  })
+  assert.deepEqual(looseParse(bricked).plugin, ["keep"])
+  assert.equal(/,\s*,/.test(bricked), false, `an orphan comma was left behind:\n${bricked}`)
+
+  // …and the general case, computed rather than typed: every layout crossed with
+  // every subset of removals, checked with the second, dumber parser.
+  const specs = ["a@1", "b@2", "c@3", "d@4"]
+  const add = "file:///tmp/added"
+  let checked = 0
+  for (const count of [1, 2, 3, 4]) {
+    for (const multiline of [true, false]) {
+      for (const trailingComma of [true, false]) {
+        for (const comments of multiline ? [true, false] : [false]) {
+          const items = specs.slice(0, count).map((spec) => JSON.stringify(spec))
+          const text = multiline
+            ? `{\n  "model": "x",\n  "plugin": [\n${items
+                .map((item, i) => `    ${item}${i < count - 1 || trailingComma ? "," : ""}${comments ? ` // ${i}` : ""}`)
+                .join("\n")}\n  ]\n}\n`
+            : `{ "model": "x", "plugin": [${items.join(", ")}${trailingComma ? "," : ""}] }\n`
+          const before = looseParse(text).plugin
+          for (let mask = 0; mask < 1 << count; mask += 1) {
+            const remove = [...Array(count).keys()].filter((i) => mask & (1 << i))
+            for (const wanted of [null, add]) {
+              checked += 1
+              const shape = JSON.stringify({ count, multiline, trailingComma, comments, remove, add: Boolean(wanted) })
+              const edited = editPluginArray(text, { remove, add: wanted })
+              const kept = before.filter((_, i) => !remove.includes(i))
+              const expected = wanted && !kept.includes(wanted) ? [...kept, wanted] : kept
+              let after
+              try {
+                after = looseParse(edited)
+              } catch (error) {
+                assert.fail(`${shape} produced unparseable JSON (${error.message}):\n${edited}`)
+              }
+              assert.deepEqual(after.plugin, expected, `${shape} produced ${JSON.stringify(after.plugin)}:\n${edited}`)
+              assert.equal(after.model, "x", `${shape} lost a sibling key:\n${edited}`)
+            }
+          }
+        }
+      }
+    }
+  }
+  assert.equal(checked, 360, "the matrix itself must not silently shrink")
+})
+
+test("a rewrite that does not come out right is refused, not written", () => {
+  const text = '{\n  "plugin": ["keep", "drop"]\n}\n'
+  const entries = [
+    { index: 0, entry: "keep", spec: "keep" },
+    { index: 1, entry: "drop", spec: "drop" },
+  ]
+  const config = { file: "/tmp/does-not-exist/opencode.json", exists: true, text, entries }
+
+  // The happy path still returns bytes.
+  const good = rewritePluginArray(config, { changed: true, remove: [1], removedSpecs: ["drop"], add: null })
+  assert.deepEqual(looseParse(good).plugin, ["keep"])
+
+  // A plan whose survivors disagree with what the edit produced — which is what
+  // an editor bug looks like from the outside — must throw before any write.
+  assert.throws(
+    () =>
+      rewritePluginArray(
+        { ...config, entries: [...entries, { index: 2, entry: "ghost", spec: "ghost" }] },
+        { changed: true, remove: [1], removedSpecs: ["drop"], add: null },
+      ),
+    (error) => {
+      assert.equal(error.code, "unreadable-config")
+      assert.match(error.message, /did not come out right/)
+      assert.match(error.message, /nothing was written/)
+      return true
+    },
+  )
+})
+
+test("a Windows drive colon is exempt from the path refusal, and warned about", async () => {
+  const windows = { platform: "win32" }
+  assert.equal(unusablePathCharacter("C:\\Users\\me\\AppData\\Local\\pkg", windows), null)
+  assert.equal(unusablePathCharacter("\\\\server\\share\\pkg", windows), null)
+  assert.equal(unusablePathCharacter("C:\\Users\\me\\bad:dir\\pkg", windows), ":", "a second colon is still fatal")
+  assert.equal(unusablePathCharacter("C:\\Users\\me\\bad#dir\\pkg", windows), "#")
+  // Same string, POSIX host: the drive colon has no special meaning there.
+  assert.equal(unusablePathCharacter("C:\\Users\\me\\AppData\\Local\\pkg", { platform: "linux" }), ":")
+
+  const f = await fixture("windows")
+  try {
+    const result = await runInstall({ ...f.options, platform: "win32", dryRun: true })
+    assert.ok(
+      result.warnings.some((warning) => warning.includes("drive colon") && warning.includes("sidebar")),
+      `expected the unverified-TUI warning, got ${JSON.stringify(result.warnings)}`,
+    )
+    const posix = await runInstall({ ...f.options, platform: "darwin", dryRun: true })
+    assert.deepEqual(posix.warnings, [], "the warning must be Windows-only")
+  } finally {
+    await f.cleanup()
+  }
+})
+
+test("the plugin copy lands before the config entries that name it", async () => {
+  const f = await fixture("copyfirst")
+  try {
+    const result = await runInstall(f.options)
+    const kinds = result.actions.map((action) => action.kind)
+    assert.ok(kinds.includes("copy") && kinds.includes("config"))
+    assert.ok(
+      kinds.indexOf("copy") < kinds.indexOf("config"),
+      `the copy must precede every config write, got ${JSON.stringify(kinds)}`,
+    )
+  } finally {
+    await f.cleanup()
+  }
+})
+
+test("a filesystem refusal is a sentence, not a stack trace", async () => {
+  const f = await fixture("eisdir")
+  try {
+    // A directory sitting exactly where opencode.json belongs.
+    await mkdir(join(f.configDir, "opencode.json"), { recursive: true })
+    await assert.rejects(
+      () => runInstall(f.options),
+      (error) => {
+        assert.equal(error.name, "InstallError")
+        assert.equal(error.code, "write-failed")
+        assert.match(error.message, /cannot write .*opencode\.json \(EISDIR\)/)
+        assert.match(error.hint, /directory is sitting where that file belongs/)
+        return true
+      },
+    )
+  } finally {
+    await f.cleanup()
+  }
+})
+
+test("a failed write does not leave its snapshot behind", async (t) => {
+  if (process.getuid?.() === 0) return t.skip("root ignores the read-only bit")
+  const f = await fixture("nostraybak")
+  try {
+    const file = await writeConfig(f.configDir, "opencode.json", '{\n  "plugin": []\n}\n')
+    await chmod(file, 0o444)
+    await assert.rejects(
+      () => runInstall(f.options),
+      (error) => {
+        assert.equal(error.code, "write-failed")
+        return true
+      },
+    )
+    const names = await readdir(f.configDir)
+    assert.deepEqual(
+      names.filter((name) => name.endsWith(".bak")),
+      [],
+      "a snapshot of a file that was never edited is litter",
+    )
+  } finally {
+    await chmod(join(f.configDir, "opencode.json"), 0o644).catch(() => {})
+    await f.cleanup()
+  }
+})
+
+test("uninstall leaves no empty skill directory behind", async () => {
+  const f = await fixture("skilldir")
+  try {
+    await runInstall(f.options)
+    assert.notEqual(await readMaybe(f.skillFile), null)
+    assert.ok((await readdir(f.configDir)).includes("skill"), "the fixture must have created skill/ to begin with")
+    await runUninstall(f.options)
+    assert.equal(
+      (await readdir(f.configDir)).includes("skill"),
+      false,
+      "an empty skill/ left behind is a directory the user now has to clean up by hand",
+    )
+  } finally {
+    await f.cleanup()
+  }
+})
+
+test("uninstall survives two spellings of our directory at the tail of a jsonc array", async () => {
+  const f = await fixture("tailuninstall")
+  const ours = pathToFileURL(f.dataDir).href
+  try {
+    const file = await writeConfig(
+      f.configDir,
+      "opencode.json",
+      `{\n  "model": "x",\n  "plugin": [\n    "keep-me",\n    ${JSON.stringify(ours)},\n    ${JSON.stringify(`${ours}/`)},\n  ]\n}\n`,
+    )
+    const result = await runUninstall(f.options)
+    assert.equal(result.ok, true)
+    const after = await readFile(file, "utf8")
+    assert.deepEqual(looseParse(after).plugin, ["keep-me"])
+    assert.equal(looseParse(after).model, "x")
   } finally {
     await f.cleanup()
   }

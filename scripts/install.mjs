@@ -45,6 +45,10 @@
 // truncates a path at the first '#' (@opentui/core@0.4.5 runtime-plugin.js:76,
 // used at :330). The installer refuses such a destination rather than shipping a
 // half-dead install whose server half looks fine in `opencode debug config`.
+// The one exemption is a Windows drive root (`C:\…`), which every absolute
+// Windows path carries: refusing it would leave no installable destination at
+// all, so it warns instead — see `unusablePathCharacter`. That exemption is
+// unverified rather than measured; no Windows TUI run has been recorded.
 
 import { createHash } from "node:crypto"
 import { mkdir, readFile, readdir, rm, rmdir, stat, writeFile } from "node:fs/promises"
@@ -110,6 +114,42 @@ async function exists(file) {
     return true
   } catch {
     return false
+  }
+}
+
+// A filesystem refusal is a normal outcome of installing into somebody's home
+// directory — a read-only config file, a directory sitting where a file belongs,
+// a full disk. Each one gets a sentence and a hint instead of a Node stack trace.
+const WRITE_ERROR_HINTS = {
+  EACCES: "Check the permissions on that path and the directory holding it, then re-run.",
+  EPERM: "Check the permissions on that path and the directory holding it, then re-run.",
+  EROFS: "That path is on a read-only filesystem. Pass --config-dir or --data-dir to write somewhere else.",
+  EISDIR: "A directory is sitting where that file belongs. Move or remove it, then re-run.",
+  ENOTDIR: "A path component is a file, not a directory. Move or remove it, then re-run.",
+  ENOSPC: "The disk is full.",
+  EMFILE: "Too many open files. Close something, or raise the limit with `ulimit -n`, then re-run.",
+  ENAMETOOLONG: "That path is too long for this filesystem. Pass a shorter --config-dir or --data-dir.",
+}
+
+function asWriteError(error, file) {
+  const hint = WRITE_ERROR_HINTS[error?.code]
+  if (!hint) return error
+  return new InstallError(`cannot write ${file} (${error.code})`, { code: "write-failed", hint })
+}
+
+async function writeFileSafely(file, data) {
+  try {
+    await writeFile(file, data)
+  } catch (error) {
+    throw asWriteError(error, file)
+  }
+}
+
+async function mkdirSafely(directory) {
+  try {
+    await mkdir(directory, { recursive: true })
+  } catch (error) {
+    throw asWriteError(error, directory)
   }
 }
 
@@ -352,19 +392,33 @@ export function editPluginArray(text, { remove = [], add = null } = {}) {
   const elements = located.array.elements
   const survivors = elements.filter((_, index) => !removeSet.has(index))
   const edits = []
-  const blanked = blankTrailingCommas(blankJsoncComments(text))
+  // Comments are blanked so a comma inside one is invisible, but trailing commas
+  // are NOT: `applyEdits` rewrites the ORIGINAL text, where a trailing comma is
+  // still a real byte. Scanning the trailing-comma-blanked text here made the
+  // LAST element of a trailing-comma array look like it had no separator, sent
+  // it down the backward branch, and merged its deletion with the one before it
+  // — leaving an orphan `, ,` that no JSON or JSONC parser accepts.
+  const scan = blankJsoncComments(text)
 
   for (const [index, element] of elements.entries()) {
     if (!removeSet.has(index)) continue
     let start = element.start
     let end = element.end
     // Take the separating comma with the element: forward first, then backward.
-    const forward = skipWhitespace(blanked, end)
-    if (blanked[forward] === ",") end = forward + 1
-    else {
+    const forward = skipWhitespace(scan, end)
+    if (scan[forward] === ",") {
+      end = forward + 1
+      // …and the run of spaces behind it, so removing the first element of a
+      // one-line array does not leave `[ "kept"]`.
+      while (end < scan.length && (scan[end] === " " || scan[end] === "\t")) end += 1
+    } else {
       let back = start - 1
-      while (back > located.array.start && " \t\r\n".includes(blanked[back])) back -= 1
-      if (blanked[back] === ",") start = back
+      while (back > located.array.start && " \t\r\n".includes(scan[back])) back -= 1
+      if (scan[back] === ",") start = back
+      // The element was last and had no comma of its own: its line is going with
+      // it, so take the newline too rather than leaving a blank line behind.
+      const tail = text.indexOf("\n", end)
+      if (tail !== -1 && scan.slice(end, tail).trim() === "") end = tail + 1
     }
     // When the element had a line to itself, take the whole line — including a
     // trailing comment, which described the entry that is going away. A comment
@@ -372,7 +426,7 @@ export function editPluginArray(text, { remove = [], add = null } = {}) {
     const lineStart = text.lastIndexOf("\n", start - 1) + 1
     const newline = text.indexOf("\n", end)
     const lineEnd = newline === -1 ? text.length : newline + 1
-    if (blanked.slice(lineStart, start).trim() === "" && blanked.slice(end, lineEnd).trim() === "") {
+    if (scan.slice(lineStart, start).trim() === "" && scan.slice(end, lineEnd).trim() === "") {
       start = lineStart
       end = lineEnd
     }
@@ -448,11 +502,32 @@ export function specForDirectory(directory) {
   return pathToFileURL(path.resolve(directory)).href.replace(/\/+$/, "")
 }
 
-/** `:` and `#` are fatal to the TUI half. Returns the offending character, or null. */
-export function unusablePathCharacter(target) {
-  if (target.includes(":")) return ":"
-  if (target.includes("#")) return "#"
+/**
+ * `:` and `#` are fatal to the TUI half. Returns the offending character, or null.
+ *
+ * On Windows the drive root is exempt. Every absolute Windows path carries a
+ * drive colon (`path.win32.resolve(homedir(), pkg)` is always `C:\…`), so
+ * checking the whole string refuses every possible destination — there is no
+ * colon-free path to point `--data-dir` at, and `install` becomes an
+ * unconditional exit 3. Only a colon the user can actually remove is refused.
+ * The exemption is a carve-out, not a clean bill of health: no Windows TUI run
+ * has been recorded, so `install` warns (see `windowsTuiWarning`).
+ */
+export function unusablePathCharacter(target, { platform = process.platform } = {}) {
+  const body = platform === "win32" ? target.slice(path.win32.parse(target).root.length) : target
+  if (body.includes(":")) return ":"
+  if (body.includes("#")) return "#"
   return null
+}
+
+/** Said on Windows, where the drive colon is exempt but unverified. */
+export function windowsTuiWarning(dataDir) {
+  return (
+    `${dataDir} contains a drive colon, which is unavoidable on Windows and is exempt from the path check — but a ` +
+    "colon is exactly what breaks the TUI half's module loader on the hosts this was measured on, and no Windows " +
+    "run has been recorded. The server half (the /goal command, the tools, the hooks) and the skill are unaffected. " +
+    "If the sidebar panel never appears, that is the reason."
+  )
 }
 
 // ---------------------------------------------------------------------------
@@ -595,6 +670,7 @@ async function readMarker(dataDir) {
 async function resolveContext(options = {}) {
   const env = options.env ?? process.env
   const home = options.home ?? homedir()
+  const platform = options.platform ?? process.platform
   const sourceDir = path.resolve(options.sourceDir ?? PACKAGE_DIRECTORY)
   const manifestBuffer = await readFileOrNull(path.join(sourceDir, "package.json"))
   if (manifestBuffer === null) {
@@ -607,6 +683,7 @@ async function resolveContext(options = {}) {
   return {
     env,
     home,
+    platform,
     sourceDir,
     manifest,
     packageName,
@@ -622,19 +699,80 @@ async function resolveContext(options = {}) {
   }
 }
 
-async function snapshot(file, text, { stamp, actions, dryRun, backup }) {
-  if (!backup) return
-  const target = `${file}.${stamp}.bak`
-  actions.push({ kind: "snapshot", label: "Snapshot", path: target })
-  if (!dryRun) await writeFile(target, text)
+/**
+ * Every rewrite is re-parsed and re-checked BEFORE anything is written: the
+ * result must parse the way OpenCode parses it, and its `plugin` array must hold
+ * exactly the survivors plus the entry being added. An edit bug is then a
+ * refusal that touches nothing, rather than a config file OpenCode can no longer
+ * read — which would take the user's model, agents, MCP servers and every other
+ * plugin with it.
+ */
+export function rewritePluginArray(config, plan) {
+  const next = editPluginArray(config.text, { remove: plan.remove, add: plan.add })
+  if (next === config.text) return null
+  const removeSet = new Set(plan.remove)
+  const kept = config.entries.filter((entry) => !removeSet.has(entry.index)).map((entry) => entry.entry)
+  const expected = plan.add && !kept.some((entry) => specOf(entry) === plan.add) ? [...kept, plan.add] : kept
+  const refuse = (detail) =>
+    new InstallError(`the edit to ${config.file} did not come out right (${detail}); nothing was written`, {
+      code: "unreadable-config",
+      hint:
+        "This is a bug in this installer, not in your config, and your file is untouched. Please report it with " +
+        `the "plugin" array from ${config.file}. The manual two-file install in docs/install.md works meanwhile.`,
+    })
+  let parsed
+  try {
+    parsed = parseJsonc(next)
+  } catch (error) {
+    throw refuse(`the result would not parse back: ${error.message}`)
+  }
+  const got = Array.isArray(parsed.plugin) ? parsed.plugin : []
+  if (JSON.stringify(got) !== JSON.stringify(expected)) {
+    throw refuse(`the resulting entries are ${JSON.stringify(got)}, expected ${JSON.stringify(expected)}`)
+  }
+  return next
 }
 
-async function writeConfigChange(config, plan, { schema, actions, dryRun, backup, stamp, label }) {
-  if (!plan.changed) return false
+async function snapshot(file, text, { stamp, actions, dryRun, backup }) {
+  if (!backup) return null
+  const target = `${file}.${stamp}.bak`
+  actions.push({ kind: "snapshot", label: "Snapshot", path: target })
+  if (!dryRun) await writeFileSafely(target, text)
+  return dryRun ? null : target
+}
+
+/**
+ * Write `next` over `file`, removing the snapshot taken just before it when the
+ * write fails: a `.bak` of a file that was never edited is litter the user then
+ * has to identify and clean up by hand.
+ */
+async function writeWithSnapshot(file, next, backupFile) {
+  try {
+    await writeFileSafely(file, next)
+  } catch (error) {
+    if (backupFile) await rm(backupFile, { force: true }).catch(() => {})
+    throw error
+  }
+}
+
+/**
+ * The pure half of a config write: decide the exact bytes, and refuse here if
+ * anything is wrong. Nothing on disk has been touched when this returns, which
+ * is what lets `runInstall` validate every file before it writes the first one.
+ */
+function planConfigWrite(config, plan, { schema, label }) {
+  if (!plan.changed) return null
+  // A file that does not exist is created from scratch, which only makes sense
+  // when there is an entry to put in it.
+  if (!config.exists) return plan.add ? { config, plan, next: null, schema, label } : null
+  const next = rewritePluginArray(config, plan)
+  if (next === null) return null
+  return { config, plan, next, schema, label }
+}
+
+async function applyConfigWrite({ config, plan, next, schema, label }, { actions, dryRun, backup, stamp }) {
   if (config.exists) {
-    const next = editPluginArray(config.text, { remove: plan.remove, add: plan.add })
-    if (next === config.text) return false
-    await snapshot(config.file, config.text, { stamp, actions, dryRun, backup })
+    const backupFile = await snapshot(config.file, config.text, { stamp, actions, dryRun, backup })
     for (const removed of plan.removedSpecs) {
       actions.push({
         kind: "removed-entry",
@@ -644,14 +782,14 @@ async function writeConfigChange(config, plan, { schema, actions, dryRun, backup
       })
     }
     if (plan.add) actions.push({ kind: "config", label, path: config.file, detail: plan.add })
-    if (!dryRun) await writeFile(config.file, next)
+    if (!dryRun) await writeWithSnapshot(config.file, next, backupFile)
     return true
   }
   const body = `{\n  "$schema": "${schema}",\n  "plugin": [${JSON.stringify(plan.add)}]\n}\n`
   actions.push({ kind: "config", label, path: config.file, detail: plan.add, created: true })
   if (!dryRun) {
-    await mkdir(path.dirname(config.file), { recursive: true })
-    await writeFile(config.file, body)
+    await mkdirSafely(path.dirname(config.file))
+    await writeFileSafely(config.file, body)
   }
   return true
 }
@@ -674,7 +812,7 @@ export async function runInstall(options = {}) {
   let tuiConfigFile = null
 
   if (!ctx.skillOnly) {
-    const bad = unusablePathCharacter(ctx.dataDir)
+    const bad = unusablePathCharacter(ctx.dataDir, { platform: ctx.platform })
     if (bad) {
       throw new InstallError(
         `refusing to install into ${ctx.dataDir}: the path contains ${JSON.stringify(bad)}.`,
@@ -688,6 +826,7 @@ export async function runInstall(options = {}) {
         },
       )
     }
+    if (ctx.platform === "win32") warnings.push(windowsTuiWarning(ctx.dataDir))
 
     copy = await planCopy({ sourceDir: ctx.sourceDir, dataDir: ctx.dataDir })
     const marker = await readMarker(ctx.dataDir)
@@ -727,44 +866,32 @@ export async function runInstall(options = {}) {
     const serverConfigs = await readCandidates(SERVER_CONFIG_CANDIDATES, serverConfigFile)
     const tuiConfigs = await readCandidates(TUI_CONFIG_CANDIDATES, tuiConfigFile)
 
-    for (const config of serverConfigs) {
-      if (!config.exists && config.file !== serverConfigFile) continue
-      const plan = planConfigFile(config, {
-        spec: ctx.spec,
-        dataDir: ctx.dataDir,
-        mode: "install",
-        isTarget: config.file === serverConfigFile,
-        home: ctx.home,
-      })
-      await writeConfigChange(config, plan, {
-        schema: CONFIG_SCHEMA,
-        actions,
-        dryRun: ctx.dryRun,
-        backup: ctx.backup,
-        stamp,
-        label: "Config written",
-      })
+    // Everything that can refuse runs before anything is written: the unreadable
+    // target config above, then every plugin-array rewrite, each one re-parsed
+    // and re-checked by `rewritePluginArray`.
+    const configWrites = []
+    for (const [configs, target, schema, label] of [
+      [serverConfigs, serverConfigFile, CONFIG_SCHEMA, "Config written"],
+      [tuiConfigs, tuiConfigFile, TUI_SCHEMA, "TUI config"],
+    ]) {
+      for (const config of configs) {
+        if (!config.exists && config.file !== target) continue
+        const plan = planConfigFile(config, {
+          spec: ctx.spec,
+          dataDir: ctx.dataDir,
+          mode: "install",
+          isTarget: config.file === target,
+          home: ctx.home,
+        })
+        const write = planConfigWrite(config, plan, { schema, label })
+        if (write) configWrites.push(write)
+      }
     }
 
-    for (const config of tuiConfigs) {
-      if (!config.exists && config.file !== tuiConfigFile) continue
-      const plan = planConfigFile(config, {
-        spec: ctx.spec,
-        dataDir: ctx.dataDir,
-        mode: "install",
-        isTarget: config.file === tuiConfigFile,
-        home: ctx.home,
-      })
-      await writeConfigChange(config, plan, {
-        schema: TUI_SCHEMA,
-        actions,
-        dryRun: ctx.dryRun,
-        backup: ctx.backup,
-        stamp,
-        label: "TUI config",
-      })
-    }
-
+    // The plugin files land BEFORE the config entries that name them. The other
+    // order leaves OpenCode pointed at a directory that does not exist whenever
+    // a copy fails — not fatal to the host, but a wiring the user never asked
+    // for and has to undo by hand.
     const changedFiles = copy.filter((file) => file.changed)
     if (changedFiles.length > 0) {
       actions.push({
@@ -775,10 +902,14 @@ export async function runInstall(options = {}) {
       })
       if (!ctx.dryRun) {
         for (const file of changedFiles) {
-          await mkdir(path.dirname(file.to), { recursive: true })
-          await writeFile(file.to, file.buffer)
+          await mkdirSafely(path.dirname(file.to))
+          await writeFileSafely(file.to, file.buffer)
         }
       }
+    }
+
+    for (const write of configWrites) {
+      await applyConfigWrite(write, { actions, dryRun: ctx.dryRun, backup: ctx.backup, stamp })
     }
 
     // Files an older version of this installer wrote and this one does not.
@@ -803,8 +934,8 @@ export async function runInstall(options = {}) {
       if (current === null || !current.equals(source)) {
         actions.push({ kind: "skill", label: "Skill", path: skillTarget, detail: SKILL_NAME })
         if (!ctx.dryRun) {
-          await mkdir(path.dirname(skillTarget), { recursive: true })
-          await writeFile(skillTarget, source)
+          await mkdirSafely(path.dirname(skillTarget))
+          await writeFileSafely(skillTarget, source)
         }
       }
     }
@@ -836,8 +967,8 @@ export async function runInstall(options = {}) {
     }
     actions.push({ kind: "marker", label: "Marker", path: markerPath })
     if (!ctx.dryRun) {
-      await mkdir(ctx.dataDir, { recursive: true })
-      await writeFile(markerPath, `${JSON.stringify(body, null, 2)}\n`)
+      await mkdirSafely(ctx.dataDir)
+      await writeFileSafely(markerPath, `${JSON.stringify(body, null, 2)}\n`)
     }
   }
 
@@ -888,16 +1019,25 @@ export async function runUninstall(options = {}) {
       home: ctx.home,
     })
     if (!plan.changed) continue
-    const next = editPluginArray(config.text, { remove: plan.remove, add: null })
-    if (next === config.text) continue
-    await snapshot(config.file, config.text, { stamp, actions, dryRun: ctx.dryRun, backup: ctx.backup })
+    // Re-parsed and re-checked before it is written, exactly as install is: two
+    // spellings of our own directory sitting at the tail of a trailing-comma
+    // array is the same edit shape, and a bricked config here would be worse —
+    // the user is trying to REMOVE this thing.
+    const next = rewritePluginArray(config, plan)
+    if (next === null) continue
+    const backupFile = await snapshot(config.file, config.text, {
+      stamp,
+      actions,
+      dryRun: ctx.dryRun,
+      backup: ctx.backup,
+    })
     actions.push({
       kind: "removed-entry",
       label: "Removed",
       path: config.file,
       detail: plan.removedSpecs.map((spec) => JSON.stringify(spec)).join(", "),
     })
-    if (!ctx.dryRun) await writeFile(config.file, next)
+    if (!ctx.dryRun) await writeWithSnapshot(config.file, next, backupFile)
   }
 
   const marker = await readMarker(ctx.dataDir)
@@ -911,7 +1051,10 @@ export async function runUninstall(options = {}) {
       actions.push({ kind: "skill-removed", label: "Removed", path: skillTarget })
       if (!ctx.dryRun) {
         await rm(skillTarget, { force: true })
+        // The skill's own directory, then the `skill/` root that held it. Both
+        // rmdir calls fail harmlessly when anything else lives there.
         await rmdir(path.dirname(skillTarget)).catch(() => {})
+        await rmdir(path.dirname(path.dirname(skillTarget))).catch(() => {})
       }
     } else {
       warnings.push(`${skillTarget} has local edits (or came from elsewhere); leaving it in place`)

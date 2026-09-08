@@ -148,3 +148,37 @@ test("verify is delegated to the shipped verifier", async () => {
   assert.match(result.stdout, /installation verification/)
   assert.match(result.stdout, /is installed correctly/)
 })
+
+test("a flag value that looks like a flag is a usage error, not a directory", async () => {
+  const s = await scratch("flagvalue")
+  try {
+    // `--data-dir --dry-run` used to swallow the flag as the directory: a real
+    // install into a directory literally named "--dry-run", exit 0, "Restart
+    // opencode to load it."
+    for (const argv of [
+      ["install", "--config-dir", s.configDir, "--data-dir", "--dry-run"],
+      ["install", "--data-dir", s.dataDir, "--config-dir", "--json"],
+    ]) {
+      const result = await cliRun(argv, { cwd: s.root })
+      assert.equal(result.code, 2, `${argv.join(" ")} must be a usage error, got ${result.code}`)
+      assert.match(result.stderr, /needs a directory, but the next argument is/)
+      assert.equal(result.stdout, "", "a usage error must not report work it did not do")
+    }
+    assert.ok(await missing(join(s.root, "--dry-run")), "nothing may be created under the swallowed flag's name")
+    assert.ok(await missing(join(s.configDir, "opencode.json")))
+
+    // Control: the same value bound with `=` is taken literally, and a real
+    // directory after the flag still works.
+    const inline = await cliRun([
+      "install",
+      `--config-dir=${s.configDir}`,
+      `--data-dir=${s.dataDir}`,
+      "--dry-run",
+      "--json",
+    ])
+    assert.equal(inline.code, 0, inline.stderr)
+    assert.equal(JSON.parse(inline.stdout).dataDir, s.dataDir)
+  } finally {
+    await s.cleanup()
+  }
+})
