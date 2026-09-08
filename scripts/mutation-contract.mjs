@@ -665,6 +665,12 @@ const mutants = [
     to: "",
     test: "test/goal-plugin.test.js",
   },
+  // >>> v101:T29 the seven todo-mirror mutation anchors (design §5.3)
+  // Reserved. T29 adds the seven mutants here, as the LAST elements of `mutants`.
+  // <<< v101:T29
+
+
+
 ]
 
 try {

@@ -12798,3 +12798,154 @@ test("the terminal sidebar render keeps the context ceiling learned from the mod
   // that every earlier render had.
   assert.deepEqual(finished.context, { used: 147_100, max: 1_000_000 })
 })
+
+// >>> v101:T1 tests - mirrorRowStatus / mirrorRowSuffix
+// T1 units: 2, 3 (titles verbatim in CONTRACTS "Unit inventory" / design §5.1).
+// <<< v101:T1
+
+
+
+// >>> v101:T2 tests - projectPlanToTodos
+// T2 units: 1, 5, 6.
+// <<< v101:T2
+
+
+
+// >>> v101:T3 tests - mirrorRow / mirrorRowPriority
+// T3 units: 1, 4.
+// <<< v101:T3
+
+
+
+// >>> v101:T4 tests - mirrorFingerprint
+// T4 units: 26.
+// <<< v101:T4
+
+
+
+// >>> v101:T5 tests - isMirrorOwnedRow / pickExtras
+// T5 units: 12, 14, 15.
+// <<< v101:T5
+
+
+
+// >>> v101:T6 tests - boundExtraContent / resetMirrorForNewGoal
+// T6 units: 39, 40.
+// <<< v101:T6
+
+
+
+// >>> v101:T7 tests - normalizeMirrorMode and the mirrorTodos option
+// T7 units: 24.
+// <<< v101:T7
+
+
+
+// >>> v101:T8 tests - normalizeMirror and the persisted record
+// T8 units: 25.
+// <<< v101:T8
+
+
+
+// >>> v101:T9 tests - mirrorTerminals snapshot accessors
+// T9 units: 41.
+// <<< v101:T9
+
+
+
+// >>> v101:T10 tests - the before-hook signature, tool gate and guard ladder
+// T10 units: 7, 8, 9, 10, 11, 47.
+// <<< v101:T10
+
+
+
+// >>> v101:T11 tests - the empty-todowrite interception (X1)
+// T11 units: 13, 42, 43, 44, 45.
+// <<< v101:T11
+
+
+
+// >>> v101:T12 tests - the after-hook freshness stamp
+// T12 units: 16, 17, 46.
+// <<< v101:T12
+
+
+
+// >>> v101:T13 tests - the after-hook result note
+// T13 units: 13, 15b, 18 (15b = "dropped extras are named in the tool result only when the cap trimmed them").
+// <<< v101:T13
+
+
+
+// >>> v101:T14 tests - staleness, mirror state and the nudge budget
+// T14 units: 19, 20, 21, 22.
+// <<< v101:T14
+
+
+
+// >>> v101:T15 tests - the stall-brake exemption
+// T15 units: 27, 28.
+// <<< v101:T15
+
+
+
+// >>> v101:T16 tests - /goal resume refunds the nudge budget
+// T16 units: 23.
+// <<< v101:T16
+
+
+
+// >>> v101:T17 tests - the goal-end snapshot and the handback line
+// T17 units: 41, 48.
+// <<< v101:T17
+
+
+
+// >>> v101:T18 tests - the plan system-block sentence
+// T18 units: 49.
+// <<< v101:T18
+
+
+
+// >>> v101:T19 tests - the continuation nudge line
+// T19 units: 20.
+// <<< v101:T19
+
+
+
+// >>> v101:T20 tests - the compaction stale line
+// T20 units: 50.
+// <<< v101:T20
+
+
+
+// >>> v101:T21 tests - the two plan tool descriptions
+// T21 units: 51.
+// <<< v101:T21
+
+
+
+// >>> v101:T22 tests - the tool.definition todowrite suffix
+// T22 units: 30, 31, 52.
+// <<< v101:T22
+
+
+
+// >>> v101:T23 tests - the v3 sidebar payload
+// T23 units: 38 (a §5.2 cross-half parity unit: assert the SERVER half of it here, the panel half in test/goal-sidebar-panel.test.js).
+// <<< v101:T23
+
+
+
+// >>> v101:T38 tests - the <existing_todos> offer on /goal set
+// T38 units: 29.
+// <<< v101:T38
+
+
+
+// >>> v101:T28 tests - the ledger-isolation guard
+// T28 units: 32.
+// <<< v101:T28
+
+
+

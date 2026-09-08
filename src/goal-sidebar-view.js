@@ -167,6 +167,33 @@ function normalizeAction(raw) {
   }
 }
 
+// >>> v101:T24 exception-list filter for the mirrored action list (G2)
+// Reserved. T24 filters `goalPanelModel`'s action list to done-unverified, then blocked, then
+// in_progress when `plan.mirror` exists and its state is not "off".
+// <<< v101:T24
+
+
+
+// >>> v101:T25 mirror suffix on the progress line
+// Reserved. T25 adds the ` · todo mirror fresh (n)` / ` · todo list stale` suffix and the
+// `{ liveTodoCount }` options argument.
+// <<< v101:T25
+
+
+
+// >>> v101:T26 live drift check
+// Reserved. T26 reads the live todo count in `GoalPanel` and renders the drift suffix.
+// <<< v101:T26
+
+
+
+// >>> v101:T39 the needs-evidence suffix on a panel action line (A3)
+// Reserved. T39 appends ` — needs claim/evidence/verdict` in `actionLine` for a done action
+// with no passing verdict.
+// <<< v101:T39
+
+
+
 /**
  * Turn a `session.metadata.goal` payload into everything the panel renders.
  * Returns `null` when there is no goal — including after `/goal clear`, which

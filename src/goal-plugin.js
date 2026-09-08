@@ -5241,6 +5241,227 @@ function createChildSessionAuditor(
   }
 }
 
+// >>> v101:CONST todo-mirror bounds, id separator, tool set and mode set
+const MIRROR_MAX_TODOS = 20          // plan rows incl. the overflow row
+const MIRROR_MAX_EXTRAS = 10         // model-authored rows kept after the plan rows
+const MIRROR_EXTRA_TEXT_LIMIT = 120  // bound on each extra row's content (via summarizeText)
+const MIRROR_MAX_NUDGES = 3          // per goal-run total; refunded only by /goal resume
+const MIRROR_ID_SEPARATOR = " · "    // between the action id and the title in a mirrored row
+const MIRROR_TOOL_NAMES = new Set(["todowrite"])
+const MIRROR_MODES = new Set(["plan", "off"])
+// <<< v101:CONST
+
+
+
+// >>> v101:T1 plan action -> mirrored row status and suffix
+/**
+ * `mirrorRowStatus(action)` -> `"pending" | "in_progress" | "completed"`: pending->pending;
+ * in_progress->in_progress; done AND `planActionVerified(action)`->completed; done not
+ * verified->in_progress; blocked->in_progress. The verified branch must be written as the exact
+ * literal shown in CONTRACTS (mutation anchor 2); that literal must occur EXACTLY ONCE in this
+ * file, so do not repeat it in a comment.
+ */
+function mirrorRowStatus(action) {
+  throw new Error("v1.0.1 T1: not implemented")
+}
+
+/**
+ * `mirrorRowSuffix(action)` -> string per the CONTRACTS Strings section: `""` for
+ * pending/in_progress/verified-done, ` — needs claim/evidence/verdict` for a done action with no
+ * passing verdict, ` — BLOCKED: <reason head>` (60 chars via `summarizeText`, `no reason recorded`
+ * when none) for a blocked action.
+ */
+function mirrorRowSuffix(action) {
+  throw new Error("v1.0.1 T1: not implemented")
+}
+// <<< v101:T1
+
+
+
+// >>> v101:T2 plan -> native todo rows, with the one counted overflow row
+/**
+ * `projectPlanToTodos(plan, extras)` -> row[]: plan rows in plan order; if
+ * `plan.actions.length > MIRROR_MAX_TODOS`, emit the first `MIRROR_MAX_TODOS - 1` actions then ONE
+ * overflow row (so plan rows never exceed 20); then append `extras` (already bounded and capped by
+ * T5/T6) unchanged. `plan` may be `undefined`/have no actions -> returns `[...extras]`. Every row
+ * passes through `mirrorRow(...)` (T3). Priority: keep a running `index` = number of NON-completed
+ * rows emitted before this one and write the priority property exactly as CONTRACTS shows
+ * (mutation anchor 4); that literal must occur EXACTLY ONCE in this file, so do not repeat it in
+ * a comment.
+ */
+function projectPlanToTodos(plan, extras) {
+  throw new Error("v1.0.1 T2: not implemented")
+}
+// <<< v101:T2
+
+
+
+// >>> v101:T3 the three-required-strings invariant, and the row priority
+/**
+ * `mirrorRow({ content, status, priority })` -> `{ content: string, status: string, priority: string }`:
+ * coerces via `String(...)`, never emits `undefined`/`null`; missing status -> `"pending"`, missing
+ * priority -> `"medium"`, empty/missing content -> `"(untitled)"`.
+ */
+function mirrorRow({ content, status, priority } = {}) {
+  throw new Error("v1.0.1 T3: not implemented")
+}
+
+/**
+ * `mirrorRowPriority(action, index)` -> `"low" | "high" | "medium"`: completed (per
+ * `mirrorRowStatus`) -> low; `index === 0` -> high; else medium.
+ */
+function mirrorRowPriority(action, index) {
+  throw new Error("v1.0.1 T3: not implemented")
+}
+// <<< v101:T3
+
+
+
+// >>> v101:T4 fingerprint over the rendered rows, never over the plan
+/**
+ * `mirrorFingerprint(rows)` -> string: sha256 hex (node:crypto) over
+ * `JSON.stringify(rows.map(r => [r.content, r.status, r.priority]))`; `[]` -> the hash of `"[]"`,
+ * never `""`.
+ */
+function mirrorFingerprint(rows) {
+  throw new Error("v1.0.1 T4: not implemented")
+}
+// <<< v101:T4
+
+
+
+// >>> v101:T5 the extras picker: rows the model authored, kept and capped
+/**
+ * `isMirrorOwnedRow(content, goal)` -> boolean: content starts with `${id}${MIRROR_ID_SEPARATOR}`
+ * for an id currently in `goal.plan.actions`, OR matches the overflow row pattern
+ * `^\+\d+ more actions — \/goal status$`.
+ */
+function isMirrorOwnedRow(content, goal) {
+  throw new Error("v1.0.1 T5: not implemented")
+}
+
+/**
+ * `pickExtras(incoming, goal)` -> `{ extra: row[], dropped: number }`: rows of `incoming` that are
+ * NOT owned, each coerced through `mirrorRow` and content-bounded with `boundExtraContent(content)`
+ * (T6), first `MIRROR_MAX_EXTRAS` kept, `dropped` = the rest. Non-array/absent `incoming` ->
+ * `{ extra: [], dropped: 0 }`.
+ */
+function pickExtras(incoming, goal) {
+  throw new Error("v1.0.1 T5: not implemented")
+}
+// <<< v101:T5
+
+
+
+// >>> v101:T6 extras bounding, and the reset on a new goal
+/**
+ * `boundExtraContent(content)` -> string: the bound T5 calls, `summarizeText(content,
+ * MIRROR_EXTRA_TEXT_LIMIT)`.
+ */
+function boundExtraContent(content) {
+  throw new Error("v1.0.1 T6: not implemented")
+}
+
+/**
+ * `resetMirrorForNewGoal(goal)` sets `goal.mirror = normalizeMirror()`; T6 wires that ONE call site
+ * on the goal-set path and names the function it edited.
+ */
+function resetMirrorForNewGoal(goal) {
+  throw new Error("v1.0.1 T6: not implemented")
+}
+// <<< v101:T6
+
+
+
+// >>> v101:T7 the mirrorTodos option
+/**
+ * `normalizeMirrorMode(value)` -> `"plan" | "off"` (anything not in `MIRROR_MODES` -> `"plan"`).
+ * SCAFFOLD STUB: returns `"plan"` unconditionally so the factory's option read is live from wave 1;
+ * T7 replaces this with the real normalizer.
+ */
+function normalizeMirrorMode(value) {
+  return "plan"
+}
+// <<< v101:T7
+
+
+
+// >>> v101:T8 the persisted mirror record, read side
+/**
+ * `normalizeMirror(raw)` -> `{ fingerprint: string, at: number, rows: row[], nudges: number,
+ * extra: row[] }` with defaults `{ "", 0, [], 0, [] }`, each field coerced; wired into
+ * `normalizePersistedGoal` (`goal.mirror = normalizeMirror(rawGoal.mirror)`) and into the in-memory
+ * goal record creation. No write-side change (`serializeGoal` spreads the goal).
+ * SCAFFOLD STUB: minimal and un-hardened (no per-field coercion, no call sites) so a goal record
+ * carrying a mirror field never throws before T8 lands; T8 hardens it and wires it.
+ */
+function normalizeMirror(raw) {
+  const source = raw && typeof raw === "object" ? raw : {}
+  return { fingerprint: "", at: 0, rows: [], nudges: 0, extra: [], ...source }
+}
+// <<< v101:T8
+
+
+
+// >>> v101:T9 the mirrorTerminals collection and its snapshot accessors
+/**
+ * `mirrorTerminals` = `runtimeCollection("mirrorTerminals")` beside `sidebarTerminals` (and the
+ * matching `new Map()` in `createRuntimeState`); `snapshotMirror(sessionID, goal, now)` -> void
+ * stores `{ rows: goal.mirror.rows, at: now }`, only when `goal.mirror.rows.length > 0`.
+ * SCAFFOLD STUB: a no-op that returns undefined, so wave-2 hooks may call it before T9 lands.
+ */
+function snapshotMirror(sessionID, goal, now) {
+  return undefined
+}
+
+/**
+ * `readMirrorTerminal(sessionID)` -> `{ rows, at } | undefined`.
+ * SCAFFOLD STUB: always `undefined`, so wave-2 hooks may call it before T9 lands.
+ */
+function readMirrorTerminal(sessionID) {
+  return undefined
+}
+
+/**
+ * `dropMirrorTerminal(sessionID)` -> void.
+ * SCAFFOLD STUB: a no-op, so wave-2 hooks may call it before T9 lands.
+ */
+function dropMirrorTerminal(sessionID) {
+  return undefined
+}
+// <<< v101:T9
+
+
+
+// >>> v101:T14 mirror staleness, the mirror state, and the nudge budget
+/**
+ * `mirrorIsFresh(goal)` -> boolean: `goal.mirror.at > 0 &&
+ * mirrorFingerprint(projectPlanToTodos(goal.plan, goal.mirror.extra)) === goal.mirror.fingerprint`.
+ */
+function mirrorIsFresh(goal) {
+  throw new Error("v1.0.1 T14: not implemented")
+}
+
+/**
+ * `mirrorState(goal, mirrorMode)` -> `"fresh" | "stale" | "off"`.
+ */
+function mirrorState(goal, mirrorMode) {
+  throw new Error("v1.0.1 T14: not implemented")
+}
+
+/**
+ * `mirrorNudgeLine(goal, mirrorMode)` -> string: returns the nudge line and increments
+ * `goal.mirror.nudges` ONLY when mode is plan, a live plan with >=1 action exists, the mirror is
+ * stale, and `nudges < MIRROR_MAX_NUDGES`; otherwise `""` with no side effect. Wire ONE emission
+ * into the `goal_action_update` tool result (function `updateAction`), after its existing text.
+ */
+function mirrorNudgeLine(goal, mirrorMode) {
+  throw new Error("v1.0.1 T14: not implemented")
+}
+// <<< v101:T14
+
+
+
 async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) {
   if (pluginOptions.completionAudit && pluginOptions.registerAgents === false) {
     throw new TypeError("completionAudit requires registerAgents to remain enabled")
@@ -5271,6 +5492,10 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
   // Opt-out for deployments that deliberately drive execution from a planning
   // agent. Defaults to false: unattended work must not escape Plan mode.
   const allowGoalExecutionFromPlan = pluginOptions.allowGoalExecutionFromPlan === true
+
+  // Todo mirror. `mirrorTodos: "off"` restores v1.0.0 behaviour on every surface;
+  // the normalizer defaults anything else to "plan" (T7 hardens it).
+  const mirrorMode = normalizeMirrorMode(pluginOptions.mirrorTodos)
 
   // Sidebar goal status. On by default: an unattended goal you cannot see is
   // the whole problem this solves. Two kill switches, because the mechanism
@@ -6373,6 +6598,45 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       throw new Error(
         `This /${commandName} control command has already been handled. Tool "${input?.tool || "unknown"}" was blocked because no tool calls are allowed while its result is being reported. Wait for a separate user turn before using tools or modifying work or goal state.`,
       )
+      // >>> v101:T10 todowrite mirror: hook signature, tool gate and the guard ladder
+      // Reserved. Unreachable until T10 restructures the ladder above: today this hook returns
+      // early unless the turn is a control turn, and then always throws. T10 rewrites the hook to
+      // `async (input, output)` and moves this region into the live path.
+      // <<< v101:T10
+
+
+
+      // >>> v101:T11 todowrite mirror: the empty-call interception (X1)
+      // Reserved. T11 fills this with the A1 ladder, placed BEFORE the `!goal` return and AFTER
+      // the `mirrorMode === "off"` return that T10 writes.
+      // <<< v101:T11
+
+
+
+    },
+    "tool.execute.after": async (input, output) => {
+      // >>> v101:T12 todowrite mirror: the freshness stamp, only after the write landed
+      // Reserved. T12 fills this (tool gate, mode gate, terminal drop, and the stamp call written
+      // as the exact literal CONTRACTS shows for mutation anchor 3 - EXACTLY ONE occurrence in
+      // this file, so do not repeat that literal in a comment).
+      // <<< v101:T12
+
+
+
+      // >>> v101:T13 todowrite mirror: the tool-result note
+      // Reserved. T13 fills this (the mirrored/verified/kept/dropped note and the no-plan hint).
+      // <<< v101:T13
+
+
+
+    },
+    "tool.definition": async (input, output) => {
+      // >>> v101:T22 todowrite description suffix (X4)
+      // Reserved. T22 fills this (todowrite only, skipped when the mode is off, never gated on goal state).
+      // <<< v101:T22
+
+
+
     },
     "command.execute.before": async (input, output) => {
       if (!input || input.command !== commandName || !output) return
@@ -8457,4 +8721,31 @@ export const testInternals = {
   runtimeSessionDiagnostics,
   stopReason,
   xdgStateFilePath,
+  // --- v1.0.1 todo mirror (written by the scaffold as ONE block; wave seats implement the
+  // functions in their own region and do NOT edit this object) ---
+  MIRROR_MAX_TODOS,
+  MIRROR_MAX_EXTRAS,
+  MIRROR_EXTRA_TEXT_LIMIT,
+  MIRROR_MAX_NUDGES,
+  MIRROR_ID_SEPARATOR,
+  MIRROR_TOOL_NAMES,
+  MIRROR_MODES,
+  mirrorRowStatus,
+  mirrorRowSuffix,
+  projectPlanToTodos,
+  mirrorRow,
+  mirrorRowPriority,
+  mirrorFingerprint,
+  isMirrorOwnedRow,
+  pickExtras,
+  boundExtraContent,
+  resetMirrorForNewGoal,
+  normalizeMirrorMode,
+  normalizeMirror,
+  snapshotMirror,
+  readMirrorTerminal,
+  dropMirrorTerminal,
+  mirrorIsFresh,
+  mirrorState,
+  mirrorNudgeLine,
 }
