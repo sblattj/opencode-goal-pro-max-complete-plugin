@@ -1,8 +1,10 @@
 import assert from "node:assert/strict"
+import { execSync } from "node:child_process"
 import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises"
 import { homedir, tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import test from "node:test"
+import { fileURLToPath } from "node:url"
 import pluginModule, { GoalPlugin, testInternals } from "../src/goal-plugin.js"
 import { acquirePersistenceLease } from "../src/persistence-lease.js"
 // The TUI half's payload reducer. It imports nothing but ./goal-format.js, so
@@ -14876,7 +14878,10 @@ test("compaction context names a stale mirror only while stale", async () => {
 
 
 // >>> v101:T21 tests - the two plan tool descriptions
-// T21 units: 51.
+// T21 units: 51. Amended (v1.0.1 wave 5, T40): CONTRACTS "Tool-description append ... (T21)" was
+// revised after int3 so the append is gated on mirrorMode !== "off" (design SS4.6 :629-:631,
+// "off" restores v1.0.0 exactly). `buildAgentTools`'s new `mirrorMode` parameter defaults to
+// "off" (house convention), so the original "plan" assertions below now pass it explicitly.
 test("goal_plan_set and goal_action_update descriptions name the todo redraw", async () => {
   const schema = {
     string: () => ({ optional: () => "str?" }),
@@ -14889,7 +14894,7 @@ test("goal_plan_set and goal_action_update descriptions name the todo redraw", a
   toolHelper.schema = schema
 
   const { handlers } = makeAgentHandlers()
-  const tools = buildAgentTools(toolHelper, handlers)
+  const tools = buildAgentTools(toolHelper, handlers, undefined, undefined, undefined, undefined, "plan")
 
   const APPEND = " The session's Todo list is redrawn from this plan on the next todowrite call."
   assert.ok(tools.goal_plan_set.description.endsWith(APPEND))
@@ -14899,6 +14904,91 @@ test("goal_plan_set and goal_action_update descriptions name the todo redraw", a
     if (name === "goal_plan_set" || name === "goal_action_update") continue
     assert.ok(!tools[name].description.includes(APPEND), `${name} description must not contain the mirror sentence`)
   }
+})
+
+// Known-good v1.0.0 description bytes (verified by hand against the `v1.0.0` tag when this test
+// was written: `git show v1.0.0^{commit}:src/goal-plugin.js`). Kept as a fallback because
+// `scripts/mutation-contract.mjs` copies `src/` and `test/` into a fresh tmpdir with no `.git` at
+// all to run its baseline and every mutant, so a test that shells out to `git show` unconditionally
+// would fail there every time, taking the whole file's mutation baseline down with it — not a
+// property of the source, a property of the harness. See `readV100PlanToolDescriptions` below.
+const V100_PLAN_SET_DESCRIPTION_FALLBACK =
+  "Record the ordered action plan for the current goal. Decompose the objective into concrete actions; each needs a stable `id` and a `title`. Replaces the whole plan, preserving already-recorded claim/evidence/verdict for actions you keep by id."
+const V100_ACTION_UPDATE_DESCRIPTION_FALLBACK =
+  "Update one action of the goal plan. An action may only become `done` with a claim, the minimum evidence that could have falsified it (real command output, file content, or response — not your own report), and verdict `pass`. A `blocked` action must state its reason in `claim`."
+
+// Prefer the ground truth (a real checkout's git history) and fall back to the verified constants
+// above only when git is unavailable (the mutation-contract's git-less copy). Either way the
+// caller below cross-checks the two sources are equal whenever git DID answer, so the fallback
+// cannot silently drift from the tag without a real-checkout test run catching it.
+function readV100PlanToolDescriptions() {
+  const extractDescription = (source, toolName) => {
+    const literal = new RegExp(`${toolName}:\\s*toolHelper\\(\\{\\s*description:\\s*\\n\\s*"((?:[^"\\\\]|\\\\.)*)"`)
+    const match = source.match(literal)
+    assert.ok(match, `v1.0.0 description literal for ${toolName} not found`)
+    return match[1]
+  }
+  try {
+    const repositoryRoot = fileURLToPath(new URL("..", import.meta.url))
+    const v100Source = execSync("git show v1.0.0^{commit}:src/goal-plugin.js", {
+      cwd: repositoryRoot,
+      encoding: "utf8",
+      maxBuffer: 16 * 1024 * 1024,
+      stdio: ["ignore", "pipe", "pipe"],
+    })
+    return {
+      planSet: extractDescription(v100Source, "goal_plan_set"),
+      actionUpdate: extractDescription(v100Source, "goal_action_update"),
+      fromGit: true,
+    }
+  } catch {
+    return {
+      planSet: V100_PLAN_SET_DESCRIPTION_FALLBACK,
+      actionUpdate: V100_ACTION_UPDATE_DESCRIPTION_FALLBACK,
+      fromGit: false,
+    }
+  }
+}
+
+// CONTROL arm: under mirrorTodos "off" both descriptions must be BYTE-IDENTICAL to v1.0.0's, not
+// merely free of the append. A test that only asserted `!description.includes(APPEND)` could pass
+// vacuously if the base text were accidentally emptied or truncated; this compares full equality
+// against v1.0.0's actual string literals instead.
+test("goal_plan_set and goal_action_update descriptions are byte-identical to v1.0.0 when mirrorTodos is off", async () => {
+  const schema = {
+    string: () => ({ optional: () => "str?" }),
+    number: () => ({ optional: () => "num?" }),
+    array: () => ({ optional: () => "array?" }),
+    object: () => "object",
+    enum: () => ({ optional: () => "enum?" }),
+  }
+  const toolHelper = (def) => def
+  toolHelper.schema = schema
+
+  const { handlers } = makeAgentHandlers()
+  const offTools = buildAgentTools(toolHelper, handlers, undefined, undefined, undefined, undefined, "off")
+
+  const v100 = readV100PlanToolDescriptions()
+  if (v100.fromGit) {
+    // A real checkout re-derives from the tag every run, so a hand-edit that lets the fallback
+    // constants above drift from the tag fails loudly here rather than silently passing.
+    assert.equal(v100.planSet, V100_PLAN_SET_DESCRIPTION_FALLBACK, "fallback constant has drifted from the v1.0.0 tag")
+    assert.equal(
+      v100.actionUpdate,
+      V100_ACTION_UPDATE_DESCRIPTION_FALLBACK,
+      "fallback constant has drifted from the v1.0.0 tag",
+    )
+  }
+
+  // Guard the guard: the v1.0.0 text must itself be non-empty and must not already carry the
+  // mirror append, or an empty/garbled source would make the equality below pass vacuously too.
+  assert.ok(v100.planSet.length > 0)
+  assert.ok(v100.actionUpdate.length > 0)
+  assert.ok(!v100.planSet.includes("redrawn from this plan"))
+  assert.ok(!v100.actionUpdate.includes("redrawn from this plan"))
+
+  assert.equal(offTools.goal_plan_set.description, v100.planSet)
+  assert.equal(offTools.goal_action_update.description, v100.actionUpdate)
 })
 // <<< v101:T21
 

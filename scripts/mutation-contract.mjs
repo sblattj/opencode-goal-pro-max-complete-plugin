@@ -547,7 +547,10 @@ const mutants = [
   {
     name: "goal tools register without an external helper",
     file: "src/goal-plugin.js",
-    from: "    hooks.tool = buildAgentTools(\n      bundledToolHelper,\n      agentToolHandlers,\n      ensureSessionLoaded,\n      commandName,\n      () => runtime.disposed,\n      registerCommand,\n    )",
+    // v1.0.1 wave 5 (T40): re-anchored after `mirrorMode` was added as buildAgentTools' 7th
+    // argument (CONTRACTS "Tool-description append ... (T21)" amendment, design SS4.6); the
+    // property guarded is unchanged — hooks.tool must be the real wired-up tool table, not a stub.
+    from: "    hooks.tool = buildAgentTools(\n      bundledToolHelper,\n      agentToolHandlers,\n      ensureSessionLoaded,\n      commandName,\n      () => runtime.disposed,\n      registerCommand,\n      mirrorMode,\n    )",
     to: "hooks.tool = {}",
     test: "test/goal-plugin.test.js",
   },
