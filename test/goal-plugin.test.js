@@ -13571,13 +13571,17 @@ test("a NON-EMPTY todowrite is left alone when the goal is stopped", async () =>
 })
 
 test("a NON-EMPTY todowrite is left alone before a plan exists, and the result says to record one", async () => {
-  // T10 owns the before-hook half of this unit: with a goal but zero plan actions
-  // the ladder returns and the model's list reaches the host untouched. The
-  // tool-result half - the "record one with goal_plan_set" hint - is written into
-  // the after-hook by T13.
+  // Both halves of unit 10, joined at wave-2 integration. T10 owned the before-hook
+  // half (with a goal but zero plan actions the ladder returns and the model's list
+  // reaches the host untouched) and T13 owned the tool-result half (the "record one
+  // with goal_plan_set" hint), and each seat wrote a test under this same name
+  // because neither could reach the other's region. T13's report asked the
+  // integrator to extend this test in place rather than ship a duplicate name; that
+  // is what the after-hook block below is.
   const sessionID = "t10-no-plan-yet"
   const hooks = await t10Hooks(sessionID, null)
   assert.equal(currentGoal(sessionID).plan.actions.length, 0)
+  assert.equal(currentGoal(sessionID).stopped, false)
 
   const todos = [t10Row("native item")]
   const args = { todos }
@@ -13585,7 +13589,20 @@ test("a NON-EMPTY todowrite is left alone before a plan exists, and the result s
     { tool: "todowrite", sessionID, callID: "t10-no-plan-call" },
     { args },
   )
+  // The before-hook half: the SAME array object, not merely an equal one.
   assert.equal(args.todos, todos)
+
+  // The result half (T13): the same untouched list carried on into the after-hook is
+  // exactly what the guard above leaves behind, and its tool result names the hint.
+  const output = { title: "todowrite", output: "Updated 1 todo.", metadata: {} }
+  await hooks["tool.execute.after"](
+    { tool: "todowrite", sessionID, callID: "t10-no-plan-call", args },
+    output,
+  )
+  assert.equal(
+    output.output,
+    "Updated 1 todo.\n\nNo goal plan is recorded yet — record one with goal_plan_set, and the Todo list will be redrawn from it.",
+  )
 
   // The control: recording a plan into the same live goal flips the same call to
   // mirrored, so the pass above is the empty-plan guard.
@@ -13597,6 +13614,15 @@ test("a NON-EMPTY todowrite is left alone before a plan exists, and the result s
     { args: plannedArgs },
   )
   assert.equal(plannedArgs.todos.length, 2)
+  // ...and the same control on the result half: with a plan recorded, the note is
+  // the mirrored one, never the no-plan hint.
+  const plannedOutput = { title: "todowrite", output: "Updated 2 todos.", metadata: {} }
+  await hooks["tool.execute.after"](
+    { tool: "todowrite", sessionID, callID: "t10-planned-call", args: plannedArgs },
+    plannedOutput,
+  )
+  assert.match(plannedOutput.output, /Mirrored from the goal plan \(0\/1 verified\)\./)
+  assert.doesNotMatch(plannedOutput.output, /No goal plan is recorded yet/)
 })
 
 test("a control-command turn still blocks todowrite before any mirroring happens", async () => {
@@ -14191,32 +14217,13 @@ test("dropped extras are named in the tool result only when the cap trimmed them
   assert.equal(output3.output, "\n\nMirrored from the goal plan (0/4 verified). 3 items of your own kept.")
 })
 
-test("a NON-EMPTY todowrite is left alone before a plan exists, and the result says to record one", async () => {
-  const { hooks } = await createHooks()
-  const sessionID = "session-mirror-no-plan-result"
-  const { handlers } = makeAgentHandlers()
-  await handlers.setGoal(sessionID, { objective: "ship it" })
-  const goal = currentGoal(sessionID)
-  assert.equal(goal.plan.actions.length, 0, "a fresh goal carries no plan yet")
-  assert.equal(goal.stopped, false)
-
-  // T13 covers only the result half here: the before-hook leaving a NON-EMPTY
-  // todowrite's `args.todos` untouched before a plan exists is T10/T11's guard
-  // (`!goal || goal.stopped || goal.plan.actions.length === 0`). This drives the
-  // after-hook directly with the model's own non-empty list — exactly what that
-  // guard leaves behind — and checks only the tool-result note.
-  const modelTodos = [{ content: "my own todo", status: "pending", priority: "medium" }]
-  const output = { title: "todowrite", output: "Updated 1 todo.", metadata: {} }
-  await hooks["tool.execute.after"](
-    { tool: "todowrite", sessionID, callID: "call-no-plan", args: { todos: modelTodos } },
-    output,
-  )
-
-  assert.equal(
-    output.output,
-    "Updated 1 todo.\n\nNo goal plan is recorded yet — record one with goal_plan_set, and the Todo list will be redrawn from it.",
-  )
-})
+// Unit 10 ("a NON-EMPTY todowrite is left alone before a plan exists, and the result
+// says to record one") lived here as T13's result half and in the v101:T10 region as
+// T10's before-hook half, under the same name — neither seat could reach the other's
+// region, and T13's report asked the integrator to join them rather than ship a
+// duplicate test name. At wave-2 integration the two halves were merged into the T10
+// copy, which now drives both hooks and carries the result-half control as well. The
+// no-plan hint's exact bytes are asserted there.
 // <<< v101:T13
 
 
