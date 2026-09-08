@@ -4102,7 +4102,7 @@ function formatPlanForPrompt(plan) {
 
 // Plan lines for the system prompt and the compaction summary. Two states: no
 // plan yet (decompose first) or a plan (work the ledger).
-function buildPlanSystemLines(goal) {
+function buildPlanSystemLines(goal, { mirrorMode } = {}) {
   const render = formatPlanForPrompt(goal?.plan)
   if (!render) {
     return [
@@ -4118,6 +4118,9 @@ function buildPlanSystemLines(goal) {
     render,
     `progress: ${planStatusLabel(goal.plan)}`,
     "Keep it current with goal_action_update(id, status, claim?, evidence?, verdict?); add or replace the whole list with goal_plan_set.",
+    ...(mirrorMode === "plan" ? [
+      "The session's Todo list is drawn from this plan: while a plan exists, todowrite redraws it from the plan's actions and keeps any items of your own below them. Change the work with goal_plan_set/goal_action_update, and call todowrite({todos: []}) to refresh the panel.",
+    ] : []),
     "An action may only become done with a claim, the evidence that could have falsified it, and verdict=pass. A blocked action must state its reason in claim.",
     "The goal cannot be completed until every action is done with verdict=pass, or blocked with a stated reason.",
     CEV_RULE,
@@ -8848,7 +8851,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         : [
             `<opencode_goal_plugin id="${goal.goalId}">`,
             buildGoalBlock(goal),
-            ...buildPlanSystemLines(goal),
+            ...buildPlanSystemLines(goal, { mirrorMode }),
             "Keep working until the goal is fully satisfied.",
             "When fully satisfied, put a `[goal:evidence]` line summarizing what you verified immediately before `[goal:complete]`. A `[goal:complete]` without evidence is rejected.",
             "If user input is required, explain the concrete blocker in the line immediately before `[goal:blocked]`. A `[goal:blocked]` without a concrete blocker is rejected.",
