@@ -200,8 +200,12 @@ const mutants = [
   {
     name: "control turns block every tool call",
     file: "src/goal-plugin.js",
-    from: 'if (currentRuntime().activeCommandTurns.get(sessionID)?.policy !== "control") return',
-    to: 'if (currentRuntime().activeCommandTurns.get(sessionID)?.policy !== "control" || input?.tool === "read") return',
+    // Re-anchored at v1.0.1 wave-2 integration. T10 inverted this guard (the early
+    // return became a positive block) so the todo mirror below it can run on ordinary
+    // turns; the throw and its text are unchanged. The mutant is the same property in
+    // the new shape: let a control turn stop blocking one tool.
+    from: 'if (currentRuntime().activeCommandTurns.get(sessionID)?.policy === "control") {',
+    to: 'if (currentRuntime().activeCommandTurns.get(sessionID)?.policy === "control" && input?.tool !== "read") {',
     test: "test/goal-plugin.test.js",
   },
   {
@@ -578,8 +582,12 @@ const mutants = [
   {
     name: "the plugin's own tools are not the turn's work",
     file: "src/goal-plugin.js",
-    from: "      part && TOOL_PART_TYPES.has(part.type) && !isPluginOwnToolName(toolPartName(part)),",
-    to: "      part && TOOL_PART_TYPES.has(part.type),",
+    // Re-anchored at v1.0.1 wave-2 integration. T15 gave `messageHasWorkToolCall` an
+    // `exempt` set for the mirror refresh, which turned the one-line `parts.some`
+    // predicate into a block body; the guarded property is unchanged, so the mutant
+    // still drops the plugin-own-tool exclusion and nothing else.
+    from: "    return !isPluginOwnToolName(name) && !exemptNames.has(name)",
+    to: "    return !exemptNames.has(name)",
     test: "test/goal-plugin.test.js",
   },
   {

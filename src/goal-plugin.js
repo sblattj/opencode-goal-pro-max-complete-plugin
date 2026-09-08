@@ -5692,6 +5692,32 @@ function isEmptyList(value) {
 
 
 
+// >>> v101:T12 the mirror freshness stamp
+/**
+ * `stampMirror(goal, args, now)` -> void: record what the host was actually
+ * handed — the fingerprint over `args.todos`, the moment it landed, and the
+ * rows themselves coerced through the one row coercer so a reloaded record is
+ * spelled exactly like a freshly projected one.
+ *
+ * `nudges` is a per-goal-run budget (X5) and `extra` is owned by the
+ * before-hook's `pickExtras`, so neither is touched here.
+ *
+ * Hoisted here from inside `tool.execute.after` at wave-2 integration: CONTRACTS
+ * declares every wave-2 function module scope and exported through
+ * `testInternals`, and the T12 seat could not add the export from a hook-body
+ * region. Behaviour is byte-identical — it closes over nothing but the
+ * module-scope `mirrorFingerprint` and `mirrorRow`.
+ */
+function stampMirror(goal, args, now) {
+  const written = Array.isArray(args?.todos) ? args.todos : []
+  goal.mirror.fingerprint = mirrorFingerprint(written)
+  goal.mirror.at = now
+  goal.mirror.rows = written.map((row) => mirrorRow(row))
+}
+// <<< v101:T12
+
+
+
 async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) {
   if (pluginOptions.completionAudit && pluginOptions.registerAgents === false) {
     throw new TypeError("completionAudit requires registerAgents to remain enabled")
@@ -6947,22 +6973,9 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         // this plan, so it has to reach disk with the rest of the goal record.
         await persist(sessionID)
       }
-
-      /**
-       * `stampMirror(goal, args, now)` -> void: record what the host was actually
-       * handed — the fingerprint over `args.todos`, the moment it landed, and the
-       * rows themselves coerced through the one row coercer so a reloaded record is
-       * spelled exactly like a freshly projected one.
-       *
-       * `nudges` is a per-goal-run budget (X5) and `extra` is owned by the
-       * before-hook's `pickExtras`, so neither is touched here.
-       */
-      function stampMirror(goal, args, now) {
-        const written = Array.isArray(args?.todos) ? args.todos : []
-        goal.mirror.fingerprint = mirrorFingerprint(written)
-        goal.mirror.at = now
-        goal.mirror.rows = written.map((row) => mirrorRow(row))
-      }
+      // `stampMirror` itself lives at module scope, in the v101:T12 region beside
+      // the other mirror helpers, so CONTRACTS' "exported through testInternals"
+      // can hold for it. Only the call site is here.
       // <<< v101:T12
 
 
@@ -9153,4 +9166,10 @@ export const testInternals = {
   mirrorIsFresh,
   mirrorState,
   mirrorNudgeLine,
+  // Added at wave-2 integration. CONTRACTS declares every function in its
+  // "Function contracts" section exported through `testInternals`; the scaffold
+  // wrote this block before wave 2 existed and told seats not to edit it, so the
+  // T10 and T12 seats correctly left these two out. The integrator adds them.
+  isEmptyList,
+  stampMirror,
 }

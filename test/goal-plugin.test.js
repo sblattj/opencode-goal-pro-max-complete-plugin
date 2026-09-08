@@ -14709,3 +14709,102 @@ test("the goal-end response carries the todo handback line only when rows were m
 
 
 
+// >>> v101:INT2 wave-2 integration - the cross-seat seam no single seat could test
+// Written by the wave-2 integrator, not by a seat. Every seat branched from the same
+// base, so T14 could not drive T12's `stampMirror` (it stamped with its own
+// `t14StampMirror`), T12 could not drive T10/T11's before-hook, and none of them could
+// prove that the refresh idiom the plugin TEACHES actually clears staleness. That claim
+// - "call todowrite({todos: []}) once and the panel matches the plan again" - is the
+// whole feature, and until the seats are merged there is nothing to assert it against.
+// This unit drives the real hooks from one `createHooks()` plugin, end to end.
+test("the taught refresh idiom really clears staleness across the wave-2 seats", async () => {
+  const { mirrorIsFresh, mirrorState, mirrorNudgeLine, MIRROR_MAX_NUDGES } = testInternals
+  const { hooks } = await createHooks()
+  const { handlers } = makeAgentHandlers()
+  const sid = "int2-refresh-idiom-e2e"
+  await handlers.setGoal(sid, { objective: "ship it" })
+  await handlers.setPlan(sid, {
+    actions: [{ id: "a1", title: "write it" }, { id: "a2", title: "verify it" }],
+  })
+  const goal = currentGoal(sid)
+
+  // 1. A NON-EMPTY todowrite: T10 picks the extras and writes the projection, T12
+  //    stamps it, T13 names it, and T14 reads the result as FRESH.
+  const first = {
+    args: {
+      todos: [
+        { content: "my own note", status: "pending", priority: "medium" },
+        { content: "another of mine", status: "pending", priority: "low" },
+      ],
+    },
+  }
+  await hooks["tool.execute.before"]({ tool: "todowrite", sessionID: sid, callID: "int2-1" }, first)
+  assert.equal(first.args.todos.length, 4, "2 plan rows + 2 rows of the model's own")
+  const firstResult = { title: "todowrite", output: "ok", metadata: {} }
+  await hooks["tool.execute.after"](
+    { tool: "todowrite", sessionID: sid, callID: "int2-1", args: first.args },
+    firstResult,
+  )
+  assert.equal(mirrorIsFresh(goal), true)
+  assert.equal(mirrorState(goal, "plan"), "fresh")
+  assert.equal(
+    firstResult.output,
+    "ok\n\nMirrored from the goal plan (0/2 verified). 2 items of your own kept.",
+  )
+  // A fresh mirror spends none of the nudge budget.
+  assert.equal(mirrorNudgeLine(goal, "plan"), "")
+  assert.equal(goal.mirror.nudges, 0)
+
+  // 2. Editing the plan makes the panel stale, and the goal_action_update result
+  //    carries the nudge - T14's emission over T12's real stamp.
+  const updateResult = await handlers.updateAction(sid, { id: "a1", status: "in_progress" })
+  assert.equal(mirrorIsFresh(goal), false)
+  assert.equal(mirrorState(goal, "plan"), "stale")
+  assert.match(
+    updateResult,
+    /Todo panel is stale — call todowrite\(\{todos: \[\]\}\) once; the plan is copied into it for you\.$/,
+  )
+  assert.equal(goal.mirror.nudges, 1)
+
+  // 3. THE CLAIM: doing exactly what the nudge asks makes it fresh again, with the
+  //    model's own rows still there and the NEW action status projected.
+  const refresh = { args: { todos: [] } }
+  await hooks["tool.execute.before"]({ tool: "todowrite", sessionID: sid, callID: "int2-2" }, refresh)
+  assert.equal(refresh.args.todos.length, 4, "the empty call re-projected and kept the extras")
+  assert.equal(refresh.args.todos[0].status, "in_progress", "the re-projection picked up the edit")
+  assert.deepEqual(
+    refresh.args.todos.slice(2).map((row) => row.content),
+    ["my own note", "another of mine"],
+  )
+  await hooks["tool.execute.after"](
+    { tool: "todowrite", sessionID: sid, callID: "int2-2", args: refresh.args },
+    { title: "todowrite", output: "ok", metadata: {} },
+  )
+  assert.equal(mirrorIsFresh(goal), true, "the refresh idiom cleared the staleness")
+  assert.equal(mirrorState(goal, "plan"), "fresh")
+  // ...and the budget is a per-goal-run TOTAL (X5): a landed mirror does not refund it.
+  assert.equal(goal.mirror.nudges, 1)
+  assert.ok(goal.mirror.nudges < MIRROR_MAX_NUDGES)
+
+  // 4. The control that keeps 1-3 from being green by construction: a stamp taken
+  //    from rows the plan never projected must read STALE through the same code.
+  const control = "int2-refresh-idiom-control"
+  await handlers.setGoal(control, { objective: "ship it" })
+  await handlers.setPlan(control, { actions: [{ id: "b1", title: "do it" }] })
+  const controlGoal = currentGoal(control)
+  await hooks["tool.execute.after"](
+    {
+      tool: "todowrite",
+      sessionID: control,
+      callID: "int2-3",
+      args: { todos: [{ content: "not the plan", status: "pending", priority: "medium" }] },
+    },
+    { title: "todowrite", output: "ok", metadata: {} },
+  )
+  assert.equal(controlGoal.mirror.at > 0, true, "the control WAS stamped")
+  assert.equal(mirrorIsFresh(controlGoal), false, "a stamp of non-plan rows reads stale")
+})
+// <<< v101:INT2
+
+
+
