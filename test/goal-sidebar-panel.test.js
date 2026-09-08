@@ -16,6 +16,11 @@ import {
   GOAL_PANEL_TITLE,
 } from "../src/goal-sidebar-view.js"
 import { formatBudgetMinutes, formatTurnBudget, UNLIMITED_MARK } from "../src/goal-format.js"
+// v1.0.1 wave-4 integration (unit 38): the SERVER half. The cross-half parity unit
+// in the v101:INT4 region below builds a real goal, mirrors it through the real
+// tool.execute hooks and publishes a real payload, so the number the panel prints is
+// the number the server computed rather than one this file typed.
+import { GoalPlugin, testInternals } from "../src/goal-plugin.js"
 
 const THEME = {
   text: "text",
@@ -1065,3 +1070,137 @@ test("a verified done action carries no suffix", async () => {
 
 
 
+// >>> v101:INT4 wave-4 integration - the cross-half seam no single seat could test
+// Written by the wave-4 integrator, not by a seat. Unit 38 is design §5.2's
+// "cross-half parity" unit, and it is the one unit in this wave that no seat could
+// write: T23 (wave 3) proved the SERVER publishes `plan.mirror.rows`, and T25/T26
+// proved the PANEL renders whatever number a hand-built payload carries — but every
+// panel seat fed `goalPanelModel` a fixture it typed itself, so nothing yet asserted
+// that the number the server puts on the wire is the number the panel prints.
+//
+// This unit closes that: one real goal, mirrored through the real
+// `tool.execute.before` / `tool.execute.after` hooks, its payload built by the real
+// `buildSidebarMetadata`, and that payload — never a fixture — handed to
+// `goalPanelModel` and to a mounted `GoalPanel`. Every count asserted here is read
+// back from the run, so a divergence between the two halves cannot be typed away.
+function int4Client() {
+  return {
+    app: { log: async () => {} },
+    session: {
+      messages: async () => ({ data: [] }),
+      promptAsync: async () => ({}),
+      abort: async () => ({}),
+    },
+  }
+}
+
+test("the server's v3 payload and the panel agree on the mirrored count", async () => {
+  // 1. A real goal and a real plan, through the server half's own tool handlers.
+  //    Statuses are set through `goal_plan_set` so the plan carries a
+  //    done-without-a-verdict action (a1), an in_progress one (a2) and a pending
+  //    one (a3) — the three cases the panel's exception list has to tell apart.
+  const hooks = await GoalPlugin({ client: int4Client() }, { persistState: false })
+  const handlers = testInternals.buildAgentToolHandlers({
+    defaultGoalOptions: testInternals.normalizeOptions(),
+    persist: async () => {},
+  })
+  const sid = "ses_int4_parity"
+  await handlers.setGoal(sid, { objective: "ship the todo mirror" })
+  await handlers.setPlan(sid, {
+    actions: [
+      { id: "a1", title: "write the code", status: "done", claim: "it compiles", evidence: "node -c" },
+      { id: "a2", title: "verify the code", status: "in_progress" },
+      { id: "a3", title: "ship it", status: "pending" },
+    ],
+  })
+  const goal = testInternals.currentGoal(sid)
+  // Fixture self-check: fail loud if the plan did not come out as intended, rather
+  // than quietly asserting the parity of the wrong shape.
+  assert.deepEqual(
+    goal.plan.actions.map((action) => `${action.id}:${action.status}:${action.verdict}`),
+    ["a1:done:null", "a2:in_progress:null", "a3:pending:null"],
+  )
+
+  // 2. The mirror really runs: two rows of the model's own go in, three plan rows
+  //    plus those two come out, and the after-hook stamps the result.
+  const call = {
+    args: {
+      todos: [
+        { content: "buy milk", status: "pending", priority: "medium" },
+        { content: "call mom", status: "pending", priority: "low" },
+      ],
+    },
+  }
+  await hooks["tool.execute.before"]({ tool: "todowrite", sessionID: sid, callID: "int4-1" }, call)
+  // `hostTodos` is the array the HOST would now be showing — the before-hook replaced
+  // the model's two rows with this. Every "5" below is derived from it.
+  const hostTodos = call.args.todos
+  assert.equal(hostTodos.length, 5, "3 plan rows + 2 kept extras")
+  await hooks["tool.execute.after"](
+    { tool: "todowrite", sessionID: sid, callID: "int4-1", args: call.args },
+    { title: "todowrite", output: "ok", metadata: {} },
+  )
+
+  // 3. The payload the panel actually receives, from the real publisher.
+  const wire = testInternals.buildSidebarMetadata(goal, 1_700_000_000_000, { mirrorMode: "plan" })
+  assert.equal(wire.v, 3)
+  assert.equal(wire.plan.mirror.state, "fresh")
+  assert.equal(wire.plan.mirror.rows, hostTodos.length, "the server counts the rows it actually wrote")
+  assert.equal(wire.plan.mirror.extra, 2)
+
+  // 4. THE PARITY CLAIM: the panel prints the server's own number. `liveTodoCount`
+  //    is `hostTodos.length`, i.e. what a host showing exactly those rows would
+  //    report, so agreement here is agreement between the two halves and not
+  //    between two hand-typed constants.
+  const agree = goalPanelModel(wire, { liveTodoCount: hostTodos.length })
+  assert.equal(agree.progress, "0/3 actions verified · todo mirror fresh (5)")
+  assert.equal(agree.mirror.rows, wire.plan.mirror.rows)
+  assert.equal(agree.mirror.extra, wire.plan.mirror.extra)
+  assert.equal(agree.mirror.liveTodoCount, hostTodos.length)
+  assert.equal(agree.mirror.drift, false)
+
+  // 5. The control that gives 4 polarity: one row more on the host and the SAME
+  //    payload renders drift, naming both numbers, with the fresh wording gone.
+  const drifted = goalPanelModel(wire, { liveTodoCount: hostTodos.length + 2 })
+  assert.equal(drifted.progress, "0/3 actions verified · mirror drift (7≠5)")
+  assert.equal(drifted.mirror.drift, true)
+  assert.ok(!drifted.progress.includes("fresh"), "drift replaces the fresh suffix, never sits beside it")
+
+  // 6. Through the mounted panel, where nobody hands `GoalPanel` a number: it reads
+  //    the host's list itself, and the host's list IS the array the before-hook wrote.
+  const runtime = fakeRuntime()
+  const { tui } = createGoalSidebar(runtime)
+  const sessions = new Map([[sid, { id: sid, metadata: { goal: wire } }]])
+  const { api, registrations } = fakeApi(sessions)
+  const asked = []
+  api.state.session.todo = (sessionID) => {
+    asked.push(sessionID)
+    return hostTodos
+  }
+  await tui(api, {}, { spec: "opencode-goal-pro-max-complete-plugin" })
+  const lines = renderLines(runtime, registrations[0].slots.sidebar_content({}, { session_id: sid }))
+  const texts = lines.map((line) => line.text)
+  assert.deepEqual([...new Set(asked)], [sid], "the panel asks the host about its own session")
+  assert.ok(
+    texts.includes("0/3 actions verified · todo mirror fresh (5)"),
+    `progress line missing from ${JSON.stringify(texts)}`,
+  )
+
+  // 7. T24's exception list over a REAL payload: the pending action is hidden and
+  //    the two that need attention render, done-unverified before in_progress.
+  assert.deepEqual(agree.actions.map((action) => action.id), ["a1", "a2"])
+  assert.equal(agree.hiddenActions, 0)
+  assert.deepEqual(texts.slice(-2), [
+    "● write the code — needs claim/evidence/verdict",
+    "◐ verify the code",
+  ])
+
+  // 8. The two halves spell the needs-evidence suffix the same way: T1's
+  //    `mirrorRowSuffix` writes it into the mirrored todo row, T39's
+  //    `actionNeedsEvidenceSuffix` writes it onto the panel line. Both bytes come
+  //    out of this one run, so a drift in either would be caught here.
+  assert.equal(hostTodos[0].content, "a1 · write the code — needs claim/evidence/verdict")
+  assert.ok(hostTodos[0].content.endsWith(" — needs claim/evidence/verdict"))
+  assert.ok(texts.at(-2).endsWith(" — needs claim/evidence/verdict"))
+})
+// <<< v101:INT4
