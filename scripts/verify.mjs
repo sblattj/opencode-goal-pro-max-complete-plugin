@@ -171,9 +171,14 @@ await check("no model calls were made during verification", () => {
 await runGoalCommand("clear")
 
 await check("lifecycle transitions are visible without leaking objective text", () => {
-  assert.deepEqual(logCalls.map((entry) => entry.body.extra.kind), ["goal-lifecycle", "goal-lifecycle"])
-  assert.match(logCalls[0].body.message, /Goal (?:active|started)/i)
-  assert.match(logCalls[1].body.message, /Goal cleared/i)
+  // Lifecycle entries are selected by kind rather than by position: the
+  // <existing_todos> probe logs one `warn` on a host whose SDK has no
+  // `client.session.todo` (the client below is exactly that host), and a warn
+  // carries no `extra`. The leak assertion still covers EVERY entry.
+  const lifecycle = logCalls.filter((entry) => entry.body?.extra?.kind === "goal-lifecycle")
+  assert.deepEqual(lifecycle.map((entry) => entry.body.extra.kind), ["goal-lifecycle", "goal-lifecycle"])
+  assert.match(lifecycle[0].body.message, /Goal (?:active|started)/i)
+  assert.match(lifecycle[1].body.message, /Goal cleared/i)
   assert.ok(logCalls.every((entry) => !entry.body.message.includes("verify the installation")))
 })
 
