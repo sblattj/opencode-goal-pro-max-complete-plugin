@@ -82,6 +82,86 @@ comes from the rewritten turn's escaped reporting frame, fail-closed tool
 blocking, and parent-correlated lifecycle suppression. The system transform
 remains registered as additional protection for hosts that support it.
 
+## Todo mirror
+
+From 1.0.1 the session's native Todo list is drawn from the goal plan while a plan exists
+(`mirrorTodos: "plan"`, the default; the mechanism is in
+[reference.md](reference.md#todo-mirror)). The mirror is a rewrite of the model's own `todowrite`
+arguments, so it reaches every surface that renders the **stored** list — the TUI's Todo sidebar
+section, the `opencode run` renders, and the desktop client's todo dock — and it survives a restart,
+because the TUI re-seeds that store from the server on session hydration.
+
+**Two surfaces it cannot reach, by construction.** OpenCode also renders the `todowrite` *transcript
+bubble*, in the TUI and again on the web share page, and those rows come from the tool call's own
+separately captured input. No plugin can change them: the TUI plugin API exposes sidebar, prompt and
+app-shell slots only, and the transcript is a hardcoded switch rather than a slot lookup. Scrollback
+may therefore keep showing the model's original wording beside a corrected sidebar. That is a
+property of the host's plugin surface, not a defect in the mirror, and nothing in this package can
+fix it; `mirrorTodos: "off"` is the only way to keep the two readings identical.
+
+**`priority` is wire-only in the TUI.** Mirrored rows carry a `priority` (`high` for the first row
+still to act on, `low` for completed rows, `medium` otherwise) because the host's schema requires
+one, but the TUI's todo item component never reads it — it renders `[✓]`, `[•]` or `[ ]` from
+`status` alone. Other clients, including the desktop app, may render it, so the field is populated
+honestly rather than stubbed.
+
+### Seven documented hazards
+
+Each of these is a property of the host or of another plugin, not something this package can fix.
+They are documented rather than worked around, and `mirrorTodos: "off"` removes all seven.
+
+1. **The suffixed `todowrite` description reaches sessions that have no goal.** The
+   `tool.definition` hook carries no session id, and OpenCode caches one plugin instance per project
+   directory, so the suffix is served to every session in the same project — ordinary `build`
+   sessions and custom subagents included. There is no blanket "subagents cannot `todowrite`" rule:
+   only the `general` and `explore` agents deny the tool, and everything else inherits allow. The
+   suffix is deliberately *static*, so it never flips mid-conversation and never invalidates a
+   cached prompt prefix, and it is *self-checking*: it ends by telling the model that with no
+   `<goal_plan>` block the tool behaves normally, which is true — in a session that has never held a
+   goal the mirror hooks return without rewriting anything.
+2. **`todowrite: "ask"` turns every refresh into a permission modal.** OpenCode's permission check
+   is three-valued: anything that is not `allow` or `deny` raises a user-facing request. The
+   plugin's explicit stale-mirror nudge is budgeted at **three per goal run** (refunded by
+   `/goal resume`), which bounds the prompts it asks for by name; the plan block's standing
+   instruction to call `todowrite({todos: []})` when the list drifts is not budgeted, so a model
+   that follows it eagerly can ask more often. `mirrorTodos: "off"` removes both.
+3. **On hosts where `todowrite` is denied, the mirror never becomes fresh.** The `general` and
+   `explore` agents deny the tool outright, so the before-hook never gets to mirror anything and no
+   write ever lands. The mirror then reads `stale` for the whole run rather than `off`, which has
+   two visible consequences: the Goal panel's progress line carries ` · todo list stale`, and the
+   panel still shows the **exception list**, so `pending` actions appear only in `/goal status`. The
+   nudge self-suppresses once its budget is spent. **No configuration introspection is performed** —
+   the plugin cannot see the merged ruleset, and the empirical signal is both simpler and correct.
+   If you run goals under an agent that denies `todowrite`, set `mirrorTodos: "off"`: that is the
+   mode in which the panel goes back to listing every action.
+4. **Another plugin's `tool.execute.before` can overwrite the mirror.** Hooks run in plugin load
+   order with no arbitration, so the last plugin to mutate `args.todos` wins. Neither side can
+   detect this from inside; the observable is a Todo list that does not match the plan while the
+   panel reports the mirror fresh.
+5. **A second, hookless `todowrite` implementation exists in the host.** It writes the same table
+   and fires no plugin hooks. The live loop today is the hooked one, so the mirror works; if that
+   other runner ever became the default, the mirror would go inert — and silently, because the
+   plugin would see no calls at all rather than an error.
+6. **`/undo` does not rewind todos.** Session revert rewinds messages and file snapshots only, so a
+   revert past the last mirrored write leaves the mirrored rows in place beside a transcript that no
+   longer contains them. One `todowrite({todos: []})` redraws the list from the current plan.
+7. **One deliberate departure from the host's todo convention.** That convention asks for exactly
+   one `in_progress` item at a time. The mirror does not honour it: a plan may hold several
+   `in_progress` actions, and `blocked` and unverified-`done` actions also mirror as `in_progress`.
+   The second half follows the same convention, which states that a blocked item stays
+   `in_progress`; the first is a consequence of the list being a projection of the plan rather than
+   a hand-maintained checklist. The plan, not the list, is the source of truth about the work.
+
+### Verifying it against a real host
+
+Two smoke scripts exercise the mirror through the production plugin loader, the host's own
+`todowrite`, its permission check and its SQLite write, with nothing faked but the model:
+`npm run smoke:todo-mirror` (the plan is redrawn over a divergent list, with an `"off"` control and
+a no-goal control) and `npm run smoke:todo-safety` (every assertion is about rows *surviving* an
+empty `todowrite` after a stop, after a completion, and in a session that never had a goal, where it
+must still clear the list). Both need the `opencode` binary on `PATH` and a freshly bundled `dist/`,
+and neither is part of `release:check`, because that binary is not a dev dependency.
+
 ## OpenCode 2
 
 **Status: not supported, and not yet tested.**

@@ -18,7 +18,7 @@ Every row was run against this tree on 2026-09-07 (Node v24.15.0, npm 11.12.1, b
 | Installed-tool contract | `npm run smoke:packed-tools` | A clean tarball install exposes the whole agent-tool surface with no separate OpenCode helper package | **passed, 14 tools** |
 | Packed-manifest contract | `npm run smoke:packed-manifest` | OpenCode's own `packageTargets`/`readV1Plugin` discovery rules, re-implemented against the tarball, find both halves from `exports` — and the `./tui` entry really registers a `sidebar_content` view | **passed**; `server -> ./dist/goal-plugin.js`, `tui -> ./dist/goal-tui.js` |
 | Git-install contract | `npm run smoke:git-install` | None of the six manifest script names that make pacote's `GitFetcher` spawn a missing `npmBin` has reappeared, and the committed `dist/` byte-matches a fresh bundle | **passed**; `dist/goal-plugin.js` and `dist/goal-tui.js` match a fresh bun 1.3.14 bundle |
-| Hook-surface verify | `npm run verify` | The installed plugin loads, registers all 9 hooks, answers `/goal status` and `/goal set`, and makes zero model calls | **all 7 checks passed** |
+| Hook-surface verify | `npm run verify` | The installed plugin loads, registers all 11 hooks, answers `/goal status` and `/goal set`, and makes zero model calls | **all 7 checks passed** |
 | Dependency audit | `npm audit --omit=dev --audit-level=high` | No known high-severity vulnerability in the runtime dependency (`zod` only) | **0 vulnerabilities** |
 | Pack check | `npm run pack:check` | The tarball contains what it should and nothing else | **39 files, ≈367 kB packed, 1.5 MB unpacked** — `README.md` ships inside the tarball, so the exact packed byte count moves whenever it does |
 

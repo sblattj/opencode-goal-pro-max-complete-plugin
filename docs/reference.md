@@ -288,6 +288,7 @@ Pass options when registering the plugin to change the defaults for all goals.
 | `restrictedAgents` | `["plan"]` | Planning-only agent names (case-insensitive). Pass `[]` to release the restriction |
 | `allowGoalExecutionFromPlan` | `false` | `true` allows goal creation and auto-continue under a restricted agent. The default-on restriction is pinned by the mutation contract: hardcoding this to `true` fails the suite |
 | `sidebarStatus` | `true` | Mirror live status into the sidebar. `sessionTitleStatus` is the pre-0.10.0 spelling, still honoured when this is unset |
+| `mirrorTodos` | `plan` | Draw the session's native Todo list from the goal plan (see [Todo mirror](#todo-mirror)). `"off"` restores pre-1.0.1 behaviour exactly: every mirror hook returns before touching anything, every prompt surface that mentions the mirror is silent, and both plan tools' descriptions and `todowrite`'s own description are the stock text |
 | `completionAudit` | `false` | Spawn an independent OpenCode child session to verify a completion; it replies `[audit:approved]` or `[audit:rejected]` with a reason |
 | `auditor` | — | `async ({ goal, sessionID, latestText }) => ({ approved, reason })`; takes precedence over `completionAudit` |
 | `auditorOptions` | `{ timeoutMs: 120000, failurePolicy: "reject" }` | Ignored when a custom `auditor` is supplied. `failurePolicy: "reject"` means an unavailable API, missing child-session ID, provider error, or timeout **rejects** and pauses the goal. `"approve"` is an explicit escape hatch; a genuinely negative or malformed verdict still rejects |
@@ -339,11 +340,11 @@ Two kill switches: `sidebarStatus: false`, or `OPENCODE_GOAL_SIDEBAR=0` (also `f
 
 The original title is captured before the first overwrite and restored by `/goal clear`, which also clears `metadata.goal`. The captured title lives in memory only, so a hard kill leaves the last status line on the session; the plugin recognises its own status lines and will not promote one to your permanent title, but it cannot recover a title it never saw. `metadata.goal` is the plugin's own namespace, so a clear drops it even after a restart.
 
-### `metadata.goal` payload, schema `v: 2`
+### `metadata.goal` payload, schema `v: 3`
 
 ```json
 {
-  "v": 2,
+  "v": 3,
   "goalId": "…",
   "state": "active",
   "objective": "ship the release",
@@ -352,7 +353,11 @@ The original title is captured before the first overwrite and restored by `/goal
   "minutes": { "used": 2, "max": 480 },
   "tokens": { "used": 147000, "max": 100000000 },
   "context": { "used": 147000, "max": 200000 },
-  "plan": { "total": 7, "verified": 3, "blocked": 1, "actions": [ … ] },
+  "plan": {
+    "total": 7, "verified": 3, "blocked": 1,
+    "mirror": { "state": "fresh", "rows": 8, "extra": 1, "at": 1767225597000 },
+    "actions": [ … ]
+  },
   "successCriteria": "tests pass and changelog updated",
   "constraints": "do not touch the public API",
   "sequence": { "ordered": true, "position": 2, "total": 4 },
@@ -363,6 +368,8 @@ The original title is captured before the first overwrite and restored by `/goal
 `durationMs` and `minutes` are plain numbers for the same duration, and **both are quantized to the granularity they are rendered at** — `durationMs` to whole seconds below a minute and to whole minutes above, `minutes` to whole minutes. An elapsed 147,000 ms is written as `"durationMs": { "used": 120000 }`, not `147000`: a field that ticked every millisecond would cost a `PATCH /session/{id}` on every event of a multi-hour run, and quantizing here is what keeps the payload and the truncated session-title duration from disagreeing. `tokens` is cumulative **spend** against `maxTokens`; `context` is **peak context** against the learned or configured window, and is **omitted entirely** when no ceiling is known rather than written as `max: 0`. Within one budget window only `context.used` can go down — but `/goal resume` starts a new window, which resets `turns.used`, `durationMs.used`, `minutes.used` and `tokens.used` to zero as well, so none of them is a monotonic counter across a resume. The one budget with a "no ceiling" state is `turns`, carried as `"max": null` plus an explicit `"unlimited": true` — never `Infinity`, which JSON serialises to `null` and would be indistinguishable from a missing field. A bounded goal carries `{ "used": 3, "max": 10 }` with no `unlimited` key. The block above is an **active, unblocked** goal: `stopReason` is written only once the goal has stopped and `blockedReason` only once a blocker is recorded, so neither key appears here.
 
 **Upgrade both halves together.** `v: 2` landed in 0.11.0: `turns.max` became nullable, `durationMs` and `context` were added, and `tokens.used` was redefined from context size to cumulative spend. Every v1 field is still written, so a v1 consumer keeps working — with one exception. The panel is registered separately from the server half, so the two can skew, and a **0.10.x panel reading a 0.11.0 payload drops the turns stat** (it reads `"max": null` as a missing budget). The current panel reads either version.
+
+`v: 3` landed in 1.0.1 and adds exactly one key, `plan.mirror`, the state of the [Todo mirror](#todo-mirror): `state` is `"fresh"`, `"stale"` or `"off"`; `rows` is how many rows the last mirrored write contained and `extra` how many of those were the model's own; `at` is when that write landed, `0` for never. Every v2 key is still written and the key is purely additive, so a v2 consumer is unaffected. The panel still never reads `v`, so the skew is cosmetic in both directions: a 0.11.0 panel against a v3 payload lists every action and shows no mirror suffix — which is exactly what a `"off"` mirror renders anyway — and the current panel against a v2 payload does the same. Upgrade both halves together regardless.
 
 ### Sidebar panel (TUI)
 
@@ -385,7 +392,9 @@ Success: tests pass and changelog updated
 Constraints: do not touch the public API
 ```
 
-That is the payload above, rendered: every action in the plan gets a row. The panel lists **at most 12** actions and appends a `+N more` line only past that (`MAX_PANEL_ACTIONS` in `src/goal-sidebar-view.js`), and the server caps the array it publishes at **20** (`SIDEBAR_METADATA_MAX_ACTIONS` in `src/goal-plugin.js`), so `N` counts what `plan.total` claims beyond the rows shown.
+That is the payload above rendered with the Todo mirror off: every action in the plan gets a row. The panel lists **at most 12** actions and appends a `+N more` line only past that (`MAX_PANEL_ACTIONS` in `src/goal-sidebar-view.js`), and the server caps the array it publishes at **20** (`SIDEBAR_METADATA_MAX_ACTIONS` in `src/goal-plugin.js`), so `N` counts what `plan.total` claims beyond the rows shown.
+
+**While the [Todo mirror](#todo-mirror) is on, the panel shows the exceptions instead**, because the Todo section is already listing the plan: `done` actions without a passing verdict first, then `blocked`, then `in_progress`, each group in plan order, and `pending` actions are not repeated. A `done` action without a verdict carries the same ` — needs claim/evidence/verdict` suffix its mirrored row does, and the progress line gains ` · todo mirror fresh (5)`, ` · todo list stale`, or ` · mirror drift (7≠5)` when the panel's own live read of the host's list disagrees with `plan.mirror.rows`. Under the exception list `+N more` counts only the exception rows the 12-row cap dropped, and it counts them over the **published** actions — at most `SIDEBAR_METADATA_MAX_ACTIONS` — never over the whole plan, so a server-capped plan cannot promise rows the payload does not carry. A v2 payload, or `plan.mirror.state === "off"`, renders exactly as it did in 1.0.0.
 
 The `ctx` stat is **dropped entirely** when no context ceiling is known, so a panel with three stats rather than four is a goal running without one, not a broken render. State drives the colour: blocked is an error, completed a success, paused a warning. An action is green only when it is `done` **and** its verdict is `pass` — a `done` action with no verdict is exactly the unsubstantiated completion the CEV gate exists to catch. The panel hides itself when the session has no goal.
 
@@ -397,6 +406,63 @@ A plugin module may export `server()` or `tui()`, never both — but one *packag
 | `./tui` | `dist/goal-tui.js` | tui: the sidebar panel |
 
 `solid-js` and `@opentui/solid` are provided by the host at runtime, so they are not dependencies of this package and are deliberately external in the bundle — a second copy of Solid would have its own reactive graph and never update. On a host without TUI plugin slots the `./tui` target is simply never loaded and the title line remains the fallback. `sidebarStatus: false` empties the payload the panel reads, so it turns the panel off too.
+
+---
+
+### Todo mirror
+
+While a goal has a plan, the session's native Todo list is a **projection of that plan** (option
+`mirrorTodos`, default `plan`). The plugin never calls `todowrite` itself: it rewrites the arguments
+of the model's own call in `tool.execute.before`, so the host performs exactly one write and the
+checklist every client renders is the plan.
+
+- **One row per plan action, in plan order.** Content is the action id, ` · `, and the title bounded
+  to 120 characters — `a3 · rebuild dist` — so a row always names the action `goal_action_update`
+  moves. A plan longer than **20** actions emits its first 19 rows and then one counted row,
+  `+N more actions — /goal status`.
+- **The status map keeps the native `[✓]` honest.** `pending` → `pending`, `in_progress` →
+  `in_progress`, and a `done` action → `completed` **only** when it is verified (claim, evidence and
+  `verdict: "pass"`). A `done` action without that verdict mirrors as `in_progress` with the suffix
+  ` — needs claim/evidence/verdict`; a `blocked` action mirrors as `in_progress` with
+  ` — BLOCKED: <reason>`, the head of its `claim` bounded to 60 characters, or `no reason recorded`.
+  The Goal panel's own action line carries the same needs-evidence suffix.
+- **Rows of the model's own are kept, below the plan rows**: at most **10**, each bounded to 120
+  characters, and they survive every later refresh. The tool result says what happened —
+  `Mirrored from the goal plan (3/7 verified). 2 items of your own kept.` — with
+  `(N dropped, cap 10)` inside that second sentence when the cap trimmed something.
+- **An existing native list is described, never adopted.** When `/goal set` runs in a session that
+  already has todo rows, the goal's first auto-continue carries an `<existing_todos>` block listing
+  them as `- <content> (<status>)` and telling the model to either record them as the plan with
+  `goal_plan_set`, rewritten as falsifiable claims, or ignore them. The read is best-effort and
+  read-only: nothing is adopted, the kept-rows list starts empty, and a host that cannot answer is
+  logged and skipped rather than blocking `/goal set`. Under `mirrorTodos: "off"` the read is not
+  made at all.
+- **Refresh idiom: `todowrite({todos: []})`.** An empty list is a request to redraw, never a delete.
+  With a live plan it re-emits the projection and leaves the kept extras alone; with no live plan it
+  re-emits the last mirrored rows, or the terminal snapshot taken when the goal ended; only in a
+  session that never mirrored anything does an empty call reach the host as an empty list and clear
+  it.
+- **A stale mirror is nudged at most three times per goal run.** When the plan has moved since the
+  last write, the auto-continue block and `goal_action_update`'s result carry
+  `Todo panel is stale — call todowrite({todos: []}) once; the plan is copied into it for you.` The
+  budget is per goal run and shared by both surfaces; `/goal resume` refunds it in full. A
+  compaction carries the longer form instead:
+  `The session's Todo list is stale — it shows an older copy of the plan; one todowrite({todos: []}) refreshes it.`
+- **Handback on stop or completion.** The mirror is one-way and no plugin can write the host's todo
+  list directly, so the rows outlive the goal. `/goal stop`, `/goal clear` and a genuine completion
+  each take a terminal snapshot of the rows and append
+  `The Todo list still shows this plan's N rows. It is yours again: your next todowrite replaces it.`
+  to their response — only when something was actually mirrored.
+- **`mirrorTodos: "off"` restores pre-1.0.1 behaviour exactly.** All three `todowrite` hooks return
+  before touching anything, every prompt surface that mentions the mirror is silent, and both plan
+  tools' descriptions and `todowrite`'s own description are the stock text. `plan.mirror.state` is
+  then published as `"off"`, which tells the panel to render every action the way it did in 1.0.0.
+
+The hazards this creates on hosts the plugin does not control — the `todowrite` description reaching
+goal-less sessions in the same project, `todowrite: "ask"`, hosts that deny the tool, another plugin
+writing the same arguments, the second and hookless `todowrite` implementation, `/undo`, and the one
+departure from the host's one-`in_progress` convention — are each written down in
+[`compatibility.md`](compatibility.md#todo-mirror).
 
 ---
 
@@ -430,7 +496,7 @@ Objective-bearing commands preserve file attachments. OpenCode may expand those 
 | Node.js | `engines.node` is `>=18`; CI runs the full suite on Node 18, 20, 22, and 24 |
 | OpenCode | `engines.opencode` is `>=1.17.15 <2`. OpenCode 2 is unsupported and untested — see [`compatibility.md`](compatibility.md#opencode-2) |
 | Operating systems | Filesystem-sensitive lifecycle tests run on Linux, macOS, and Windows; the installed-package type, host, and tool contracts also run on Windows |
-| Package entrypoints | Installed-tarball contracts verify all three export paths (`.`, `./server`, `./tui`), the plugin-manifest targets OpenCode reads from `exports`, consumer TypeScript resolution, the 9 hooks, and all 14 tools |
+| Package entrypoints | Installed-tarball contracts verify all three export paths (`.`, `./server`, `./tui`), the plugin-manifest targets OpenCode reads from `exports`, consumer TypeScript resolution, the enumerated hook surface, and all 14 tools |
 | Provider/backend quirks | Strict-template backends require the goal block to merge into the primary `system` message; covered by regression tests. See [`providers.md`](providers.md) |
 | Runtime dependencies | `zod` only, bundled into `dist/` |
 
@@ -474,11 +540,15 @@ npm run smoke:packed-host    # install the packed tarball, exercise the host con
 npm run smoke:packed-tools   # all 14 tools from an installed tarball
 npm run smoke:packed-manifest # both plugin targets discovered from the packed exports
 npm run smoke:git-install    # no install-time scripts; dist matches a fresh bundle
+npm run smoke:todo-mirror    # real host: the plan is redrawn over the model's own list
+npm run smoke:todo-safety    # real host: an empty todowrite never destroys rows
 npm run verify               # installed hook surface
 npm run check                # syntax check + tests
 npm run pack:check           # package contents
 npm run release:check        # the complete gate, in order (~3 min)
 ```
+
+The two `smoke:todo-*` rungs are the only ones that need the `opencode` binary on `PATH` and a freshly bundled `dist/` (`npm run bundle`) — the installer copies `dist/`, so a stale bundle smokes the old code. Both are deliberately **not** in `release:check`, because the binary is not a dev dependency; their scratch roots are overridable with `SMOKE_TODO_MIRROR_DIR` and `SMOKE_TODO_SAFETY_DIR`.
 
 Point OpenCode at your checkout for local testing with the package **directory**, not a file inside it. Keep test files outside OpenCode's auto-loaded plugin directory — it will try to load plugin-like files it finds there. See [`CONTRIBUTING.md`](../CONTRIBUTING.md) for the full contribution checklist, [`SECURITY.md`](../SECURITY.md) for vulnerability reporting, [`releasing.md`](releasing.md) for how a release is cut, and [`verification.md`](verification.md) for what each rung of the gate proves.
 
