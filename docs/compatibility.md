@@ -131,7 +131,7 @@ commands, tools, hooks, and the title and metadata writes) and
 reads *TUI* plugins from a separate `tui.json`/`tui.jsonc`, whose location
 differs between OpenCode lines, and the two formats must not be mixed. Register
 the package in **both** files to get the panel. The server half works alone —
-you get the [status line](../README.md#status-line), which reaches every client
+you get the [status line](reference.md#status-line), which reaches every client
 through the session title rather than through a TUI plugin, and no panel. On a
 host without TUI plugin slots the `./tui` target is simply never loaded.
 
