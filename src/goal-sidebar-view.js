@@ -537,8 +537,9 @@ export function createGoalSidebar(runtime) {
 
   /**
    * `TuiPlugin`: registers the sidebar panel. Ordered just after the builtin
-   * todo panel (order 400 in feature-plugins/sidebar/todo.tsx) so an active
-   * goal reads as context for the todos below it.
+   * todo panel (order 400 in feature-plugins/sidebar/todo.tsx), and @opentui/core
+   * sorts sidebar plugins ascending, so this panel renders BELOW that section and
+   * an active goal's exceptions read as a footer on the todos above it.
    */
   const tui = async (api) => {
     api.slots.register({
