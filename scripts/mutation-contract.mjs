@@ -625,6 +625,18 @@ const mutants = [
     test: "test/goal-plugin.test.js",
   },
   {
+    // The wire id is still `opencode-goal-plugin` in both halves, so a second
+    // entry naming any other build of this plugin does not add a plugin — the
+    // TUI runtime rejects the duplicate id (plugin/tui/runtime.ts:655) and the
+    // sidebar silently never appears. Leaving a stale entry behind is therefore
+    // a broken install, not an untidy one.
+    name: "installing removes an older build's entry instead of colliding with it",
+    file: "scripts/install.mjs",
+    from: "    if (ours || isRelatedSpec(raw)) {",
+    to: "    if (ours) {",
+    test: "test/install.test.js",
+  },
+  {
     name: "the terminal render carries the learned context ceiling",
     file: "src/goal-plugin.js",
     from: "    modelContextTokens: goal.modelContextTokens,\n    modelKey: goal.modelKey,\n",
@@ -638,6 +650,9 @@ try {
   await Promise.all([
     cp(join(repository, "src"), join(root, "src"), { recursive: true }),
     cp(join(repository, "test"), join(root, "test"), { recursive: true }),
+    // The installer lives in scripts/ and imports nothing but node: builtins,
+    // so a mutant can be planted there exactly as in src/.
+    cp(join(repository, "scripts"), join(root, "scripts"), { recursive: true }),
     cp(join(repository, "node_modules", "zod"), join(root, "node_modules", "zod"), {
       recursive: true,
     }),
