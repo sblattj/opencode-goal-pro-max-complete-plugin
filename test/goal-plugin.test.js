@@ -399,6 +399,9 @@ async function createHooks(overrides = {}) {
       // Only wired when a test asks for it, so every other test still proves
       // the plugin works against a host that offers neither.
       ...(overrides.sessionGet ? { get: overrides.sessionGet } : {}),
+      // v1.0.1 T38: GET /session/{id}/todo, for the <existing_todos> offer.
+      // Only wired when a test asks for it, matching sessionGet above.
+      ...(overrides.todo ? { todo: overrides.todo } : {}),
     },
     ...(overrides.config ? { config: overrides.config } : {}),
   }
@@ -14698,6 +14701,82 @@ test("the system-block sentence appears only under plan mode with a plan, and is
 
 // >>> v101:T19 tests - the continuation nudge line
 // T19 units: 20.
+test("mirroring the plan once produces no continuation nudge; a plan edit adds exactly one, and re-mirroring silences it again", async () => {
+  const { hooks } = await createHooks()
+  const sessionID = "t19-continuation-nudge"
+  const goal = await t12MirrorSetup(sessionID, [
+    { id: "a1", title: "write the code" },
+    { id: "a2", title: "run the tests" },
+  ])
+
+  // 1. Mirror once through the real hooks: the model calls the taught refresh
+  // idiom (an empty todowrite), the before-hook re-projects the plan into it
+  // (T11), and the after-hook stamps the mirror fresh from what actually landed
+  // (T12). Only the stamp makes `mirrorIsFresh` true.
+  const seeded = { todos: [] }
+  await hooks["tool.execute.before"](
+    { tool: "todowrite", sessionID, callID: "t19-seed-before" },
+    { args: seeded },
+  )
+  assert.ok(seeded.todos.length > 0, "the before-hook must have re-projected the plan")
+  await hooks["tool.execute.after"](
+    { tool: "todowrite", sessionID, callID: "t19-seed-after", args: seeded },
+    { title: "todowrite", output: "", metadata: {} },
+  )
+  assert.equal(testInternals.mirrorIsFresh(goal), true)
+  assert.equal(goal.mirror.nudges, 0)
+
+  // A fresh mirror: the continuation carries no nudge line, and nothing is spent.
+  const freshMessage = buildContinueMessage(goal, { mirrorMode: "plan" })
+  assert.equal(freshMessage.includes(T14_NUDGE_LINE), false)
+  assert.equal(goal.mirror.nudges, 0)
+
+  // The "byte-for-byte today" property: a fresh mirror never has anything to say,
+  // so mode "plan" and mode "off" render an identical continuation for the same
+  // goal — the existing `.filter(Boolean)` elides the empty nudge either way.
+  assert.equal(freshMessage, buildContinueMessage(goal, { mirrorMode: "off" }))
+
+  // 2. Update an action: the plan changes under the mirror, so it reads stale.
+  // Drive the update through handlers built with `mirrorMode: "off"` so the
+  // tool-result's OWN nudge (T14, wired into `updateAction`) does not also spend
+  // the budget here — this unit isolates T19's emission, inside the continuation.
+  const { handlers: offHandlers } = makeAgentHandlers({ mirrorMode: "off" })
+  const updateResult = await offHandlers.updateAction(sessionID, { id: "a1", status: "in_progress" })
+  assert.equal(updateResult.includes(T14_NUDGE_LINE), false)
+  assert.equal(goal.mirror.nudges, 0)
+  assert.equal(testInternals.mirrorIsFresh(goal), false)
+
+  // Exactly one nudge line, and the budget now reads 1.
+  const staleMessage = buildContinueMessage(goal, { mirrorMode: "plan" })
+  assert.equal(
+    staleMessage.split("\n").filter((line) => line === T14_NUDGE_LINE).length,
+    1,
+  )
+  assert.equal(goal.mirror.nudges, 1)
+
+  // Mode "off" never adds it, however stale the mirror, and spends nothing.
+  const staleOffMessage = buildContinueMessage(goal, { mirrorMode: "off" })
+  assert.equal(staleOffMessage.includes(T14_NUDGE_LINE), false)
+  assert.equal(goal.mirror.nudges, 1)
+
+  // 3. Mirror again: fresh once more, so the nudge falls silent — and the second
+  // call above must not have spent any further budget while it was stale.
+  const reprojected = { todos: t12ProjectedRows(goal) }
+  await hooks["tool.execute.before"](
+    { tool: "todowrite", sessionID, callID: "t19-remirror-before" },
+    { args: reprojected },
+  )
+  await hooks["tool.execute.after"](
+    { tool: "todowrite", sessionID, callID: "t19-remirror-after", args: reprojected },
+    { title: "todowrite", output: "", metadata: {} },
+  )
+  assert.equal(testInternals.mirrorIsFresh(goal), true)
+
+  const freshAgainMessage = buildContinueMessage(goal, { mirrorMode: "plan" })
+  assert.equal(freshAgainMessage.includes(T14_NUDGE_LINE), false)
+  assert.equal(goal.mirror.nudges, 1, "landing the refresh must not refund or spend the budget")
+  assert.equal(freshAgainMessage, buildContinueMessage(goal, { mirrorMode: "off" }))
+})
 // <<< v101:T19
 
 
@@ -14728,6 +14807,76 @@ test("the system-block sentence appears only under plan mode with a plan, and is
 
 // >>> v101:T38 tests - the <existing_todos> offer on /goal set
 // T38 units: 29.
+test("setting a goal in a session with existing todos offers them to the model without adopting them", async () => {
+  let sourceTurn = 0
+  const nativeTodos = [
+    { id: "todo-1", content: "write the launch checklist", status: "pending", priority: "medium" },
+    { id: "todo-2", content: "notify the on-call rotation", status: "in_progress", priority: "high" },
+  ]
+  const { calls, hooks } = await createHooks({
+    todo: async () => nativeTodos,
+    messages: async () => ({
+      data: [message("working on it", undefined, `msg-t38-existing-todos-${sourceTurn}`)],
+    }),
+    onPromptAsync: () => {
+      sourceTurn += 1
+    },
+    options: { minDelayMs: 1 },
+  })
+  const sessionID = "t38-existing-todos"
+
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID, arguments: "ship the release" },
+    { parts: [] },
+  )
+
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID, status: { type: "idle" } } },
+  })
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID, status: { type: "idle" } } },
+  })
+
+  assert.equal(calls.length, 2, "two continuations must have been sent")
+  const firstText = calls[0].body?.parts?.[0]?.text ?? calls[0].parts?.[0]?.text
+  const secondText = calls[1].body?.parts?.[0]?.text ?? calls[1].parts?.[0]?.text
+
+  assert.match(firstText, /<existing_todos>/)
+  assert.match(firstText, /They are NOT the plan/)
+  assert.match(firstText, /- write the launch checklist \(pending\)/)
+  assert.match(firstText, /- notify the on-call rotation \(in_progress\)/)
+  assert.match(firstText, /<\/existing_todos>/)
+
+  assert.doesNotMatch(secondText, /<existing_todos>/)
+  assert.doesNotMatch(secondText, /They are NOT the plan/)
+
+  const goal = currentGoal(sessionID)
+  assert.equal(goal.plan.actions.length, 0, "no todo is ever adopted into the plan")
+  assert.equal(goal.mirror.extra.length, 0, "the offer never touches goal.mirror.extra")
+})
+
+test("a failing todo read never blocks /goal set", async () => {
+  const { hooks, logs } = await createHooks({
+    todo: async () => {
+      throw new Error("todo route unavailable")
+    },
+  })
+  const sessionID = "t38-existing-todos-failure"
+
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID, arguments: "ship the release" },
+    { parts: [] },
+  )
+
+  const goal = currentGoal(sessionID)
+  assert.ok(goal, "the goal must still be set despite the failing todo read")
+  assert.equal(goal.condition, "ship the release")
+  assert.equal(goal.mirror.extra.length, 0)
+  assert.ok(
+    logs.some((entry) => /existing todo list/.test(entry?.body?.message || "")),
+    "the failure must be logged",
+  )
+})
 // <<< v101:T38
 
 
