@@ -15201,6 +15201,215 @@ test("a failing todo read never blocks /goal set", async () => {
 
 // >>> v101:T28 tests - the ledger-isolation guard
 // T28 units: 32.
+// Imported directly rather than through `testInternals`: CONTRACTS ("do NOT edit the
+// testInternals export object") froze that bag before this wave existed, and
+// `assertPlanLedgerIsolated` is exported as a plain named export instead (see the
+// `v101:T28` region in src/goal-plugin.js). A second `import` statement mid-file is
+// valid ESM (import declarations are hoisted regardless of position).
+import { assertPlanLedgerIsolated } from "../src/goal-plugin.js"
+
+/**
+ * Reads back only the three fields `goal_plan_set`/`goal_action_update` are allowed to
+ * write. This is deliberately narrow: a stray `content`/`priority` key would be invisible
+ * to a `.map` like this one, but `t28AssertLedgerUntouched` below always runs
+ * `assertPlanLedgerIsolated` FIRST, so a real leak throws before this comparison ever runs.
+ */
+function t28PlanShape(goal) {
+  return (goal?.plan?.actions || []).map((action) => ({
+    id: action.id,
+    title: action.title,
+    status: action.status,
+  }))
+}
+
+/**
+ * One assertion per mirror-path step: the guard must pass AND return the same goal, and the
+ * ledger must read back exactly what the last `goal_plan_set`/`goal_action_update` call wrote
+ * -- never anything a todowrite call attempted.
+ */
+function t28AssertLedgerUntouched(goal, expected, label) {
+  assert.equal(assertPlanLedgerIsolated(goal), goal, `${label}: the guard returns the same goal`)
+  assert.deepEqual(
+    t28PlanShape(goal),
+    expected,
+    `${label}: the ledger still reads back only what the plan writers wrote`,
+  )
+}
+
+test("no todo status, title or completion ever reaches goal.plan.actions", async () => {
+  const sep = testInternals.MIRROR_ID_SEPARATOR
+  const sessionID = "t28-ledger-isolation-e2e"
+  // ONE plugin instance for this whole test (v101:INT3 trap): a second createHooks()
+  // would publish a second `lastRuntime` and orphan this session's goal.
+  const { hooks } = await createHooks()
+  const { handlers } = makeAgentHandlers()
+
+  // --- setup: one goal, one 3-action plan, both through the real writers ---
+  await handlers.setGoal(sessionID, { objective: "ship the todo mirror" })
+  await handlers.setPlan(sessionID, {
+    actions: [
+      { id: "a1", title: "write the code" },
+      { id: "a2", title: "verify it" },
+      { id: "a3", title: "ship it" },
+    ],
+  })
+  let goal = currentGoal(sessionID)
+  let expected = [
+    { id: "a1", title: "write the code", status: "pending" },
+    { id: "a2", title: "verify it", status: "pending" },
+    { id: "a3", title: "ship it", status: "pending" },
+  ]
+  t28AssertLedgerUntouched(goal, expected, "after goal_plan_set")
+
+  // A legitimate write through goal_action_update DOES change the ledger.
+  await handlers.updateAction(sessionID, { id: "a2", status: "in_progress" })
+  expected = [
+    { id: "a1", title: "write the code", status: "pending" },
+    { id: "a2", title: "verify it", status: "in_progress" },
+    { id: "a3", title: "ship it", status: "pending" },
+  ]
+  t28AssertLedgerUntouched(goal, expected, "after goal_action_update")
+
+  // --- mirror path 1: a non-empty todowrite that tries to smuggle a status AND a
+  // title change onto two plan actions, alongside two rows of the model's own ---
+  const nonEmpty = {
+    args: {
+      todos: [
+        // Attempts to mark a1 "completed" through the todo interface.
+        { content: `a1${sep}write the code`, status: "completed", priority: "low" },
+        // Attempts to rewrite a2's title through the todo interface.
+        { content: `a2${sep}REWRITTEN TITLE FROM TODOWRITE`, status: "in_progress", priority: "medium" },
+        { content: `a3${sep}ship it`, status: "pending", priority: "medium" },
+        { content: "buy milk", status: "pending", priority: "medium" },
+        { content: "call mom", status: "pending", priority: "low" },
+      ],
+    },
+  }
+  await hooks["tool.execute.before"](
+    { tool: "todowrite", sessionID, callID: "t28-nonempty" },
+    nonEmpty,
+  )
+  assert.equal(nonEmpty.args.todos.length, 5, "3 regenerated plan rows + 2 extras of the model's own")
+  goal = currentGoal(sessionID)
+  t28AssertLedgerUntouched(goal, expected, "after the before-hook on a contaminated non-empty todowrite")
+
+  await hooks["tool.execute.after"](
+    { tool: "todowrite", sessionID, callID: "t28-nonempty", args: nonEmpty.args },
+    { title: "todowrite", output: "ok", metadata: {} },
+  )
+  t28AssertLedgerUntouched(goal, expected, "after the after-hook stamps the contaminated call")
+  assert.equal(goal.mirror.extra.length, 2, "the two non-owned rows were kept as extras")
+
+  // --- mirror path 2: an empty refresh re-projects without changing the ledger ---
+  const emptyRefresh = { args: { todos: [] } }
+  await hooks["tool.execute.before"](
+    { tool: "todowrite", sessionID, callID: "t28-empty-refresh" },
+    emptyRefresh,
+  )
+  assert.equal(emptyRefresh.args.todos.length, 5, "the empty call re-projected the plan plus the carried extras")
+  t28AssertLedgerUntouched(goal, expected, "after an empty-list refresh")
+
+  await hooks["tool.execute.after"](
+    { tool: "todowrite", sessionID, callID: "t28-empty-refresh", args: emptyRefresh.args },
+    { title: "todowrite", output: "ok", metadata: {} },
+  )
+  t28AssertLedgerUntouched(goal, expected, "after the empty refresh is stamped")
+  const lastMirroredRows = goal.mirror.rows.map((row) => ({ ...row }))
+
+  // --- mirror path 3: /goal stop deletes the goal and takes a terminal snapshot
+  // (X2); the following empty todowrite call re-emits the snapshot rather than
+  // touching a ledger that no longer exists ---
+  const stopOutput = { parts: [] }
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID, arguments: "stop" },
+    stopOutput,
+  )
+  assert.equal(currentGoal(sessionID), null, "/goal stop deletes the goal record")
+  t28AssertLedgerUntouched(currentGoal(sessionID), [], "after /goal stop (no plan left to isolate)")
+
+  const postStop = { args: { todos: [] } }
+  await hooks["tool.execute.before"](
+    { tool: "todowrite", sessionID, callID: "t28-post-stop" },
+    postStop,
+  )
+  assert.deepEqual(
+    postStop.args.todos,
+    lastMirroredRows,
+    "the terminal snapshot re-emits exactly what was last mirrored, not a live plan",
+  )
+  t28AssertLedgerUntouched(currentGoal(sessionID), [], "after the post-stop empty call")
+
+  // --- mirror path 4: /goal resume with nothing to resume is a documented no-op ---
+  const resumeNoActive = { parts: [] }
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID, arguments: "resume" },
+    resumeNoActive,
+  )
+  assert.match(resumeNoActive.parts[0].text, /No active goal/)
+  t28AssertLedgerUntouched(currentGoal(sessionID), [], "after a no-op /goal resume")
+
+  // --- mirror path 5: a second goal set starts with a clean, isolated ledger and a
+  // reset mirror record (T6's resetMirrorForNewGoal) -- no carryover of the first
+  // goal's extras or rows ---
+  await handlers.setGoal(sessionID, { objective: "ship the second thing" })
+  await handlers.setPlan(sessionID, {
+    actions: [
+      { id: "b1", title: "second plan first action" },
+      { id: "b2", title: "second plan second action" },
+    ],
+  })
+  goal = currentGoal(sessionID)
+  expected = [
+    { id: "b1", title: "second plan first action", status: "pending" },
+    { id: "b2", title: "second plan second action", status: "pending" },
+  ]
+  t28AssertLedgerUntouched(goal, expected, "after the second goal_plan_set")
+  assert.equal(goal.mirror.extra.length, 0, "the second goal's mirror carries none of the first goal's extras")
+  assert.equal(goal.mirror.rows.length, 0, "the second goal's mirror carries none of the first goal's rows")
+  assert.equal(goal.mirror.fingerprint, "", "the second goal's mirror fingerprint was reset")
+  assert.equal(goal.mirror.nudges, 0)
+
+  // --- mirror path 6 (bonus coverage): pause/resume on this second, still-active
+  // goal -- a genuine (non-no-op) resume, unlike path 4 ---
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID, arguments: "pause" },
+    { parts: [] },
+  )
+  t28AssertLedgerUntouched(goal, expected, "after /goal pause")
+
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID, arguments: "resume" },
+    { parts: [] },
+  )
+  t28AssertLedgerUntouched(goal, expected, "after /goal resume on an active goal")
+  assert.equal(goal.mirror.nudges, 0)
+
+  // --- control arm: the guard is not vacuous -- it must actually throw. Each
+  // check is applied, asserted, and restored before the next so they cannot mask
+  // each other, and the final assertion proves the restore was exact. ---
+  const control = currentGoal(sessionID)
+  const original = { ...control.plan.actions[0] }
+
+  control.plan.actions[0].content = "x"
+  assert.throws(() => assertPlanLedgerIsolated(control), /content/)
+  delete control.plan.actions[0].content
+
+  control.plan.actions[0].priority = "high"
+  assert.throws(() => assertPlanLedgerIsolated(control), /priority/)
+  delete control.plan.actions[0].priority
+
+  control.plan.actions[0].status = "completed"
+  assert.throws(() => assertPlanLedgerIsolated(control), /status/)
+  control.plan.actions[0].status = original.status
+
+  // The generic "aN <separator>" mirror-row shape, per CONTRACTS -- independent
+  // of which action or id it lands on.
+  control.plan.actions[0].title = `a1${sep}smuggled todo content`
+  assert.throws(() => assertPlanLedgerIsolated(control), /title/)
+  control.plan.actions[0].title = original.title
+
+  t28AssertLedgerUntouched(control, expected, "after the control arm is fully restored")
+})
 // <<< v101:T28
 
 
