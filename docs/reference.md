@@ -530,11 +530,12 @@ Do not paste `state.json`, its ledger, or verbose logs into a public issue witho
 ## Development
 
 ```sh
-npm test                     # 555 unit tests
+npm test                     # 655 unit tests
 npm run test:coverage        # tests with coverage
 npm run type:check           # compile installed-package consumers (NodeNext + Bundler)
-npm run test:mutation        # 83 critical mutants must all be killed (~2.3 min)
+npm run test:mutation        # 95 critical mutants must all be killed (~2.3 min)
 npm run benchmark:behavior   # 6 deterministic autonomy scenarios, no provider call
+npm run benchmark:todo-mirror # the todo mirror against a pre-v1.0.1 control, no provider call
 npm run smoke                # package export + command hook, no model call
 npm run smoke:packed-host    # install the packed tarball, exercise the host contract
 npm run smoke:packed-tools   # all 14 tools from an installed tarball

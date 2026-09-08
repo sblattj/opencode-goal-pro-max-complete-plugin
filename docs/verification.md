@@ -8,10 +8,11 @@ Every row was run against this tree on 2026-09-07 (Node v24.15.0, npm 11.12.1, b
 
 | Rung | Command | What it proves | Measured |
 |---|---|---|---|
-| Unit suite | `npm test` | Every documented behaviour has an executable specification, across 16 test files | **555 tests, 555 pass, 0 fail** |
+| Unit suite | `npm test` | Every documented behaviour has an executable specification, across 18 test files | **655 tests, 655 pass, 0 fail** |
 | Coverage | `npm run test:coverage` | The suite actually reaches the code it claims to cover | **≈97% line, ≈88.5% branch, ≈94% function** over `src/` — the cross-process lease tests race, so `persistence-lease.js` and the totals move a tenth of a point or so between runs (runs on this tree stay inside 97.0–97.2% line, 88.4–88.7% branch, 93.8–94.1% function; four fresh 1.0.0 runs came out at 97.07–97.11, 88.46–88.65 and 93.88–94.06) |
-| Mutation contract | `npm run test:mutation` | Each safety property's test is *not vacuous*: the mutant reverts exactly that property in a scratch copy of `src/` and the suite must go red | **83/83 critical mutants killed** |
+| Mutation contract | `npm run test:mutation` | Each safety property's test is *not vacuous*: the mutant reverts exactly that property in a scratch copy of `src/` and the suite must go red | **95/95 critical mutants killed** |
 | Behaviour benchmark | `npm run benchmark:behavior` | Six end-to-end autonomy scenarios — verified success, false completion, loop circuit breaker, human interruption, compaction continuity, restart recovery — behave as specified | **6/6 passed, score 100/100, 0 model calls, 0 external requests** |
+| Todo-mirror benchmark | `npm run benchmark:todo-mirror` | The Todo mirror does what it was built for, measured against a pre-v1.0.1 control: one goal, a five-action plan, eight scripted turns, and a model that writes its own divergent list every turn | **passed — under `mirrorTodos: "plan"` the executed list diverges from the plan on 0 of 8 turns and the sidebar settles on 1 persistent checklist; the `"off"` control diverges on 8 of 8 and renders 2. Both arms re-run and deep-equal their first pass** |
 | Type contract | `npm run type:check` | A TypeScript consumer can compile against the **packed tarball** under both NodeNext and Bundler resolution, including the `./tui` subpath | **passed** (`opencode-goal-pro-max-complete-plugin-1.0.0.tgz`) |
 | Command-hook smoke | `npm run smoke` | The package export path and the `/goal` command hook work with no model call | **passed** |
 | Installed-host contract | `npm run smoke:packed-host` | The published artifact, installed into a scratch project, satisfies the OpenCode host contract — hooks, exports, consumer resolution | **passed**, ≈367 kB tarball |

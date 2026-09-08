@@ -38,12 +38,13 @@ The sidebar's Todo section is drawn from the same plan: while a plan exists, eve
 
 | Rung | Proves | Result |
 |---|---|---|
-| `npm test` | an executable spec for every documented behaviour | 555 of 555 pass |
-| `npm run test:mutation` | those tests are not vacuous | 83 of 83 critical mutants killed |
+| `npm test` | an executable spec for every documented behaviour | 655 of 655 pass |
+| `npm run test:mutation` | those tests are not vacuous | 95 of 95 critical mutants killed |
 | `npm run benchmark:behavior` | six end-to-end autonomy scenarios | 6 of 6, 0 model calls |
+| `npm run benchmark:todo-mirror` | the Todo mirror against a pre-v1.0.1 control | 0 of 8 turns diverge, 1 persistent checklist |
 | `npm run release:check` | the whole gate, in order | passes in about 2.5 to 3 minutes |
 
-The full 13-rung ladder, the review process behind the 0.11.0 defaults, the one-session measurement that drove the turn-aggregation fix, and what none of it proves, are in [docs/verification.md](docs/verification.md).
+The full 14-rung ladder, the review process behind the 0.11.0 defaults, the one-session measurement that drove the turn-aggregation fix, and what none of it proves, are in [docs/verification.md](docs/verification.md).
 
 ## The shipped skill
 
