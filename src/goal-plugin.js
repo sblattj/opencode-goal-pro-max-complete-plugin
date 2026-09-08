@@ -5262,7 +5262,10 @@ const MIRROR_MODES = new Set(["plan", "off"])
  * file, so do not repeat it in a comment.
  */
 function mirrorRowStatus(action) {
-  throw new Error("v1.0.1 T1: not implemented")
+  if (action.status === "pending") return "pending"
+  if (action.status === "in_progress") return "in_progress"
+  if (action.status === "blocked") return "in_progress"
+  return planActionVerified(action) ? "completed" : "in_progress"
 }
 
 /**
@@ -5272,7 +5275,14 @@ function mirrorRowStatus(action) {
  * when none) for a blocked action.
  */
 function mirrorRowSuffix(action) {
-  throw new Error("v1.0.1 T1: not implemented")
+  if (action.status === "blocked") {
+    const reasonHead = summarizeText(action.claim, 60) || "no reason recorded"
+    return ` — BLOCKED: ${reasonHead}`
+  }
+  if (action.status === "done" && !planActionVerified(action)) {
+    return " — needs claim/evidence/verdict"
+  }
+  return ""
 }
 // <<< v101:T1
 
