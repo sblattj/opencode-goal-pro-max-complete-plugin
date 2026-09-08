@@ -5591,6 +5591,22 @@ function mirrorNudgeLine(goal, mirrorMode) {
 
 
 
+// >>> v101:T10 the empty-list predicate the before-hook guard ladder shares
+/**
+ * `isEmptyList(value)` -> boolean: `Array.isArray(value) && value.length === 0`.
+ *
+ * The refresh idiom the model is taught is `todowrite({todos: []})`, so "an empty
+ * array" has to be told apart from "no list at all": a missing/malformed
+ * `args.todos` is a native call the mirror must not intercept, while an empty
+ * array is the deliberate refresh T11 re-emits the last rows for.
+ */
+function isEmptyList(value) {
+  return Array.isArray(value) && value.length === 0
+}
+// <<< v101:T10
+
+
+
 async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) {
   if (pluginOptions.completionAudit && pluginOptions.registerAgents === false) {
     throw new TypeError("completionAudit requires registerAgents to remain enabled")
@@ -6718,19 +6734,33 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         abortAccepted: true,
       })
     },
-    "tool.execute.before": async (input) => {
+    "tool.execute.before": async (input, output) => {
       const sessionID = input?.sessionID
       if (!sessionID) return
       await ensureSessionLoaded(sessionID)
       if (currentRuntime().disposed) return
-      if (currentRuntime().activeCommandTurns.get(sessionID)?.policy !== "control") return
-      throw new Error(
-        `This /${commandName} control command has already been handled. Tool "${input?.tool || "unknown"}" was blocked because no tool calls are allowed while its result is being reported. Wait for a separate user turn before using tools or modifying work or goal state.`,
-      )
+      // v1.0.1 (T10) inverted this guard. The control-command block still fires
+      // FIRST, with byte-identical text, so a control turn can never be raced by
+      // a tool call — but it no longer swallows every ordinary turn on its way
+      // out, because the todo mirror below has to run on those.
+      if (currentRuntime().activeCommandTurns.get(sessionID)?.policy === "control") {
+        throw new Error(
+          `This /${commandName} control command has already been handled. Tool "${input?.tool || "unknown"}" was blocked because no tool calls are allowed while its result is being reported. Wait for a separate user turn before using tools or modifying work or goal state.`,
+        )
+      }
       // >>> v101:T10 todowrite mirror: hook signature, tool gate and the guard ladder
-      // Reserved. Unreachable until T10 restructures the ladder above: today this hook returns
-      // early unless the turn is a control turn, and then always throws. T10 rewrites the hook to
-      // `async (input, output)` and moves this region into the live path.
+      // The tool gate is the FIRST mirror statement, and it is mandatory: without
+      // it the plugin would write a `todos` property into `bash`'s args and every
+      // tool call in the session would fail the host's argument decode.
+      if (input.tool !== "todowrite") return
+      // The kill switch. `mirrorTodos: "off"` restores v1.0.0 behaviour: the
+      // model's list reaches the host exactly as it was written.
+      if (mirrorMode === "off") return
+      // Some hosts (and the plugin's own guard-only callers) trigger this hook
+      // with no args bag at all. There is nothing to rewrite, and creating one
+      // would invent arguments the host never sent.
+      if (!output?.args) return
+      const goal = goalStates.get(sessionID)
       // <<< v101:T10
 
 
@@ -6739,6 +6769,28 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       // Reserved. T11 fills this with the A1 ladder, placed BEFORE the `!goal` return and AFTER
       // the `mirrorMode === "off"` return that T10 writes.
       // <<< v101:T11
+
+
+
+      // >>> v101:T10 todowrite mirror: the non-empty path - extras, projection, the write
+      // Native behaviour whenever there is no live plan to draw from: no goal, a
+      // paused/stopped one, or a goal whose plan is still empty. The plan is
+      // opt-in, so a session that never recorded one keeps its own todo list.
+      if (!goal || goal.stopped || goal.plan.actions.length === 0) return
+      // The model's own rows, minus the ones this plugin wrote last time, bounded
+      // and capped. They are re-derived from every non-empty call, so the model
+      // can delete an item of its own simply by omitting it.
+      const { extra, dropped } = pickExtras(output.args.todos, goal)
+      goal.mirror.extra = extra
+      // Runtime-only scalar for the tool-result note: `normalizeMirror` drops it,
+      // so a count from one call never reaches disk or a later session.
+      goal.mirror.lastDropped = dropped
+      const rows = projectPlanToTodos(goal.plan, extra)
+      // THE WRITE. A property write on the caller's own args object: the host
+      // kept its reference before triggering the hook, so reassigning
+      // `output.args` would be silently dropped.
+      output.args.todos = rows
+      // <<< v101:T10
 
 
 
