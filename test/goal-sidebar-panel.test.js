@@ -558,3 +558,34 @@ test("the shared budget formatters are the ones the panel and the title both use
   assert.equal(formatTurnBudget(3, 0), "3/∞")
   assert.equal(formatTurnBudget(3, null), "3/∞")
 })
+
+// >>> v101:T24 tests - the exception-list filter
+// T24 units: 33, 34.
+// <<< v101:T24
+
+
+
+// >>> v101:T25 tests - the mirror suffix on the progress line
+// T25 units: 35.
+// <<< v101:T25
+
+
+
+// >>> v101:T26 tests - the live drift check
+// T26 units: 37.
+// <<< v101:T26
+
+
+
+// >>> v101:T27 tests - a v2 payload still renders as today
+// T27 units: 36.
+// <<< v101:T27
+
+
+
+// >>> v101:T39 tests - the needs-evidence suffix on a panel action line
+// T39 units: A3 ("a done action without a passing verdict carries the needs-evidence suffix on its panel line").
+// <<< v101:T39
+
+
+
