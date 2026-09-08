@@ -108,6 +108,8 @@ const {
   goalSpendTokens,
   userInterventionDetected,
   xdgStateFilePath,
+  mirrorRow,
+  mirrorRowPriority,
 } = testInternals
 
 function sessionStatePath(stateFilePath, sessionID) {
@@ -12812,7 +12814,51 @@ test("the terminal sidebar render keeps the context ceiling learned from the mod
 
 
 // >>> v101:T3 tests - mirrorRow / mirrorRowPriority
-// T3 units: 1, 4.
+// T3 units: 4 (design §5.1 name, verbatim), plus "the first open row is high priority, later
+// open rows medium, completed rows low", plus "mirrorRow never emits an undefined field".
+// (Unit 1 — "the plan projects onto native rows carrying exactly content, status and priority" —
+// belongs to T2's projectPlanToTodos region per its own placeholder comment above; it is not
+// duplicated here.)
+
+test("mirrorRow coerces provided values to strings and fills in defaults for missing status, priority and content", () => {
+  assert.deepEqual(mirrorRow({ content: "abc-1 · Ship it", status: 7, priority: true }), {
+    content: "abc-1 · Ship it",
+    status: "7",
+    priority: "true",
+  })
+  assert.deepEqual(mirrorRow({}), { content: "(untitled)", status: "pending", priority: "medium" })
+  assert.deepEqual(mirrorRow({ content: "x" }), { content: "x", status: "pending", priority: "medium" })
+})
+
+test("every mirrored row's three fields are non-empty strings even for an action with no title", () => {
+  // An action with no title reaches mirrorRow with an empty/missing content field.
+  const row = mirrorRow({ content: undefined, status: undefined, priority: undefined })
+  for (const key of ["content", "status", "priority"]) {
+    assert.equal(typeof row[key], "string")
+    assert.ok(row[key].length > 0, `${key} must be a non-empty string`)
+  }
+  assert.equal(row.content, "(untitled)")
+})
+
+test("mirrorRow never emits an undefined field", () => {
+  const row = mirrorRow({ content: undefined, status: undefined, priority: undefined })
+  for (const key of ["content", "status", "priority"]) {
+    assert.notEqual(row[key], undefined)
+    assert.notEqual(row[key], null)
+  }
+  assert.deepEqual(Object.keys(row).sort(), ["content", "priority", "status"])
+})
+
+// "the first open row is high priority, later open rows medium, completed rows low": DEFERRED.
+// mirrorRowPriority(action, index) must call the sibling mirrorRowStatus(action) (T1) FIRST, on
+// every call, because a completed row must win "low" over an index-0 "high" — the ordering in
+// CONTRACTS ("completed -> low; index === 0 -> high; else medium") is not just presentation order,
+// it is the correctness rule. Until T1 lands, mirrorRowStatus throws unconditionally for ANY
+// action (src/goal-plugin.js:5264-5266, `throw new Error("v1.0.1 T1: not implemented")`), so
+// mirrorRowPriority throws for every input right now — not only the completed arm. This is wider
+// than the brief's assumption that only the completed-row assertion needed deferring; verified by
+// reading the T1 stub before writing this comment. Deferred in full: { todo: "lands with wave-1
+// integration" }. See REPORT.md for the reconciliation.
 // <<< v101:T3
 
 

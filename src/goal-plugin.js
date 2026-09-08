@@ -5303,7 +5303,12 @@ function projectPlanToTodos(plan, extras) {
  * priority -> `"medium"`, empty/missing content -> `"(untitled)"`.
  */
 function mirrorRow({ content, status, priority } = {}) {
-  throw new Error("v1.0.1 T3: not implemented")
+  const hasContent = typeof content === "string" && content.length > 0
+  return {
+    content: hasContent ? content : "(untitled)",
+    status: status === undefined || status === null ? "pending" : String(status),
+    priority: priority === undefined || priority === null ? "medium" : String(priority),
+  }
 }
 
 /**
@@ -5311,7 +5316,8 @@ function mirrorRow({ content, status, priority } = {}) {
  * `mirrorRowStatus`) -> low; `index === 0` -> high; else medium.
  */
 function mirrorRowPriority(action, index) {
-  throw new Error("v1.0.1 T3: not implemented")
+  if (mirrorRowStatus(action) === "completed") return "low"
+  return index === 0 ? "high" : "medium"
 }
 // <<< v101:T3
 
