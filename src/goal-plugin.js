@@ -7213,6 +7213,11 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       if (input?.toolID !== "todowrite") return
       if (mirrorMode === "off") return
       if (!output || typeof output.description !== "string") return
+      // Defensive only: the host builds a fresh description object per
+      // tools() call, so it cannot re-trigger this hook against an object
+      // this plugin already stamped. A second registration of this plugin, or a
+      // host that reuses the object, would otherwise double the paragraph.
+      if (output.description.includes(TODOWRITE_MIRROR_DESCRIPTION)) return
       output.description = `${output.description}\n\n${TODOWRITE_MIRROR_DESCRIPTION}`
 
     },
