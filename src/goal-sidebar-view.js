@@ -161,9 +161,16 @@ function normalizeAction(raw) {
     status,
     verdict,
     mark: ACTION_MARKS[status],
-    // A `done` action without a passing verdict is exactly the unsubstantiated
-    // completion the CEV gate exists to catch, so it must not read as finished.
-    verified: status === "done" && verdict === "pass",
+    // A `done` action the plan's own ledger does not substantiate is exactly the
+    // unsubstantiated completion the CEV gate exists to catch, so it must not
+    // read as finished. The SERVER decides that — its gate also reads `claim`
+    // and `evidence`, which the payload does not carry — so a v3 payload's own
+    // boolean wins whenever it is present. A v2 payload has no `verified` key at
+    // all and falls back to the pre-1.0.1 derivation, which is the strongest
+    // statement the wire supports there. The `status === "done"` conjunct is
+    // kept on both arms because the payload is arbitrary cross-process JSON:
+    // `verified` must never contradict the mark this same record renders.
+    verified: status === "done" && (typeof raw.verified === "boolean" ? raw.verified : verdict === "pass"),
   }
 }
 

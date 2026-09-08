@@ -17,7 +17,13 @@ export interface GoalPanelAction {
   verdict: "pass" | "fail" | null
   /** Status glyph: `○` pending, `◐` in progress, `●` done, `⛔` blocked. */
   mark: string
-  /** `true` only when the action is done AND its verdict is `pass`. */
+  /**
+   * `true` only when the action is `done` AND the server said it is verified.
+   * A v3 payload publishes `plan.actions[].verified`, the server's own CEV
+   * gate (claim, evidence and a passing verdict), and that boolean is used
+   * verbatim. A v2 payload has no such key, so it falls back to
+   * `verdict === "pass"` — the strongest statement that wire supports.
+   */
   verified: boolean
 }
 

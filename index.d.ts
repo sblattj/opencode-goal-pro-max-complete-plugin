@@ -150,7 +150,16 @@ export interface GoalSidebarStatus {
      * never been written for this goal.
      */
     mirror: { state: "fresh" | "stale" | "off"; rows: number; extra: number; at: number }
-    actions: Array<Pick<GoalPlanAction, "id" | "title" | "status" | "verdict">>
+    /**
+     * The plan's actions, capped server-side at 20. `claim` and `evidence` are
+     * deliberately NOT published — they are goal-private prose — so `verified`
+     * (added in v3) carries the server's own answer to the CEV gate instead:
+     * `true` only when `status` is `"done"` with a non-empty claim, non-empty
+     * evidence and `verdict === "pass"`. Do not re-derive it from `status` and
+     * `verdict`: `goal_plan_set` accepts a `done` action with a passing verdict
+     * and no ledger, and only `verified` tells that case apart.
+     */
+    actions: Array<Pick<GoalPlanAction, "id" | "title" | "status" | "verdict"> & { verified: boolean }>
   }
   successCriteria?: string
   constraints?: string

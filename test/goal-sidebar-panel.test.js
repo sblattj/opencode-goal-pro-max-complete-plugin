@@ -1188,3 +1188,119 @@ test("the server's v3 payload and the panel agree on the mirrored count", async 
   assert.ok(hostTodos[0].content.endsWith(" — needs claim/evidence/verdict"))
   assert.ok(texts.at(-2).endsWith(" — needs claim/evidence/verdict"))
 })
+
+// Tests - the CEV gate crosses the wire (v1.0.1 fix, review finding D-F1)
+//
+// The panel used to re-derive "verified" from `status` and `verdict` alone. That
+// is WEAKER than the server's gate, which also demands a claim and evidence, and
+// the two disagree on a reachable state: `goal_plan_set` records an action's
+// status and verdict with no ledger at all (only `goal_action_update` enforces
+// the gate), so `{status: "done", verdict: "pass"}` with empty claim/evidence is
+// something a model can write in one call. The server called that action
+// unverified everywhere - the progress count, the mirrored todo row's
+// ` — needs claim/evidence/verdict` suffix, the completion blockers - while the
+// panel called it verified and therefore dropped it from the exception list
+// entirely. The payload now carries the server's own boolean and the panel uses
+// it, so this unit fails on any re-derivation.
+test("a done action with a passing verdict but no ledger is an exception on the panel, as it is on the wire", async () => {
+  const hooks = await GoalPlugin({ client: int4Client() }, { persistState: false })
+  const handlers = testInternals.buildAgentToolHandlers({
+    defaultGoalOptions: testInternals.normalizeOptions(),
+    persist: async () => {},
+  })
+  const sid = "ses_cev_parity"
+  await handlers.setGoal(sid, { objective: "prove the CEV gate crosses the wire" })
+  // a1 is the finding: done, verdict pass, no claim and no evidence. a2 is the
+  // control that must come out different: the same status and verdict WITH the
+  // ledger the gate asks for.
+  await handlers.setPlan(sid, {
+    actions: [
+      { id: "a1", title: "ship it", status: "done", verdict: "pass" },
+      {
+        id: "a2",
+        title: "prove it",
+        status: "done",
+        verdict: "pass",
+        claim: "the suite is green",
+        evidence: "tests 655, fail 0",
+      },
+    ],
+  })
+  const goal = testInternals.currentGoal(sid)
+  // Fixture self-check: fail loud if `goal_plan_set` refused the ledger-less
+  // action rather than quietly asserting parity on a plan that never held it.
+  assert.deepEqual(
+    goal.plan.actions.map((action) => `${action.id}:${action.status}:${action.verdict}:${action.claim}`),
+    ["a1:done:pass:", "a2:done:pass:the suite is green"],
+  )
+
+  // The real mirror, so the todo row and the panel line come out of one run.
+  const call = { args: { todos: [] } }
+  await hooks["tool.execute.before"]({ tool: "todowrite", sessionID: sid, callID: "cev-1" }, call)
+  await hooks["tool.execute.after"](
+    { tool: "todowrite", sessionID: sid, callID: "cev-1", args: call.args },
+    { title: "todowrite", output: "ok", metadata: {} },
+  )
+  const hostTodos = call.args.todos
+  assert.deepEqual(hostTodos.map((row) => [row.content, row.status]), [
+    ["a1 · ship it — needs claim/evidence/verdict", "in_progress"],
+    ["a2 · prove it", "completed"],
+  ])
+
+  // The wire: the server publishes its own verdict on each action.
+  const wire = testInternals.buildSidebarMetadata(goal, 1_700_000_000_000, { mirrorMode: "plan" })
+  assert.equal(wire.plan.verified, 1, "the server counts one of the two as verified")
+  assert.deepEqual(
+    wire.plan.actions.map((action) => [action.id, action.status, action.verdict, action.verified]),
+    [
+      ["a1", "done", "pass", false],
+      ["a2", "done", "pass", true],
+    ],
+  )
+
+  // The panel: a1 is the exception, a2 is not, and the two halves spell the
+  // suffix the same way.
+  const model = goalPanelModel(wire, { liveTodoCount: hostTodos.length })
+  assert.equal(model.progress, "1/2 actions verified · todo mirror fresh (2)")
+  assert.deepEqual(model.actions.map((action) => [action.id, action.verified]), [["a1", false]])
+  assert.equal(model.hiddenActions, 0)
+
+  const runtime = fakeRuntime()
+  const { tui } = createGoalSidebar(runtime)
+  const sessions = new Map([[sid, { id: sid, metadata: { goal: wire } }]])
+  const { api, registrations } = fakeApi(sessions)
+  api.state.session.todo = () => hostTodos
+  await tui(api, {}, { spec: "opencode-goal-pro-max-complete-plugin" })
+  const texts = renderLines(runtime, registrations[0].slots.sidebar_content({}, { session_id: sid })).map(
+    (line) => line.text,
+  )
+  // The rendered line keeps the recorded verdict AND names the missing ledger,
+  // which is the whole point: `[pass]` alone read as finished.
+  assert.equal(texts.at(-1), "● ship it [pass] — needs claim/evidence/verdict")
+  // The two halves spell the suffix identically, both bytes from this one run.
+  const suffix = hostTodos[0].content.slice("a1 · ship it".length)
+  assert.equal(suffix, " — needs claim/evidence/verdict")
+  assert.ok(texts.at(-1).endsWith(suffix))
+  assert.ok(
+    !texts.some((line) => line.includes("prove it")),
+    `the verified action must not be repeated: ${JSON.stringify(texts)}`,
+  )
+
+  // THE CONTROL that gives every assertion above its polarity, and the T27
+  // guarantee in the same breath: strip the v3 key from this very payload and
+  // the panel falls back to the pre-1.0.1 derivation, which calls a1 verified
+  // and hides it. So the difference above is the published boolean and nothing
+  // else, and a v2 payload still renders exactly as it did in 1.0.0.
+  const v2 = JSON.parse(JSON.stringify(wire))
+  for (const action of v2.plan.actions) delete action.verified
+  const v2Model = goalPanelModel(v2, { liveTodoCount: hostTodos.length })
+  assert.deepEqual(v2Model.actions, [], "without the key the panel cannot see the missing ledger")
+  assert.equal(v2Model.progress, model.progress, "the progress line is the server's count either way")
+
+  // And a payload that lies about the key in the other direction is still bound
+  // by the mark the same record renders: `verified` never contradicts `status`.
+  const lying = JSON.parse(JSON.stringify(wire))
+  lying.plan.actions[0].status = "in_progress"
+  lying.plan.actions[0].verified = true
+  assert.equal(goalPanelModel(lying).actions.find((action) => action.id === "a1").verified, false)
+})
