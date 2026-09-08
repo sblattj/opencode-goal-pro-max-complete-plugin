@@ -78,7 +78,7 @@ Exit codes: `0` ok (including "already installed"), `1` failed, `2` usage error,
 `3` refused on purpose — an unusable destination path, or a config file the
 installer will not rewrite blind.
 
-`GOAL_PLUGIN_REF=v1.0.0 sh install.sh` installs a specific ref instead of `main`.
+`GOAL_PLUGIN_REF=v1.0.1 sh install.sh` installs a specific ref instead of `main`.
 It must be a **tag or a branch**: the `git clone` fallback passes it to
 `git clone --branch`, which does not accept a commit SHA. `install.sh` passes
 its arguments through, supplying `install` only when the first one is not

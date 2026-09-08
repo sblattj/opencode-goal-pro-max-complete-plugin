@@ -4,16 +4,16 @@ The name is not a claim about the feature list. It is a claim about the **proces
 
 ## The verification ladder
 
-Every row was run against this tree on 2026-09-08 (Node v24.15.0, npm 11.12.1, bun 1.3.14, macOS 26.5.1). `npm run release:check` runs all of them in order, plus a bundle step, and takes about **2.5–3 minutes** on that stack — around nine tenths of it the mutation rung, which re-runs the whole suite once per mutant. (Timed end to end: 150 s, 151 s, 155 s and 173 s before 1.0.0; 153 s, 157 s and 162 s on the 1.0.0 tree, which adds 47 tests and three mutants; and 165 s on the 1.0.1 tree, which adds 100 tests, twelve mutants and a second benchmark.)
+Every row was run against this tree on 2026-09-08 (Node v24.15.0, npm 11.12.1, bun 1.3.14, macOS 26.5.1). `npm run release:check` runs all of them in order, plus a bundle step, and takes about **2.5–3 minutes** on that stack — around nine tenths of it the mutation rung, which re-runs the whole suite once per mutant. (Timed end to end: 150 s, 151 s, 155 s and 173 s before 1.0.0; 153 s, 157 s and 162 s on the 1.0.0 tree, which adds 47 tests and three mutants; and 167 s on the 1.0.1 tree, which adds 105 tests, sixteen mutants and a second benchmark.)
 
 | Rung | Command | What it proves | Measured |
 |---|---|---|---|
-| Unit suite | `npm test` | Every documented behaviour has an executable specification, across 18 test files | **655 tests, 655 pass, 0 fail** |
+| Unit suite | `npm test` | Every documented behaviour has an executable specification, across 18 test files | **660 tests, 660 pass, 0 fail** |
 | Coverage | `npm run test:coverage` | The suite actually reaches the code it claims to cover | **≈97.5% line, ≈88.7% branch, ≈93.9% function** on `src/goal-plugin.js` — the cross-process lease tests race, so `persistence-lease.js` and every total move between runs. Six fresh 1.0.1 runs came out at 97.51–97.55% line, 88.62–88.77% branch and a flat 93.86% function on `goal-plugin.js`, while `persistence-lease.js` itself swung 92.37–93.96% line, 87.79–90.09% branch and 86.67–88.89% function over the same six. Re-measure rather than quote: this row is a range, not a point |
-| Mutation contract | `npm run test:mutation` | Each safety property's test is *not vacuous*: the mutant reverts exactly that property in a scratch copy of `src/` and the suite must go red | **95/95 critical mutants killed** |
+| Mutation contract | `npm run test:mutation` | Each safety property's test is *not vacuous*: the mutant reverts exactly that property in a scratch copy of `src/` and the suite must go red | **99/99 critical mutants killed** |
 | Behaviour benchmark | `npm run benchmark:behavior` | Six end-to-end autonomy scenarios — verified success, false completion, loop circuit breaker, human interruption, compaction continuity, restart recovery — behave as specified | **6/6 passed, score 100/100, 0 model calls, 0 external requests** |
 | Todo-mirror benchmark | `npm run benchmark:todo-mirror` | The Todo mirror does what it was built for, measured against a pre-v1.0.1 control: one goal, a five-action plan, eight scripted turns, and a model that writes its own divergent list every turn | **passed — under `mirrorTodos: "plan"` the executed list diverges from the plan on 0 of 8 turns and the sidebar settles on 1 persistent checklist; the `"off"` control diverges on 8 of 8 and renders 2. Both arms re-run and deep-equal their first pass** |
-| Type contract | `npm run type:check` | A TypeScript consumer can compile against the **packed tarball** under both NodeNext and Bundler resolution, including the `./tui` subpath | **passed** (`opencode-goal-pro-max-complete-plugin-1.0.0.tgz`) |
+| Type contract | `npm run type:check` | A TypeScript consumer can compile against the **packed tarball** under both NodeNext and Bundler resolution, including the `./tui` subpath | **passed** (`opencode-goal-pro-max-complete-plugin-1.0.1.tgz`) |
 | Command-hook smoke | `npm run smoke` | The package export path and the `/goal` command hook work with no model call | **passed** |
 | Installed-host contract | `npm run smoke:packed-host` | The published artifact, installed into a scratch project, satisfies the OpenCode host contract — hooks, exports, consumer resolution | **passed**, on the same tarball the pack-check row below measures |
 | Installed-tool contract | `npm run smoke:packed-tools` | A clean tarball install exposes the whole agent-tool surface with no separate OpenCode helper package | **passed, 14 tools** |
@@ -21,7 +21,7 @@ Every row was run against this tree on 2026-09-08 (Node v24.15.0, npm 11.12.1, b
 | Git-install contract | `npm run smoke:git-install` | None of the six manifest script names that make pacote's `GitFetcher` spawn a missing `npmBin` has reappeared, and the committed `dist/` byte-matches a fresh bundle | **passed**; `dist/goal-plugin.js` and `dist/goal-tui.js` match a fresh bun 1.3.14 bundle |
 | Hook-surface verify | `npm run verify` | The installed plugin loads, registers all 11 hooks, answers `/goal status` and `/goal set`, and makes zero model calls | **all 7 checks passed** |
 | Dependency audit | `npm audit --omit=dev --audit-level=high` | No known high-severity vulnerability in the runtime dependency (`zod` only) | **0 vulnerabilities** |
-| Pack check | `npm run pack:check` | The tarball contains what it should and nothing else | **39 files, ≈401 kB packed, 1.6 MB unpacked** — this file and `README.md` both ship inside the tarball, so the exact packed byte count moves whenever either of them does; only the rounded figure is quotable |
+| Pack check | `npm run pack:check` | The tarball contains what it should and nothing else | **39 files, ≈406 kB packed, 1.7 MB unpacked** — this file and `README.md` both ship inside the tarball, so the exact packed byte count moves whenever either of them does; only the rounded figure is quotable |
 
 ## The process behind 0.11.0
 
