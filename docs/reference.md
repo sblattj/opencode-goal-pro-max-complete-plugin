@@ -429,7 +429,9 @@ checklist every client renders is the plan.
 - **Rows of the model's own are kept, below the plan rows**: at most **10**, each bounded to 120
   characters, and they survive every later refresh. The tool result says what happened —
   `Mirrored from the goal plan (3/7 verified). 2 items of your own kept.` — with
-  `(N dropped, cap 10)` inside that second sentence when the cap trimmed something.
+  `(N dropped, cap 10)` inside that second sentence when the cap trimmed something. A kept row's
+  `status` and `priority` are passed through as written and coerced to strings, so a row the host
+  would have rejected for a non-string field is accepted instead.
 - **An existing native list is described, never adopted.** When `/goal set` runs in a session that
   already has todo rows, the goal's first auto-continue carries an `<existing_todos>` block listing
   them as `- <content> (<status>)` and telling the model to either record them as the plan with
@@ -548,6 +550,8 @@ npm run check                # syntax check + tests
 npm run pack:check           # package contents
 npm run release:check        # the complete gate, in order (~3 min)
 ```
+
+Most of the commands above need a file this package's published tarball does not ship — a script under `scripts/` (only `cli.mjs`, `install.mjs`, and `verify.mjs` are published) or the `test/` directory (not published at all) — so, aside from `npm run verify` described above, this whole section is meant to run from a clone of the repository, never from an installed package.
 
 The two `smoke:todo-*` rungs are the only ones that need the `opencode` binary on `PATH` and a freshly bundled `dist/` (`npm run bundle`) — the installer copies `dist/`, so a stale bundle smokes the old code. Both are deliberately **not** in `release:check`, because the binary is not a dev dependency; their scratch roots are overridable with `SMOKE_TODO_MIRROR_DIR` and `SMOKE_TODO_SAFETY_DIR`.
 
