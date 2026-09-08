@@ -921,6 +921,67 @@ test("GoalPanel tolerates a host without a todo state reader", async () => {
 
 // >>> v101:T27 tests - a v2 payload still renders as today
 // T27 units: 36.
+test("a v2 payload with no mirror key renders the actions", () => {
+  // A payload shaped exactly like v1.0.0's `buildSidebarMetadata` output: `v:
+  // GOAL_PANEL_PAYLOAD_VERSION` (2), a `plan` object that carries no `mirror`
+  // key at all. Waves 4+ add mirror-aware exception-list filtering (T24) and
+  // a progress-line suffix (T25/T26) to `goalPanelModel`, both gated on
+  // `plan.mirror` existing and not being `"off"` — this unit is the
+  // regression this back-compat guarantee exists to catch if either lands
+  // ungated and starts firing on a plan that never had a mirror.
+  const v2Payload = payload({
+    goalId: "goal_v2back",
+    objective: "ship the v2 back-compat check",
+    turns: { used: 4, max: 12 },
+    minutes: { used: 6, max: 60 },
+    tokens: { used: 12_000, max: 50_000 },
+    plan: {
+      total: 5,
+      verified: 1,
+      blocked: 1,
+      actions: [
+        { id: "a1", title: "first, pending", status: "pending", verdict: null },
+        { id: "a2", title: "second, in progress", status: "in_progress", verdict: null },
+        { id: "a3", title: "third, done and verified", status: "done", verdict: "pass" },
+        { id: "a4", title: "fourth, done unverified", status: "done", verdict: null },
+        { id: "a5", title: "fifth, blocked", status: "blocked", verdict: "fail" },
+      ],
+    },
+  })
+  assert.equal("mirror" in v2Payload.plan, false, "fixture must not carry a mirror key")
+
+  // Captured by actually running `goalPanelModel(v2Payload)` at base SHA
+  // 8954b6f (v1.0.1 integrate wave 3), before T24/T25/T26/T39 fill their
+  // reserved regions in src/goal-sidebar-view.js — so this literal is
+  // byte-identical to what the code produced before any mirror-aware panel
+  // logic existed, rather than a hand-typed guess at what it should produce.
+  const expected = {
+    state: "active",
+    icon: "▶",
+    objective: "ship the v2 back-compat check",
+    stats: ["4/12 turns", "6m/1h", "12k/50k tokens"],
+    sequence: "",
+    progress: "1/5 actions verified, 1 blocked",
+    actions: [
+      { id: "a1", title: "first, pending", status: "pending", verdict: null, mark: "○", verified: false },
+      { id: "a2", title: "second, in progress", status: "in_progress", verdict: null, mark: "◐", verified: false },
+      { id: "a3", title: "third, done and verified", status: "done", verdict: "pass", mark: "●", verified: true },
+      { id: "a4", title: "fourth, done unverified", status: "done", verdict: null, mark: "●", verified: false },
+      { id: "a5", title: "fifth, blocked", status: "blocked", verdict: "fail", mark: "⛔", verified: false },
+    ],
+    hiddenActions: 0,
+    notes: [],
+  }
+
+  const model = goalPanelModel(v2Payload)
+  assert.deepEqual(model, expected)
+
+  // The unit's own claim, named explicitly rather than left implicit in the
+  // snapshot: every action rendered, in plan order, ...
+  assert.deepEqual(model.actions.map((action) => action.id), ["a1", "a2", "a3", "a4", "a5"])
+  // ...and no mirror suffix anywhere on the progress line.
+  assert.equal(/todo mirror|todo list stale|mirror drift/.test(model.progress), false)
+})
 // <<< v101:T27
 
 
