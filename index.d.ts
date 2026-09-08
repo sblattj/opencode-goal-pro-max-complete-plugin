@@ -651,8 +651,25 @@ export interface GoalPluginHooks {
    * {@link GoalPluginOptions.registerCommand} is `false`.
    */
   "command.execute.before"?: (input: unknown, output: unknown) => Promise<void>
-  /** Blocks tool execution while an already-handled control-command result is being reported. */
+  /**
+   * Blocks tool execution while an already-handled control-command result is
+   * being reported, and rewrites a `todowrite` call's rows from the goal plan
+   * while the Todo mirror is on. Returns without touching the arguments when
+   * {@link GoalPluginOptions.mirrorTodos} is `"off"`.
+   */
   "tool.execute.before": (input: unknown, output: unknown) => Promise<void>
+  /**
+   * Stamps the mirror fresh once a `todowrite` has actually landed, and appends
+   * the mirror note to the tool result. Returns immediately when
+   * {@link GoalPluginOptions.mirrorTodos} is `"off"`.
+   */
+  "tool.execute.after": (input: unknown, output: unknown) => Promise<void>
+  /**
+   * Appends the goal-plugin paragraph to the host `todowrite` tool's own
+   * description. Static text, never gated on goal state; returns immediately
+   * when {@link GoalPluginOptions.mirrorTodos} is `"off"`.
+   */
+  "tool.definition": (input: unknown, output: unknown) => Promise<void>
   event: (input: unknown) => Promise<void>
   "experimental.chat.system.transform": (input: unknown, output: unknown) => Promise<void>
   "experimental.compaction.autocontinue": (input: unknown, output: unknown) => Promise<void>
