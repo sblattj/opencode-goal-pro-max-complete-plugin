@@ -17,7 +17,7 @@ var __export = (target, all) => {
 import { createHash, randomUUID as randomUUID2 } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
 import {
-  promises as fs2,
+  promises as fs3,
   closeSync,
   constants as fsConstants2,
   fchmodSync,
@@ -28,8 +28,8 @@ import {
   rmSync,
   writeSync
 } from "node:fs";
-import { homedir } from "node:os";
-import { dirname as dirname2, isAbsolute, join as join2, relative, resolve as resolvePath, sep } from "node:path";
+import { homedir as homedir2 } from "node:os";
+import { dirname as dirname2, isAbsolute, join as join3, relative, resolve as resolvePath, sep } from "node:path";
 
 // node_modules/zod/v4/classic/external.js
 var exports_external = {};
@@ -15101,14 +15101,506 @@ var persistenceLeaseInternals = Object.freeze({
   validStoredHostname
 });
 
+// src/v2-adapter.js
+import { promises as fs2 } from "node:fs";
+import { homedir } from "node:os";
+import { join as join2 } from "node:path";
+var SERVICE_FILE_RETRY_DELAYS_MS = [250, 500, 1000, 2000];
+var PLUGIN_METADATA_KEY = "opencode-goal-plugin";
+function isV2SetupContext(value) {
+  return Boolean(value && typeof value === "object" && !value.client && (typeof value.tool?.transform === "function" || typeof value.session?.hook === "function"));
+}
+function isV1PluginInput(value) {
+  return Boolean(value && typeof value === "object" && value.client && !value.tool);
+}
+function serviceFilePaths() {
+  const paths = [];
+  if (process.env.XDG_STATE_HOME) {
+    paths.push(join2(process.env.XDG_STATE_HOME, "opencode", "service.json"));
+  }
+  paths.push(join2(homedir(), ".local", "state", "opencode", "service.json"));
+  return [...new Set(paths)];
+}
+async function readServiceEndpointOnce() {
+  for (const filePath of serviceFilePaths()) {
+    try {
+      const parsed = JSON.parse(await fs2.readFile(filePath, "utf8"));
+      if (typeof parsed?.url === "string" && parsed.url)
+        return parsed;
+    } catch {}
+  }
+  return;
+}
+async function readServiceEndpoint() {
+  for (let attempt = 0;; attempt++) {
+    const service = await readServiceEndpointOnce();
+    if (service)
+      return service;
+    if (attempt >= SERVICE_FILE_RETRY_DELAYS_MS.length)
+      return;
+    await new Promise((resolve) => {
+      const timer = setTimeout(resolve, SERVICE_FILE_RETRY_DELAYS_MS[attempt]);
+      timer.unref?.();
+    });
+  }
+}
+function baseUrlFrom(service) {
+  return `${service.url.replace(/\/+$/, "")}/api`;
+}
+function serviceHeaders(service) {
+  const headers = { "content-type": "application/json" };
+  if (typeof service.password === "string" && service.password) {
+    headers.authorization = `Basic ${Buffer.from(`opencode:${service.password}`).toString("base64")}`;
+  }
+  return headers;
+}
+function sessionIDFrom(input) {
+  const id = input?.sessionID ?? input?.path?.id ?? input?.path?.sessionID;
+  return typeof id === "string" && id ? id : undefined;
+}
+function bodyFrom(input) {
+  if (!input || typeof input !== "object")
+    return {};
+  if (input.body !== undefined) {
+    return input.body && typeof input.body === "object" ? input.body : {};
+  }
+  const body = {};
+  for (const [key, value] of Object.entries(input)) {
+    if (key === "sessionID" || key === "path" || key === "query")
+      continue;
+    body[key] = value;
+  }
+  return body;
+}
+function queryFrom(input) {
+  return input && typeof input === "object" && input.query && typeof input.query === "object" ? input.query : undefined;
+}
+function messageQueryString(query) {
+  if (!query)
+    return "";
+  const params = new URLSearchParams;
+  for (const [key, value] of Object.entries(query)) {
+    if (typeof value === "string" && value)
+      params.set(key, value);
+    else if (typeof value === "number" && Number.isFinite(value))
+      params.set(key, String(value));
+  }
+  const qs = params.toString();
+  return qs ? `?${qs}` : "";
+}
+function translatePromptBody(body) {
+  const source = body && typeof body === "object" ? body : {};
+  const translated = {};
+  for (const [key, value] of Object.entries(source)) {
+    if (key === "parts" || key === "agent" || key === "messageID")
+      continue;
+    translated[key] = value;
+  }
+  const parts = Array.isArray(source.parts) ? source.parts : [];
+  const texts = [];
+  const metadata = {};
+  for (const part of parts) {
+    if (part && typeof part === "object" && part.type === "text" && typeof part.text === "string") {
+      texts.push(part.text);
+    }
+    const nonce = part?.metadata?.[PLUGIN_METADATA_KEY];
+    if (nonce !== undefined)
+      metadata[PLUGIN_METADATA_KEY] = nonce;
+  }
+  if (texts.length > 0)
+    translated.text = texts.join(`
+`);
+  if (typeof source.messageID === "string" && source.messageID)
+    translated.id = source.messageID;
+  if (Object.keys(metadata).length > 0) {
+    translated.metadata = {
+      ...source.metadata && typeof source.metadata === "object" ? source.metadata : {},
+      ...metadata
+    };
+  }
+  return {
+    body: translated,
+    agent: typeof source.agent === "string" && source.agent ? source.agent : undefined
+  };
+}
+function createV2ServiceClient(ctx = {}, options = {}) {
+  const state = {
+    service: options.service ?? null,
+    baseUrl: options.service ? baseUrlFrom(options.service) : ""
+  };
+  const ensureService = async () => {
+    if (state.service)
+      return state.service;
+    const service = await readServiceEndpoint();
+    if (!service)
+      return null;
+    state.service = service;
+    state.baseUrl = baseUrlFrom(service);
+    return service;
+  };
+  const send = async (operation, method, path, body) => {
+    if (!await ensureService()) {
+      throw new Error(`OpenCode v2 service endpoint unavailable (session.${operation})`);
+    }
+    const attempt = () => {
+      const service = state.service;
+      return globalThis.fetch(`${state.baseUrl}${path}`, {
+        method,
+        headers: serviceHeaders(service),
+        body: body === undefined ? undefined : JSON.stringify(body)
+      });
+    };
+    let response;
+    try {
+      response = await attempt();
+    } catch (error51) {
+      throw new Error(`OpenCode v2 service request failed (session.${operation}): ${String(error51?.message || error51)}`);
+    }
+    if (response.status === 401) {
+      try {
+        const rotated = await readServiceEndpointOnce();
+        if (rotated && rotated.password !== state.service.password) {
+          state.service = rotated;
+          state.baseUrl = baseUrlFrom(rotated);
+          response = await attempt();
+        }
+      } catch {}
+    }
+    if (!response.ok) {
+      throw new Error(`OpenCode v2 service request failed (session.${operation}): HTTP ${response.status}`);
+    }
+    const text = await response.text().catch(() => "");
+    if (!text)
+      return { data: undefined };
+    try {
+      return JSON.parse(text);
+    } catch {
+      return { data: text };
+    }
+  };
+  const requireSessionID = (operation, input) => {
+    const sessionID = sessionIDFrom(input);
+    if (!sessionID) {
+      throw new Error(`OpenCode v2 service call requires a sessionID (session.${operation})`);
+    }
+    return sessionID;
+  };
+  const prompt = async (operation, input) => {
+    const sessionID = requireSessionID(operation, input);
+    const translated = translatePromptBody(bodyFrom(input));
+    if (translated.agent && typeof ctx?.session?.switchAgent === "function") {
+      try {
+        await ctx.session.switchAgent({ sessionID, agent: translated.agent });
+      } catch {}
+    }
+    return send(operation, "POST", `/session/${encodeURIComponent(sessionID)}/prompt`, translated.body);
+  };
+  return {
+    session: {
+      get: (input) => send("get", "GET", `/session/${encodeURIComponent(requireSessionID("get", input))}`),
+      messages: (input) => {
+        const sessionID = requireSessionID("messages", input);
+        const query = queryFrom(input) ?? bodyFrom(input);
+        const qs = messageQueryString(query);
+        return send("messages", "GET", `/session/${encodeURIComponent(sessionID)}/message${qs}`);
+      },
+      prompt: (input) => prompt("prompt", input),
+      promptAsync: (input) => prompt("promptAsync", input),
+      create: (input) => send("create", "POST", "/session", bodyFrom(input)),
+      update: (input) => send("update", "PATCH", `/session/${encodeURIComponent(requireSessionID("update", input))}`, bodyFrom(input)),
+      delete: (input) => send("delete", "DELETE", `/session/${encodeURIComponent(requireSessionID("delete", input))}`),
+      abort: (input) => send("abort", "POST", `/session/${encodeURIComponent(requireSessionID("abort", input))}/interrupt`)
+    }
+  };
+}
+function toolInputSchema(args) {
+  try {
+    if (args && typeof args === "object" && typeof exports_external.object === "function" && typeof exports_external.toJSONSchema === "function") {
+      return exports_external.toJSONSchema(exports_external.object(args), { target: "draft-2020-12" });
+    }
+  } catch {}
+  return { type: "object" };
+}
+function toolResultToV2(result) {
+  if (typeof result === "string")
+    return { content: result };
+  const title = typeof result?.title === "string" ? result.title : "";
+  const output = result?.output;
+  const outputText = typeof output === "string" ? output : output === undefined || output === null ? "" : JSON.stringify(output, null, 2) ?? String(output);
+  const adapted = { content: [title, outputText].filter(Boolean).join(`
+`) || "{}" };
+  if (result?.metadata && typeof result.metadata === "object")
+    adapted.metadata = result.metadata;
+  return adapted;
+}
+function registerQuietly(register) {
+  try {
+    const pending = register();
+    return pending && typeof pending.catch === "function" ? pending.catch(() => {}) : Promise.resolve();
+  } catch {
+    return Promise.resolve();
+  }
+}
+function v1EventPayload(directory, event) {
+  if (!event || typeof event.type !== "string")
+    return;
+  const properties = {};
+  for (const [key, value] of Object.entries(event)) {
+    if (key === "type")
+      continue;
+    properties[key] = value;
+  }
+  if (event.type === "message.updated" && properties.info && typeof properties.info === "object") {
+    if (typeof properties.messageID !== "string" && typeof properties.info.id === "string") {
+      properties.messageID = properties.info.id;
+    }
+    if (typeof properties.sessionID !== "string" && typeof properties.info.sessionID === "string") {
+      properties.sessionID = properties.info.sessionID;
+    }
+  }
+  return { directory, event: { type: event.type, properties } };
+}
+function promptHookText(input) {
+  const prompt = input?.prompt;
+  if (prompt && typeof prompt === "object" && typeof prompt.text === "string")
+    return prompt.text;
+  const parts = Array.isArray(prompt?.parts) ? prompt.parts : [];
+  const texts = [];
+  for (const part of parts) {
+    if (part && typeof part === "object" && typeof part.text === "string")
+      texts.push(part.text);
+  }
+  return texts.length > 0 ? texts.join(`
+`) : undefined;
+}
+function registerAgentDefinition(draft, name, definition) {
+  const def = definition && typeof definition === "object" ? definition : {};
+  try {
+    if (typeof draft?.add === "function") {
+      draft.add({ ...def, name });
+      return;
+    }
+  } catch {}
+  try {
+    const existing = typeof draft?.get === "function" ? draft.get(name) : undefined;
+    if (existing && typeof draft?.update === "function") {
+      draft.update(name, (agent) => {
+        if (agent && typeof agent === "object")
+          Object.assign(agent, def);
+      });
+      return;
+    }
+  } catch {}
+  try {
+    if (typeof draft?.update === "function") {
+      draft.update(name, (agent) => {
+        if (agent && typeof agent === "object")
+          Object.assign(agent, def);
+      });
+    }
+  } catch {}
+}
+function createV2Setup({ GoalPlugin, commandName = "goal", commandTextBridge = true } = {}) {
+  if (typeof GoalPlugin !== "function") {
+    throw new TypeError("createV2Setup requires the GoalPlugin factory");
+  }
+  return async function goalPluginV2Setup(context, legacyOptions) {
+    if (isV1PluginInput(context))
+      return GoalPlugin(context, legacyOptions);
+    const ctx = context;
+    const directory = typeof ctx?.location?.directory === "string" && ctx.location.directory ? ctx.location.directory : process.cwd();
+    const pluginOptions = ctx?.options ?? {};
+    const bridgeEnabled = commandTextBridge && pluginOptions.v2CommandTextBridge !== false;
+    const effectiveCommandName = typeof pluginOptions.commandName === "string" && pluginOptions.commandName.trim() ? pluginOptions.commandName.trim() : commandName;
+    const client = createV2ServiceClient(ctx);
+    const hooks = await GoalPlugin({ client, directory }, pluginOptions);
+    const pending = [];
+    if (hooks?.tool && typeof ctx?.tool?.transform === "function") {
+      const definitions = hooks.tool;
+      const toolDefinitionHook = typeof hooks["tool.definition"] === "function" ? hooks["tool.definition"] : null;
+      pending.push(registerQuietly(() => ctx.tool.transform((registry2) => {
+        for (const [name, definition] of Object.entries(definitions)) {
+          if (!definition || typeof definition.execute !== "function")
+            continue;
+          try {
+            registry2.add({
+              name,
+              description: typeof definition.description === "string" ? definition.description : "",
+              input: toolInputSchema(definition.args),
+              execute: async (args, toolCtx) => toolResultToV2(await definition.execute(args, {
+                ...toolCtx,
+                directory,
+                abort: toolCtx?.signal,
+                callID: toolCtx?.id
+              }))
+            });
+          } catch {}
+        }
+        if (toolDefinitionHook && registry2 && typeof registry2.get === "function") {
+          try {
+            const existing = registry2.get("todowrite");
+            if (existing && typeof existing.description === "string") {
+              const output = { description: existing.description };
+              Promise.resolve(toolDefinitionHook({ toolID: "todowrite", tool: existing }, output)).then(() => {
+                if (typeof output.description === "string" && output.description !== existing.description && typeof registry2.update === "function") {
+                  registry2.update("todowrite", (def) => {
+                    if (def && typeof def === "object")
+                      def.description = output.description;
+                  });
+                }
+              }).catch(() => {});
+            }
+          } catch {}
+        }
+      })));
+    }
+    if (typeof hooks?.["tool.execute.before"] === "function" && typeof ctx?.tool?.hook === "function") {
+      const handler = hooks["tool.execute.before"];
+      pending.push(registerQuietly(() => ctx.tool.hook("execute.before", (input) => handler({
+        tool: input?.tool,
+        sessionID: input?.sessionID,
+        messageID: input?.messageID,
+        callID: input?.id
+      }, { args: input?.input }))));
+    }
+    if (typeof hooks?.["tool.execute.after"] === "function" && typeof ctx?.tool?.hook === "function") {
+      const handler = hooks["tool.execute.after"];
+      pending.push(registerQuietly(() => ctx.tool.hook("execute.after", (input) => {
+        const result = input?.status === "error" ? undefined : input?.result;
+        return handler({
+          tool: input?.tool,
+          sessionID: input?.sessionID,
+          messageID: input?.messageID,
+          callID: input?.id,
+          args: input?.input
+        }, {
+          title: "",
+          output: typeof result?.content === "string" ? result.content : "",
+          metadata: result?.metadata && typeof result.metadata === "object" ? result.metadata : undefined
+        });
+      })));
+    }
+    const chatMessageHook = typeof hooks?.["chat.message"] === "function" ? hooks["chat.message"] : null;
+    const commandHook = typeof hooks?.["command.execute.before"] === "function" ? hooks["command.execute.before"] : null;
+    if ((chatMessageHook || bridgeEnabled && commandHook) && typeof ctx?.session?.hook === "function") {
+      pending.push(registerQuietly(() => ctx.session.hook("prompt", async (input) => {
+        const sessionID = input?.sessionID;
+        if (!sessionID)
+          return;
+        const messageID = input?.messageID;
+        const parts = Array.isArray(input?.prompt?.parts) ? input.prompt.parts : [];
+        const prefix = `/${effectiveCommandName}`;
+        if (bridgeEnabled && commandHook && chatMessageHook) {
+          const text = promptHookText(input);
+          if (typeof text === "string" && (text === prefix || text.startsWith(`${prefix} `))) {
+            const commandOutput = { parts: [] };
+            try {
+              await commandHook({ command: effectiveCommandName, sessionID, arguments: text.slice(prefix.length).trim() }, commandOutput);
+            } catch {}
+            await chatMessageHook({ sessionID, messageID }, { message: { id: messageID, role: "user", sessionID }, parts: commandOutput.parts });
+            return;
+          }
+        }
+        if (chatMessageHook) {
+          await chatMessageHook({ sessionID, messageID }, { message: { id: messageID, role: "user", sessionID }, parts });
+        }
+      })));
+    }
+    if (typeof hooks?.["experimental.session.compacting"] === "function" && typeof ctx?.session?.hook === "function") {
+      const handler = hooks["experimental.session.compacting"];
+      pending.push(registerQuietly(() => ctx.session.hook("compaction", (input) => handler({ sessionID: input?.sessionID ?? input?.session?.id }, { context: [] }))));
+    }
+    if (typeof hooks?.["experimental.chat.system.transform"] === "function" && typeof ctx?.session?.hook === "function") {
+      const handler = hooks["experimental.chat.system.transform"];
+      pending.push(registerQuietly(() => ctx.session.hook("context", async (input) => {
+        const system = Array.isArray(input?.system) ? input.system : null;
+        if (!system)
+          return;
+        const before = [...system];
+        const output = { system: before };
+        try {
+          await handler({ sessionID: input?.sessionID, agent: input?.agent, model: input?.model }, output);
+        } catch {
+          return;
+        }
+        const after = Array.isArray(output.system) ? output.system : before;
+        const unchanged = after.length === before.length && after.every((block, index) => block === before[index]);
+        if (unchanged)
+          return;
+        system.splice(0, system.length, ...after);
+      })));
+    }
+    if (typeof hooks?.config === "function" && typeof ctx?.agent?.transform === "function") {
+      const configHook = hooks.config;
+      const syntheticConfig = { agent: {} };
+      try {
+        await configHook(syntheticConfig);
+      } catch {}
+      const agentDefs = syntheticConfig.agent;
+      if (agentDefs && typeof agentDefs === "object" && Object.keys(agentDefs).length > 0) {
+        pending.push(registerQuietly(() => ctx.agent.transform((draft) => {
+          for (const [name, definition] of Object.entries(agentDefs)) {
+            registerAgentDefinition(draft, name, definition);
+          }
+        })));
+      }
+    }
+    let eventsAbort;
+    if (typeof hooks?.event === "function" && typeof ctx?.event?.subscribe === "function") {
+      eventsAbort = new AbortController;
+      const dispatch = hooks.event;
+      const signal = eventsAbort.signal;
+      (async () => {
+        try {
+          for await (const event of ctx.event.subscribe({ signal })) {
+            const payload = v1EventPayload(directory, event);
+            if (!payload)
+              continue;
+            try {
+              await dispatch(payload);
+            } catch {}
+          }
+        } catch {}
+      })();
+    }
+    await Promise.all(pending);
+    let disposed = false;
+    return async () => {
+      if (disposed)
+        return;
+      disposed = true;
+      try {
+        eventsAbort?.abort();
+      } catch {}
+      try {
+        await hooks?.dispose?.();
+      } catch {}
+    };
+  };
+}
+var v2AdapterInternals = Object.freeze({
+  isV2SetupContext,
+  isV1PluginInput,
+  readServiceEndpointOnce,
+  serviceFilePaths,
+  sessionIDFrom,
+  bodyFrom,
+  translatePromptBody,
+  toolInputSchema,
+  toolResultToV2,
+  v1EventPayload,
+  promptHookText,
+  registerAgentDefinition
+});
+
 // src/goal-plugin.js
 var STATE_FILE_VERSION = 1;
-var PROJECT_LOCAL_STATE_SUBPATH = join2(".opencode", "goals", "state.json");
+var PROJECT_LOCAL_STATE_SUBPATH = join3(".opencode", "goals", "state.json");
 function homeBase(env = process.env) {
-  return typeof env?.HOME === "string" && env.HOME.trim() ? env.HOME.trim() : homedir();
+  return typeof env?.HOME === "string" && env.HOME.trim() ? env.HOME.trim() : homedir2();
 }
 function legacyHomeStateFilePath(env = process.env) {
-  return join2(homeBase(env), ".opencode-goal-plugin", "state.json");
+  return join3(homeBase(env), ".opencode-goal-plugin", "state.json");
 }
 var MAX_HISTORY_ENTRIES = 20;
 var MAX_STALLED_COMPACTIONS = 2;
@@ -15773,7 +16265,7 @@ async function readLedgerEntries(ledgerFilePath, { maxBytes = DEFAULT_LEDGER_MAX
   for (const path of paths) {
     let raw;
     try {
-      const handle = await fs2.open(path, "r");
+      const handle = await fs3.open(path, "r");
       try {
         const { size } = await handle.stat();
         const length = Math.min(size, maxBytes);
@@ -16325,16 +16817,16 @@ function sessionKey(sessionID) {
   return createHash("sha256").update(sessionID).digest("hex");
 }
 function sessionPathsFor(persistenceOptions, sessionID) {
-  const directory = join2(persistenceOptions.sessionDirectory, sessionKey(sessionID));
-  const stateFilePath = join2(directory, "state.json");
+  const directory = join3(persistenceOptions.sessionDirectory, sessionKey(sessionID));
+  const stateFilePath = join3(directory, "state.json");
   return {
     stateFilePath,
     ledgerFilePath: ledgerPathFor(stateFilePath)
   };
 }
 function xdgStateFilePath(env = process.env) {
-  const base = typeof env?.XDG_STATE_HOME === "string" && env.XDG_STATE_HOME.trim() ? env.XDG_STATE_HOME.trim() : join2(homeBase(env), ".local", "state");
-  return join2(base, "opencode-goal-plugin", "state.json");
+  const base = typeof env?.XDG_STATE_HOME === "string" && env.XDG_STATE_HOME.trim() ? env.XDG_STATE_HOME.trim() : join3(homeBase(env), ".local", "state");
+  return join3(base, "opencode-goal-plugin", "state.json");
 }
 function resolveStateFilePath({ stateFilePath, env = process.env, cwd } = {}) {
   const base = typeof cwd === "string" && cwd.trim() ? cwd : process.cwd();
@@ -16347,7 +16839,7 @@ function resolveStateFilePath({ stateFilePath, env = process.env, cwd } = {}) {
     const configured = envPath.trim();
     return isAbsolute(configured) ? configured : resolvePath(base, configured);
   }
-  return join2(base, PROJECT_LOCAL_STATE_SUBPATH);
+  return join3(base, PROJECT_LOCAL_STATE_SUBPATH);
 }
 function legacyStateFilePaths(env = process.env) {
   return [legacyHomeStateFilePath(env), xdgStateFilePath(env)];
@@ -16365,7 +16857,7 @@ function normalizePersistenceOptions(options = {}, { env = process.env, cwd } = 
     persistState,
     stateFilePath,
     sessionDirectory,
-    migrationMarkerPath: join2(sessionDirectory, ".migration-v1-complete"),
+    migrationMarkerPath: join3(sessionDirectory, ".migration-v1-complete"),
     fallbackPaths,
     ledgerFilePath,
     ledgerMaxBytes,
@@ -16385,9 +16877,9 @@ async function assertSafeProjectPersistencePath({ stateFilePath, projectRoot, en
   }
   let current = root;
   for (const segment of dirname2(rel).split(sep).filter(Boolean)) {
-    current = join2(current, segment);
+    current = join3(current, segment);
     try {
-      const info = await fs2.lstat(current);
+      const info = await fs3.lstat(current);
       if (info.isSymbolicLink()) {
         throw new Error(`refusing goal persistence through symlinked directory: ${current}`);
       }
@@ -16714,7 +17206,7 @@ async function reconcileLoadedStateWithLedger(persistenceOptions, client, onlySe
 }
 async function pathExists(path) {
   try {
-    await fs2.lstat(path);
+    await fs3.lstat(path);
     return true;
   } catch (error51) {
     if (error51?.code === "ENOENT")
@@ -16741,12 +17233,12 @@ async function acquireMigrationLease(stateFilePath, migrationMarkerPath) {
 async function readPersistedStateFile(path, client) {
   let raw;
   try {
-    const info = await fs2.lstat(path);
+    const info = await fs3.lstat(path);
     if (info.isSymbolicLink() || !info.isFile() || info.size > MAX_STATE_FILE_BYTES) {
       await logPluginError(client, `Skipped persisted goal state: file is not regular or exceeds ${MAX_STATE_FILE_BYTES} bytes.`);
       return { status: "invalid" };
     }
-    raw = await fs2.readFile(path, "utf8");
+    raw = await fs3.readFile(path, "utf8");
   } catch (error51) {
     if (error51?.code === "ENOENT")
       return { status: "missing" };
@@ -16824,13 +17316,13 @@ function sessionStatePayload(sessionID, parsedState, ledgerEntries = []) {
 async function writeStateSnapshot(stateFilePath, payload) {
   const tmpPath = `${stateFilePath}.${process.pid}.${randomUUID2()}.tmp`;
   try {
-    await fs2.mkdir(dirname2(stateFilePath), { recursive: true, mode: 448 });
-    await fs2.writeFile(tmpPath, JSON.stringify(payload, null, 2), { encoding: "utf8", mode: 384 });
-    await fs2.rename(tmpPath, stateFilePath);
-    await fs2.chmod(stateFilePath, 384);
+    await fs3.mkdir(dirname2(stateFilePath), { recursive: true, mode: 448 });
+    await fs3.writeFile(tmpPath, JSON.stringify(payload, null, 2), { encoding: "utf8", mode: 384 });
+    await fs3.rename(tmpPath, stateFilePath);
+    await fs3.chmod(stateFilePath, 384);
     return true;
   } catch (error51) {
-    await fs2.rm(tmpPath, { force: true }).catch(() => {});
+    await fs3.rm(tmpPath, { force: true }).catch(() => {});
     throw error51;
   }
 }
@@ -16900,7 +17392,7 @@ async function migrateLegacyState(persistenceOptions, client) {
           continue;
         const backupPath = `${sourcePath}.migrated.${Date.now()}.${randomUUID2()}`;
         try {
-          await fs2.rename(sourcePath, backupPath);
+          await fs3.rename(sourcePath, backupPath);
         } catch (error51) {
           await logPluginError(client, `Could not retire migrated goal persistence at ${sourcePath}.`, error51);
         }
@@ -16936,7 +17428,7 @@ async function loadPersistedSessionState(persistence, client, sessionID) {
   if (state.status === "invalid" && recovered === "reconstructed") {
     const quarantinePath = `${persistence.stateFilePath}.corrupt.${Date.now()}.${randomUUID2()}`;
     try {
-      await fs2.rename(persistence.stateFilePath, quarantinePath);
+      await fs3.rename(persistence.stateFilePath, quarantinePath);
       await logPluginError(client, `Preserved invalid persisted goal state at ${quarantinePath} before ledger recovery.`);
     } catch (error51) {
       await logPluginError(client, "Could not quarantine invalid persisted goal state", error51);
@@ -21275,9 +21767,15 @@ var GoalPlugin = async (context = {}, pluginOptions = {}) => {
     }
   });
 };
+var goalPluginV2Setup = createV2Setup({ GoalPlugin });
+var GoalPluginV2 = {
+  id: "opencode-goal-plugin",
+  setup: goalPluginV2Setup
+};
 var goal_plugin_default = {
   id: "opencode-goal-plugin",
-  server: GoalPlugin
+  server: GoalPlugin,
+  setup: goalPluginV2Setup
 };
 var testInternals = {
   commandTurnTtlMs: COMMAND_TURN_TTL_MS,
@@ -21421,5 +21919,6 @@ export {
   testInternals,
   goal_plugin_default as default,
   assertPlanLedgerIsolated,
+  GoalPluginV2,
   GoalPlugin
 };

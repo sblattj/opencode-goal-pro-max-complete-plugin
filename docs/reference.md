@@ -10,12 +10,12 @@ A full install is **two entries in two different files**. `opencode.json`'s `plu
 
 Always write the spec in the **named form** `<package>@<source>`. A bare `github:owner/repo` or a bare tarball URL is accepted by the config and then silently never loads: OpenCode looks the installed package up by the name `npm-package-arg` parses out of the spec, a bare git or tarball spec has none, and the host falls back to the whole spec string as a directory name and throws *after* the files are on disk, with nothing logged.
 
-> **`v1.0.1` is the git tag; nothing is on npm.** `v1.0.1` is the current release, and it is what the specs below and the files in [`examples/`](../examples/) pin; `v1.0.0` was the first release cut under the name `opencode-goal-pro-max-complete-plugin`. The npm name is a different question: it is **unclaimed, not reserved** — `npm view opencode-goal-pro-max-complete-plugin` answers `E404`, and npm has no reservation mechanism short of publishing, so anyone could take the name before this project does. Do not trust a `<pkg>@npm` spec for this package: install from the git tag, from the local `file://` form below, or with the [installer](install.md), which uses the local form.
+> **`v1.1.0` is the git tag; nothing is on npm.** `v1.1.0` is the current release, and it is what the specs below and the files in [`examples/`](../examples/) pin; `v1.0.0` was the first release cut under the name `opencode-goal-pro-max-complete-plugin`. The npm name is a different question: it is **unclaimed, not reserved** — `npm view opencode-goal-pro-max-complete-plugin` answers `E404`, and npm has no reservation mechanism short of publishing, so anyone could take the name before this project does. Do not trust a `<pkg>@npm` spec for this package: install from the git tag, from the local `file://` form below, or with the [installer](install.md), which uses the local form.
 
 ```jsonc
 // opencode.json — the server half: commands, tools, hooks, sidebar payload
 {
-  "plugin": ["opencode-goal-pro-max-complete-plugin@github:sblattj/opencode-goal-pro-max-complete-plugin#v1.0.1"],
+  "plugin": ["opencode-goal-pro-max-complete-plugin@github:sblattj/opencode-goal-pro-max-complete-plugin#v1.1.0"],
   "command": {
     "goal": {
       "description": "Set a session-scoped goal and auto-continue until complete.",
@@ -28,13 +28,13 @@ Always write the spec in the **named form** `<package>@<source>`. A bare `github
 
 ```jsonc
 // tui.json, beside it — the TUI half: the sidebar panel
-{ "plugin": ["opencode-goal-pro-max-complete-plugin@github:sblattj/opencode-goal-pro-max-complete-plugin#v1.0.1"] }
+{ "plugin": ["opencode-goal-pro-max-complete-plugin@github:sblattj/opencode-goal-pro-max-complete-plugin#v1.1.0"] }
 ```
 
 Or let OpenCode write both entries:
 
 ```sh
-opencode plugin 'opencode-goal-pro-max-complete-plugin@github:sblattj/opencode-goal-pro-max-complete-plugin#v1.0.1' --global
+opencode plugin 'opencode-goal-pro-max-complete-plugin@github:sblattj/opencode-goal-pro-max-complete-plugin#v1.1.0' --global
 ```
 
 ### Spec forms
@@ -42,15 +42,15 @@ opencode plugin 'opencode-goal-pro-max-complete-plugin@github:sblattj/opencode-g
 Both of these name the package before the source, and both work:
 
 ```
-opencode-goal-pro-max-complete-plugin@github:sblattj/opencode-goal-pro-max-complete-plugin#v1.0.1
-opencode-goal-pro-max-complete-plugin@https://github.com/sblattj/opencode-goal-pro-max-complete-plugin/archive/refs/tags/v1.0.1.tar.gz
+opencode-goal-pro-max-complete-plugin@github:sblattj/opencode-goal-pro-max-complete-plugin#v1.1.0
+opencode-goal-pro-max-complete-plugin@https://github.com/sblattj/opencode-goal-pro-max-complete-plugin/archive/refs/tags/v1.1.0.tar.gz
 ```
 
 These do **not** work and fail *silently*, for the reason above:
 
 ```
-github:sblattj/opencode-goal-pro-max-complete-plugin#v1.0.1
-https://github.com/sblattj/opencode-goal-pro-max-complete-plugin/archive/refs/tags/v1.0.1.tar.gz
+github:sblattj/opencode-goal-pro-max-complete-plugin#v1.1.0
+https://github.com/sblattj/opencode-goal-pro-max-complete-plugin/archive/refs/tags/v1.1.0.tar.gz
 ```
 
 Pin a tag rather than tracking a branch, so an install is reproducible.
@@ -496,17 +496,17 @@ Objective-bearing commands preserve file attachments. OpenCode may expand those 
 | Surface | Status |
 |---|---|
 | Node.js | `engines.node` is `>=18`; CI runs the full suite on Node 18, 20, 22, and 24 |
-| OpenCode | `engines.opencode` is `>=1.17.15 <2`. OpenCode 2 is unsupported and untested — see [`compatibility.md`](compatibility.md#opencode-2) |
+| OpenCode | `engines.opencode` is `>=1.17.15 <3`: both the 1.x and 2.x lines are supported as of v1.1.0, and the 2.x host carries documented caveats — see [`compatibility.md`](compatibility.md#opencode-2) |
 | Operating systems | Filesystem-sensitive lifecycle tests run on Linux, macOS, and Windows; the installed-package type, host, and tool contracts also run on Windows |
 | Package entrypoints | Installed-tarball contracts verify all three export paths (`.`, `./server`, `./tui`), the plugin-manifest targets OpenCode reads from `exports`, consumer TypeScript resolution, the enumerated hook surface, and all 14 tools |
 | Provider/backend quirks | Strict-template backends require the goal block to merge into the primary `system` message; covered by regression tests. See [`providers.md`](providers.md) |
 | Runtime dependencies | `zod` only, bundled into `dist/` |
 
-Live-host verification is recorded per release rather than claimed in general: **four** provider/model combinations on OpenCode 1.17.15 for the v0.6.6–v0.9.0 lifecycle matrix ([`providers.md`](providers.md)), one live OpenCode **1.18.25** TUI run for the plan-mode hold and the status indicator in 0.9.0, and OpenCode **1.18.29** for the sidebar, TUI-config and git-install findings in 0.10.0 and 0.10.1 — those last two runs are recorded in [`CHANGELOG.md`](../CHANGELOG.md), not in [`providers.md`](providers.md). `/goal status` and auto-continue are graded on **state correctness** — verified directly against persisted state and file effects — not on terminal rendering, because OpenCode custom commands are prompts, not plugin-rendered TUI responses: after `command.execute.before` runs, the host sends its retained command-parts array through a normal model turn. The plugin mutates that array in place so the model receives the deterministic plugin-generated result rather than the raw `/goal` argument, but the model still produces the visible response and may paraphrase it. The 1.17.15 matrix and its session evidence are in [`providers.md`](providers.md); the 1.18.x runs are in the changelog entries for the releases that made them.
+Live-host verification is recorded per release rather than claimed in general: **four** provider/model combinations on OpenCode 1.17.15 for the v0.6.6–v0.9.0 lifecycle matrix ([`providers.md`](providers.md)), one live OpenCode **1.18.25** TUI run for the plan-mode hold and the status indicator in 0.9.0, OpenCode **1.18.29** for the sidebar, TUI-config and git-install findings in 0.10.0 and 0.10.1, and OpenCode **2.0.14** for the v2 adapter in 1.1.0 — the 1.18.x runs are recorded in [`CHANGELOG.md`](../CHANGELOG.md), not in [`providers.md`](providers.md), and the 2.0.14 evidence is summarized in [`compatibility.md`](compatibility.md#opencode-2). `/goal status` and auto-continue are graded on **state correctness** — verified directly against persisted state and file effects — not on terminal rendering, because OpenCode custom commands are prompts, not plugin-rendered TUI responses: after `command.execute.before` runs, the host sends its retained command-parts array through a normal model turn. The plugin mutates that array in place so the model receives the deterministic plugin-generated result rather than the raw `/goal` argument, but the model still produces the visible response and may paraphrase it. The 1.17.15 matrix and its session evidence are in [`providers.md`](providers.md); the 1.18.x runs are in the changelog entries for the releases that made them.
 
 **Re-test against the exact OpenCode build and provider stack you plan to use for unattended work.** Nothing in this repository can do that for you.
 
-The full supported-surface policy, the host version bounds, the CI matrix, and the OpenCode 2 position are in [`compatibility.md`](compatibility.md).
+The full supported-surface policy, the host version bounds, the CI matrix, and the OpenCode 2 support status and its caveats are in [`compatibility.md`](compatibility.md).
 
 ## Identifier policy
 

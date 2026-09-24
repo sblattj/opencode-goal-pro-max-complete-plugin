@@ -125,6 +125,14 @@ const sameExport: typeof goalPlugin = serverPlugin
 void sameServer
 void sameExport
 
+// The default export must carry all three keys: id, the v1 server factory and
+// the OpenCode 2 setup entrypoint. This line only compiles when the declared
+// type still exposes a callable-or-optional setup beside server, so a
+// declaration that drops either key fails this contract rather than a host.
+const v2Setup: ((context: unknown) => Promise<() => Promise<void>>) | undefined =
+  goalPlugin.setup
+void v2Setup
+
 // The ./tui target is a separate plugin module: it carries tui() and, per
 // readV1Plugin, must NOT also carry server().
 const sidebarRuntime: GoalSidebarRuntime = {

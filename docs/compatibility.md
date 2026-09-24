@@ -15,8 +15,10 @@ The latest published release is the supported line. Public compatibility covers:
   single-writer protection retained per session and passive goal behavior for
   a same-session process that does not own the lease
 
-The package requires Node.js 18 or newer and OpenCode 1.17.15 through the latest
-compatible 1.x release. CI runs the complete unit suite on Node 18, 20, 22, and
+The package requires Node.js 18 or newer and OpenCode 1.17.15 or newer, covering
+both the 1.x line and the 2.x line (`engines.opencode` is `>=1.17.15 <3`; the
+OpenCode 2 caveats are documented in the section below). CI runs the complete
+unit suite on Node 18, 20, 22, and
 24. Installed-package contracts compile TypeScript consumers using both NodeNext
 and Bundler resolution and require a clean npm-tarball install to expose the
 default agent-tool surface without a separately installed OpenCode helper package.
@@ -56,11 +58,12 @@ weaker publication protocol.
 
 ## OpenCode host compatibility
 
-OpenCode's experimental hooks and SDK request shapes may change within the 1.x
-line. Automated tests cover both current flattened session inputs and the legacy
-generated-client shape, but a real-host smoke test remains required when hook or
-SDK behavior changes. The current manual provider matrix is maintained in
-[providers.md](providers.md).
+OpenCode's experimental hooks and SDK request shapes may change within any
+supported line: across 1.x patch and minor releases, and between the 1.x and
+2.x generations. Automated tests cover both current flattened session inputs and
+the legacy generated-client shape, but a real-host smoke test remains required
+when hook or SDK behavior changes. The current manual provider matrix is
+maintained in [providers.md](providers.md).
 
 OpenCode custom commands still become model turns. The plugin handles `/goal`
 arguments in `command.execute.before` and mutates the host-retained parts array
@@ -179,15 +182,72 @@ and neither is part of `release:check`, because that binary is not a dev depende
 
 ## OpenCode 2
 
-**Status: not supported, and not yet tested.**
+**Status: supported as of v1.1.0, with the documented caveats below.**
 
-The package declares `engines.opencode` as `>=1.17.15 <2`. There is no
+Both host generations load the same bundled module through the same package
+exports (`.` and `./server` — both hosts resolve `./server`). The default
+export carries two entrypoints beside the wire `id`: OpenCode 1.x calls
+`server(input, options)`, exactly as in every earlier release, and OpenCode
+2.x calls `setup(context)`, which rebuilds the same plugin — the goal tools,
+the event-driven continuation engine, persistence and leases, and the sidebar
+status — on the v2 host API and returns the dispose finalizer the v2 host
+awaits at shutdown. The hosts self-select by which method they call, so there
+is no separate v2 package, no separate v2 config format, and no change to an
+`opencode.json`/`tui.json` entry when a project moves between host
+generations.
+
+`engines.opencode` is `>=1.17.15 <3`. OpenCode 1.x enforces the field and
+refuses to load the plugin outside the range; OpenCode 2 ignores it (verified
+against 2.0.14), so the widened bound gates 1.x loads and documents the
+supported span rather than restricting 2.x. There is still no
 `peerDependencies` entry: the host supplies the plugin API, so a peer range
 would only add an install-time warning about something OpenCode already
-controls. That bound is deliberate: no claim in this repository is made without
-a verified run behind it, and the project has not yet exercised the plugin
-against an OpenCode 2 build. Treat OpenCode 2 as unverified rather than as
-known-broken.
+controls.
+
+### What OpenCode 2 does not provide (each gap fails soft)
+
+v2 has no equivalent for a handful of host surfaces the plugin uses. Every
+affected call site is individually guarded, so each gap degrades that one
+surface and nothing else — none of them fails the plugin or interrupts a
+running goal:
+
+1. **No `command.execute.before` equivalent — no pre-execution command
+   interception, and no noReply-style echo suppression.** A typed `/goal …`
+   message still reaches the plugin as prompt text: the v2 adapter re-runs the
+   v1 command handler inside the prompt hook for its STATE side effects —
+   set, pause, resume, stop, clear, plus the ledger and persistence writes —
+   and then correlates the turn as plugin-owned, so goal semantics survive.
+   What v2 cannot do is replace the turn's parts with the framed
+   plugin-generated reply, so the model sees the raw command text and the v1
+   suppression of the assistant echo does not exist; the deterministic,
+   model-independent reply a v1 `/goal status` produces has no v2 equivalent.
+   The `goal_*` agent tools remain the surface whose result reaches the model
+   verbatim, and every state change they cover — set, pause, resume, stop,
+   clear, status, history — has an exact tool equivalent that registers and
+   executes normally. The text bridge is on by default and can be disabled
+   with the v2-side `v2CommandTextBridge` plugin option.
+2. **No TUI toast or `app.log` routes.** v2 exposes neither
+   `client.tui.showToast` nor `client.app.log`, so the lifecycle and audit
+   advisories that route through them fail soft (the dispatch is advisory and
+   swallows the failure) and notices still reach the user through the session
+   title and tool results.
+3. **No `session.todo`, `session.children`, `session.status`, or
+   `config.providers` routes.** Each consumer is fail-soft by the plugin's own
+   design: the `<existing_todos>` offer is skipped,
+   `noContinueWhileChildrenActive` fails open (continuation proceeds when the
+   host cannot report children), and the auto-detected context-window ceiling
+   stays off unless `contextWindowTokens` is configured explicitly.
+
+Beyond these, the standing rule for any host applies: the experimental hooks
+(`experimental.chat.system.transform`, `experimental.session.compacting`,
+`experimental.compaction.autocontinue`) are best-effort registrations that a
+host may simply never call. The claim behind "supported" rests on verified
+runs against a real OpenCode 2 build, not a mock — the dual-entry shape and
+the v2 host API it registers through were probed live against OpenCode 2.0.14
+during the 1.1.0 cycle, and the runs are recorded in the
+[CHANGELOG](../CHANGELOG.md). **Re-test against the exact OpenCode build and
+provider stack you plan to use for unattended work.** Nothing in this
+repository can do that for you.
 
 ### What already exists in this direction
 
@@ -198,23 +258,6 @@ known-broken.
 - Only read-only operations are ever replayed against the alternate shape, so a
   shape probe can never duplicate a mutating call. This invariant is pinned by
   the mutation contract.
-
-### What a supported v2 claim would require
-
-Before the pin is widened, all of the following need to pass against a real
-OpenCode 2 build, not a mock:
-
-1. Plugin load and hook registration through the v2 plugin entrypoint.
-2. `command.execute.before`, `event`, `experimental.chat.system.transform`,
-   `experimental.session.compacting`, and `experimental.compaction.autocontinue`
-   firing with the shapes the plugin expects.
-3. The execution-context signals (`chat.message`, `chat.params`,
-   `session.updated`) still reporting the active agent, which the planning-only
-   restriction depends on.
-4. Session-API calls (`messages`, `promptAsync`, `create`, `get`, `update`,
-   `abort`) under whichever argument shape v2 ships.
-5. Goal-specific compaction context and recovery of running child sessions after
-   a plugin restart, which are the areas most likely to differ.
 
 ### Configuration
 

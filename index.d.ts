@@ -714,8 +714,10 @@ export const testInternals: Readonly<Record<string, unknown>>
 /**
  * Default export consumed by OpenCode's plugin loader. An install spec names the
  * PACKAGE (`opencode-goal-pro-max-complete-plugin@<source>` in `opencode.json`);
- * OpenCode resolves that package's entrypoint and calls `server` to obtain the
- * plugin's hooks. `id` below is the plugin's WIRE identifier and is deliberately
+ * OpenCode resolves that package's entrypoint and calls `server` (OpenCode 1.x)
+ * or `setup` (OpenCode 2.x) to obtain the plugin's behavior — the two hosts
+ * self-select by which method they call, and both ignore the other's key.
+ * `id` below is the plugin's WIRE identifier and is deliberately
  * held at the historical `"opencode-goal-plugin"` so a session, its persisted
  * state and its part metadata survive the package rename — see the "Identifier
  * policy" section of `docs/reference.md` and the "WIRE IDENTIFIER, NOT THE PACKAGE NAME"
@@ -724,6 +726,16 @@ export const testInternals: Readonly<Record<string, unknown>>
 declare const goalPlugin: {
   id: "opencode-goal-plugin"
   server: typeof GoalPlugin
+  /**
+   * The OpenCode 2 `setup` entrypoint, beside the v1 {@link GoalPlugin}
+   * `server` factory on the same default export. OpenCode 1.x never calls it;
+   * OpenCode 2.x calls `setup` once with the v2 plugin context and treats the
+   * returned function as the dispose finalizer. The v2 context shape is
+   * defined by OpenCode itself and kept loose (`unknown`), like the hook
+   * payloads above; v2 behavior caveats are documented in
+   * `docs/compatibility.md` ("OpenCode 2").
+   */
+  setup?: (context: unknown) => Promise<() => Promise<void>>
 }
 
 export default goalPlugin

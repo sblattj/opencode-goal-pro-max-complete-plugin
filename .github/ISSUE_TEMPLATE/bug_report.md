@@ -8,7 +8,7 @@ assignees: ""
 
 ## Environment
 
-- OpenCode version: <!-- e.g. 1.17.15 (run `opencode --version`) -->
+- OpenCode version: <!-- e.g. 1.18.29, or 2.0.14 (run `opencode --version`) -->
 - Provider / model: <!-- e.g. deepseek/deepseek-chat, opencode-go/qwen3.7-plus -->
 - opencode-goal-pro-max-complete-plugin version: <!-- e.g. 0.4.7, or "file:" local install -->
 - Node.js version: <!-- run `node --version` -->

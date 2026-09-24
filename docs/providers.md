@@ -28,7 +28,12 @@ provider credentials and no mocked plugin hooks on OpenCode 1.17.15 before the
 in-place command-parts change. They drove the plugin through `/goal status`,
 `/goal <condition> --max-turns N`, and inspected the persisted state file to
 confirm state mutations (limit parsing, turn/stop accounting, evidence-gated
-completion detection) independent of what was rendered in the terminal.
+completion detection) independent of what was rendered in the terminal. They
+are evidence records, not support claims, and are kept as written: OpenCode 2
+support was added in v1.1.0, and what a 2.x host does and does not provide is
+documented in [compatibility.md](compatibility.md#opencode-2). Rows added for a
+2.x host should name the OpenCode version they were measured on, exactly like
+the rows below.
 
 ## Tested models
 

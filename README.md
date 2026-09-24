@@ -14,7 +14,7 @@ npx -y github:sblattj/opencode-goal-pro-max-complete-plugin install
 
 No `npx`? `sh install.sh`, or `curl -fsSL https://raw.githubusercontent.com/sblattj/opencode-goal-pro-max-complete-plugin/main/install.sh | sh`; from a clone, `node scripts/cli.mjs install`. Manual two-file install, upgrade and uninstall: [docs/install.md](docs/install.md).
 
-Requires Node 18 or newer and OpenCode `>=1.17.15 <2` (`engines` in `package.json`). Re-running the installer is safe: `--dry-run` previews it, `uninstall` reverses it, `status` reports what is currently wired.
+Requires Node 18 or newer and OpenCode `>=1.17.15 <3` — both the 1.x and 2.x lines (`engines` in `package.json`; the documented OpenCode 2 caveats are in [docs/compatibility.md](docs/compatibility.md)). Re-running the installer is safe: `--dry-run` previews it, `uninstall` reverses it, `status` reports what is currently wired.
 
 ## Use
 
