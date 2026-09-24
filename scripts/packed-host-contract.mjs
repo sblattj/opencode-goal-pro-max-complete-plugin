@@ -94,6 +94,10 @@ try {
 
   assert.equal(installed.default.id, "opencode-goal-plugin")
   assert.equal(installed.default.server, installed.GoalPlugin)
+  // The same default export must carry the OpenCode 2 setup entrypoint beside
+  // the v1 server factory: a v1 host calls server and ignores setup, a v2 host
+  // calls setup(ctx) and ignores server.
+  assert.equal(typeof installed.default.setup, "function")
 
   const sessionID = "packed-host-contract"
   const commandMessageID = "command-packed-contract"

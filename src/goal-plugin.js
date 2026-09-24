@@ -9240,9 +9240,28 @@ export const GoalPlugin = async (context = {}, pluginOptions = {}) => {
   })
 }
 
+// Dual-host entry (opencode v1 + v2). v1 hosts call `server(input, options)`
+// and ignore extra keys; v2 hosts call `setup(ctx)` and ignore `server`. Both
+// generations resolve the same "./server" package export to this module and
+// self-select by which method they invoke, so one file serves both without
+// any config difference for users. Import declarations are hoisted, so this
+// stays anchored at the export it wires instead of the module header.
+import { createV2Setup } from "./v2-adapter.js"
+
+const goalPluginV2Setup = createV2Setup({ GoalPlugin })
+
+// The {id, setup} shape on its own, for tests and v2-only embedders.
+export const GoalPluginV2 = {
+  id: "opencode-goal-plugin",
+  setup: goalPluginV2Setup,
+}
+
 export default {
   id: "opencode-goal-plugin",
+  // `server` must remain the SAME reference as the named `GoalPlugin` export
+  // (scripts/packed-host-contract.mjs asserts identity).
   server: GoalPlugin,
+  setup: goalPluginV2Setup,
 }
 
 export const testInternals = {

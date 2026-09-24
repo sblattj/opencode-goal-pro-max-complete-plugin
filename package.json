@@ -1,6 +1,6 @@
 {
   "name": "opencode-goal-pro-max-complete-plugin",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "Durable, guarded goal workflows for OpenCode.",
   "type": "module",
   "main": "./dist/goal-plugin.js",
@@ -78,7 +78,7 @@
   "license": "MIT",
   "engines": {
     "node": ">=18",
-    "opencode": ">=1.17.15 <2"
+    "opencode": ">=1.17.15 <3"
   },
   "repository": {
     "type": "git",

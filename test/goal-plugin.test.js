@@ -414,9 +414,10 @@ async function createHooks(overrides = {}) {
   return { aborts, calls, hooks, logs }
 }
 
-test("exports v1 OpenCode plugin module shape", () => {
+test("exports dual v1+v2 OpenCode plugin module shape", () => {
   assert.equal(pluginModule.id, "opencode-goal-plugin")
   assert.equal(pluginModule.server, GoalPlugin)
+  assert.equal(typeof pluginModule.setup, "function")
 })
 
 test("completion markers must be final-line markers", () => {

@@ -18,7 +18,7 @@ status line and no panel. See [Install](../docs/reference.md#install) in the
 reference for why a spec must name the package **before** the source, and what
 happens silently when it does not.
 
-> **These files pin `v1.0.1`, the current release — and `tui.json`
+> **These files pin `v1.1.0`, the current release — and `tui.json`
 > still will not give you the panel.** The trap is the spec form: a `github:` spec
 > is cached in a directory whose name contains a `:`, which the TUI loader
 > cannot read — so the sidebar half will not appear even though the server half
