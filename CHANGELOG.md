@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.2.0 — 2026-10-03
 
 - **Changed: a human message no longer stops a running goal.** `noInterruptOnUserMessage` now defaults to **`true`**. When you type a message while a goal is running, the goal keeps going: OpenCode answers your message, and the next auto-continue picks up with it as the latest instruction. Before this change the goal paused with `stopReason: "user intervention"` and waited for `/goal resume`. `/goal pause` and `/goal stop` are now how you halt a goal. To get the old behavior back, set `noInterruptOnUserMessage: false`. An explicit `false` is the only value that turns pausing back on, so a non-boolean such as `"yes"` now also counts as `true`. The `index.d.ts` JSDoc, `docs/reference.md`, and the shipped skill describe the new default.
 
