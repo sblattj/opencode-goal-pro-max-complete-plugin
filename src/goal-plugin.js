@@ -160,7 +160,7 @@ const DEFAULT_OPTIONS = {
   noProgressTokenThreshold: 50,
   noProgressTurnsBeforePause: 2,
   noToolCallTurnsBeforePause: 10,
-  noInterruptOnUserMessage: false,
+  noInterruptOnUserMessage: true,
   noContinueWhileChildrenActive: false,
   budgetWrapupRatio: 0.8,
   warnTurnsRemaining: 3,
@@ -1764,7 +1764,7 @@ function normalizeOptions(options = {}) {
       Number.isSafeInteger(options.noToolCallTurnsBeforePause) && options.noToolCallTurnsBeforePause >= 0
         ? options.noToolCallTurnsBeforePause
         : DEFAULT_OPTIONS.noToolCallTurnsBeforePause,
-    noInterruptOnUserMessage: options.noInterruptOnUserMessage === true,
+    noInterruptOnUserMessage: options.noInterruptOnUserMessage !== false,
     noContinueWhileChildrenActive: options.noContinueWhileChildrenActive === true,
     budgetWrapupRatio:
       Number(options.budgetWrapupRatio) > 0 && Number(options.budgetWrapupRatio) < 1
