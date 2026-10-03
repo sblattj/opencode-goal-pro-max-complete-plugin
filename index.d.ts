@@ -372,11 +372,12 @@ export interface GoalPluginOptions {
   noToolCallTurnsBeforePause?: number
 
   /**
-   * When `true`, a new human message does not pause an active goal: the goal
-   * loop keeps running and the message steers the next continuation instead of
-   * stopping with `stopReason: "user intervention"`. Plugin-owned command and
+   * When `true` (the default), a new human message does not pause an active
+   * goal: the goal loop keeps running and the message steers the next
+   * continuation. Set `false` to pause the goal with
+   * `stopReason: "user intervention"` instead. Plugin-owned command and
    * continuation messages are never treated as interventions either way.
-   * @default false
+   * @default true
    */
   noInterruptOnUserMessage?: boolean
 

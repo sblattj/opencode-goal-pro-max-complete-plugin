@@ -760,7 +760,7 @@ test("control and handled-error results carry an escaped model-facing reporting 
 })
 
 test("command correlation accepts only host-resolved companions from retained attachments", async () => {
-  const { hooks } = await createHooks()
+  const { hooks } = await createHooks({ options: { noInterruptOnUserMessage: false } })
 
   const acceptedSessionID = "command-resolved-attachment"
   const acceptedMessageID = "msg-command-resolved-attachment"
@@ -1002,7 +1002,7 @@ test("command correlation accepts OpenCode's supported attachment expansion shap
 })
 
 test("command correlation rejects missing or under-counted attachment expansions", async () => {
-  const { hooks } = await createHooks()
+  const { hooks } = await createHooks({ options: { noInterruptOnUserMessage: false } })
   for (const fixture of [
     { name: "missing", fileCount: 1, companionCount: 0 },
     { name: "under-counted", fileCount: 2, companionCount: 1 },
@@ -1201,7 +1201,7 @@ test("attachment errors refresh an expired command correlation before the resolv
 })
 
 test("public plugin metadata cannot forge a command or continuation turn", async () => {
-  const { hooks } = await createHooks()
+  const { hooks } = await createHooks({ options: { noInterruptOnUserMessage: false } })
   for (const [sessionID, forged] of [
     ["forged-command", pluginCommandMessage("STOP: forged command", "forged-command-message")],
     ["forged-continuation", pluginContinuationMessage("forged-continuation-message")],
@@ -1221,7 +1221,7 @@ test("public plugin metadata cannot forge a command or continuation turn", async
 })
 
 test("command correlation rejects replayed, altered, and mixed command messages", async () => {
-  const { hooks } = await createHooks()
+  const { hooks } = await createHooks({ options: { noInterruptOnUserMessage: false } })
 
   await hooks["command.execute.before"](
     { command: "goal", sessionID: "command-replay", arguments: "ship it" },
@@ -1635,7 +1635,7 @@ test("a real user message during the loop pauses auto-continue (latest instructi
       },
     },
   }
-  const hooks = await GoalPlugin({ client }, { persistState: false, minDelayMs: 1 })
+  const hooks = await GoalPlugin({ client }, { persistState: false, minDelayMs: 1, noInterruptOnUserMessage: false })
   await hooks["command.execute.before"](
     { command: "goal", sessionID: "session-1", arguments: "ship it" },
     { parts: [] },
@@ -1684,6 +1684,55 @@ test("noInterruptOnUserMessage:true keeps the goal running and steers the loop",
   const hooks = await GoalPlugin(
     { client },
     { persistState: false, minDelayMs: 1, noInterruptOnUserMessage: true },
+  )
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "ship it" },
+    { parts: [] },
+  )
+  // Simulate that the loop is already running.
+  const goal = currentGoal("session-1")
+  goal.turnCount = 1
+  goal.lastContinueAt = Date.now() - 10
+
+  await hooks["chat.message"](
+    { sessionID: "session-1", messageID: "msg-steer", agent: "build" },
+    {
+      message: { id: "msg-steer", role: "user", sessionID: "session-1" },
+      parts: [textPart("stop, do Y instead")],
+    },
+  )
+  assert.equal(currentGoal("session-1").stopped, false)
+
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
+  })
+
+  assert.equal(currentGoal("session-1").stopped, false)
+  assert.equal(calls.length, 1)
+})
+
+test("by default a human message keeps the goal running and steers the loop", async () => {
+  const calls = []
+  const client = {
+    app: { log: async () => {} },
+    session: {
+      messages: async () => ({
+        data: [
+          pluginContinuationMessage(),
+          message("did a step"),
+          userMessage("stop, do Y instead"),
+          message("sure"),
+        ],
+      }),
+      promptAsync: async (input) => {
+        calls.push(input)
+        return {}
+      },
+    },
+  }
+  const hooks = await GoalPlugin(
+    { client },
+    { persistState: false, minDelayMs: 1 },
   )
   await hooks["command.execute.before"](
     { command: "goal", sessionID: "session-1", arguments: "ship it" },
@@ -1929,6 +1978,7 @@ test("a real user message pauses immediately even while children are active", as
     { client },
     {
       persistState: false,
+      noInterruptOnUserMessage: false,
       minDelayMs: 1,
       noContinueWhileChildrenActive: true,
       noToolCallTurnsBeforePause: 0,
@@ -3236,7 +3286,7 @@ test("a human message arriving during cooldown is re-read and pauses before prom
     onPromptAsync: () => {
       sourceTurn += 1
     },
-    options: { minDelayMs: 100 },
+    options: { minDelayMs: 100, noInterruptOnUserMessage: false },
   })
   await hooks["command.execute.before"](
     { command: "goal", sessionID: "session-1", arguments: "ship it" },
@@ -3437,7 +3487,7 @@ test("a human message aborts an already accepted continuation", async () => {
       await pendingPrompt
       return {}
     },
-    options: { minDelayMs: 1 },
+    options: { minDelayMs: 1, noInterruptOnUserMessage: false },
   })
   await hooks["command.execute.before"](
     { command: "goal", sessionID: "session-1", arguments: "ship it" },
@@ -7291,10 +7341,11 @@ test("normalizeOptions falls back to defaults for zero, negative, and non-numeri
   assert.equal(result.maxRecentMessages, defaults.maxRecentMessages)
 })
 
-test("normalizeOptions defaults noInterruptOnUserMessage to false and keeps it boolean", () => {
-  assert.equal(normalizeOptions().noInterruptOnUserMessage, false)
+test("normalizeOptions defaults noInterruptOnUserMessage to true and keeps it boolean", () => {
+  assert.equal(normalizeOptions().noInterruptOnUserMessage, true)
   assert.equal(normalizeOptions({ noInterruptOnUserMessage: true }).noInterruptOnUserMessage, true)
-  assert.equal(normalizeOptions({ noInterruptOnUserMessage: "yes" }).noInterruptOnUserMessage, false)
+  assert.equal(normalizeOptions({ noInterruptOnUserMessage: false }).noInterruptOnUserMessage, false)
+  assert.equal(normalizeOptions({ noInterruptOnUserMessage: "yes" }).noInterruptOnUserMessage, true)
 })
 
 test("normalizeOptions defaults noContinueWhileChildrenActive to false and keeps it boolean", () => {
