@@ -10,12 +10,12 @@ A full install is **two entries in two different files**. `opencode.json`'s `plu
 
 Always write the spec in the **named form** `<package>@<source>`. A bare `github:owner/repo` or a bare tarball URL is accepted by the config and then silently never loads: OpenCode looks the installed package up by the name `npm-package-arg` parses out of the spec, a bare git or tarball spec has none, and the host falls back to the whole spec string as a directory name and throws *after* the files are on disk, with nothing logged.
 
-> **`v1.1.0` is the git tag; nothing is on npm.** `v1.1.0` is the current release, and it is what the specs below and the files in [`examples/`](../examples/) pin; `v1.0.0` was the first release cut under the name `opencode-goal-pro-max-complete-plugin`. The npm name is a different question: it is **unclaimed, not reserved** — `npm view opencode-goal-pro-max-complete-plugin` answers `E404`, and npm has no reservation mechanism short of publishing, so anyone could take the name before this project does. Do not trust a `<pkg>@npm` spec for this package: install from the git tag, from the local `file://` form below, or with the [installer](install.md), which uses the local form.
+> **`v1.2.0` is the git tag; nothing is on npm.** `v1.2.0` is the current release, and it is what the specs below and the files in [`examples/`](../examples/) pin; `v1.0.0` was the first release cut under the name `opencode-goal-pro-max-complete-plugin`. The npm name is a different question: it is **unclaimed, not reserved** — `npm view opencode-goal-pro-max-complete-plugin` answers `E404`, and npm has no reservation mechanism short of publishing, so anyone could take the name before this project does. Do not trust a `<pkg>@npm` spec for this package: install from the git tag, from the local `file://` form below, or with the [installer](install.md), which uses the local form.
 
 ```jsonc
 // opencode.json — the server half: commands, tools, hooks, sidebar payload
 {
-  "plugin": ["opencode-goal-pro-max-complete-plugin@github:sblattj/opencode-goal-pro-max-complete-plugin#v1.1.0"],
+  "plugin": ["opencode-goal-pro-max-complete-plugin@github:sblattj/opencode-goal-pro-max-complete-plugin#v1.2.0"],
   "command": {
     "goal": {
       "description": "Set a session-scoped goal and auto-continue until complete.",
@@ -28,13 +28,13 @@ Always write the spec in the **named form** `<package>@<source>`. A bare `github
 
 ```jsonc
 // tui.json, beside it — the TUI half: the sidebar panel
-{ "plugin": ["opencode-goal-pro-max-complete-plugin@github:sblattj/opencode-goal-pro-max-complete-plugin#v1.1.0"] }
+{ "plugin": ["opencode-goal-pro-max-complete-plugin@github:sblattj/opencode-goal-pro-max-complete-plugin#v1.2.0"] }
 ```
 
 Or let OpenCode write both entries:
 
 ```sh
-opencode plugin 'opencode-goal-pro-max-complete-plugin@github:sblattj/opencode-goal-pro-max-complete-plugin#v1.1.0' --global
+opencode plugin 'opencode-goal-pro-max-complete-plugin@github:sblattj/opencode-goal-pro-max-complete-plugin#v1.2.0' --global
 ```
 
 ### Spec forms
@@ -42,15 +42,15 @@ opencode plugin 'opencode-goal-pro-max-complete-plugin@github:sblattj/opencode-g
 Both of these name the package before the source, and both work:
 
 ```
-opencode-goal-pro-max-complete-plugin@github:sblattj/opencode-goal-pro-max-complete-plugin#v1.1.0
-opencode-goal-pro-max-complete-plugin@https://github.com/sblattj/opencode-goal-pro-max-complete-plugin/archive/refs/tags/v1.1.0.tar.gz
+opencode-goal-pro-max-complete-plugin@github:sblattj/opencode-goal-pro-max-complete-plugin#v1.2.0
+opencode-goal-pro-max-complete-plugin@https://github.com/sblattj/opencode-goal-pro-max-complete-plugin/archive/refs/tags/v1.2.0.tar.gz
 ```
 
 These do **not** work and fail *silently*, for the reason above:
 
 ```
-github:sblattj/opencode-goal-pro-max-complete-plugin#v1.1.0
-https://github.com/sblattj/opencode-goal-pro-max-complete-plugin/archive/refs/tags/v1.1.0.tar.gz
+github:sblattj/opencode-goal-pro-max-complete-plugin#v1.2.0
+https://github.com/sblattj/opencode-goal-pro-max-complete-plugin/archive/refs/tags/v1.2.0.tar.gz
 ```
 
 Pin a tag rather than tracking a branch, so an install is reproducible.
