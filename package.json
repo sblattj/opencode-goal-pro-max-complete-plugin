@@ -58,6 +58,7 @@
     "smoke:git-install": "node scripts/git-install-contract.mjs",
     "smoke:todo-mirror": "node scripts/smoke-todo-mirror.mjs",
     "smoke:todo-safety": "node scripts/smoke-todo-safety.mjs",
+    "smoke:multi-process": "node scripts/multi-process-contract.mjs",
     "benchmark:behavior": "node scripts/behavior-benchmark.mjs",
     "benchmark:todo-mirror": "node scripts/bench-todo-mirror.mjs",
     "verify": "node scripts/verify.mjs",
