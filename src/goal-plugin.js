@@ -90,6 +90,9 @@ const MAX_LEDGER_LINE_BYTES = 16 * 1024
 const MIGRATION_LEASE_RETRIES = 200
 const MIGRATION_LEASE_DELAY_MS = 25
 const PASSIVE_SESSION_RETRY_MS = 250
+// An idle process gives a session's persistence lease back this long after the
+// last touch, so another process can open the session. `0` disables idle release.
+const DEFAULT_IDLE_LEASE_RELEASE_MS = 3000
 const SESSION_OWNED_ELSEWHERE = "session_owned_elsewhere"
 const ACTIVE_PERSISTENCE_DISABLED = Object.freeze({ kind: "active", persistence: "disabled" })
 const ACTIVE_PERSISTENCE_OWNED = Object.freeze({ kind: "active", persistence: "owned" })
@@ -219,6 +222,14 @@ function createRuntimeState() {
     sessionPersistence: new Map(),
     sessionLoadPromises: new Map(),
     passiveSessions: new Map(),
+    // sessionID -> timer that gives an idle session's lease back.
+    idleLeaseTimers: new Map(),
+    // sessionID -> promise of an in-flight idle unload; a touch waits on it so
+    // the process never contends with its own not-yet-released claim.
+    sessionReleasePromises: new Map(),
+    // Sessions whose goal the load in progress flipped to "recovered after
+    // restart", so only that load announces the recovery.
+    freshRecoveries: new Set(),
     disposed: false,
   }
 }
@@ -1883,6 +1894,13 @@ function normalizePersistenceOptions(options = {}, { env = process.env, cwd } = 
     ledgerFilePath,
     ledgerMaxBytes,
     ledgerRetentionFiles,
+    idleLeaseReleaseMs:
+      options.idleLeaseReleaseMs === undefined
+        ? DEFAULT_IDLE_LEASE_RELEASE_MS
+        : toNonNegativeInteger(options.idleLeaseReleaseMs, DEFAULT_IDLE_LEASE_RELEASE_MS),
+    // Mainly for tests; undefined keeps the lease module's own defaults.
+    leaseHeartbeatMs: toPositiveInteger(options.leaseHeartbeatMs, undefined),
+    leaseStaleAfterMs: toPositiveInteger(options.leaseStaleAfterMs, undefined),
     projectRoot: cwd,
     enforceProjectBoundary: !hasExplicitLocation,
   }
@@ -2133,6 +2151,7 @@ function deserializeGoal(goal) {
   }
 
   if (!hydrated.stopped) {
+    currentRuntime().freshRecoveries.add(hydrated.sessionID)
     hydrated.stopped = true
     hydrated.stopReason = "recovered after restart"
     hydrated.lastStatus = "Recovered persisted goal state. Review the goal status and resume it when ready."
@@ -4887,7 +4906,8 @@ function sessionOwnedElsewhereMessage(
   return (
     "Goal controls are unavailable in this OpenCode instance because another process owns this session's goal workflow. " +
     "No goal state was read or changed here. Ordinary chat remains available. " +
-    `Close the owning process or open a fork with \`opencode --continue --fork\`, then retry ${retryTarget}.`
+    `The owner holds the session while it is driving or recently touched it, and an idle owner releases it within a few seconds, so retry ${retryTarget}; ` +
+    "to work in parallel, open a fork with `opencode --continue --fork`."
   )
 }
 
@@ -6113,15 +6133,138 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
   }
 
   // Each session owns an independent snapshot, ledger, write chain, and
-  // lifetime lease. A project can therefore host any number of unrelated goal
-  // sessions without allowing two processes to drive the same session.
+  // lease. The lease is held while the process drives or recently touched the
+  // session and handed back by the idle release below, so a project can host
+  // any number of unrelated goal sessions across processes without allowing two
+  // processes to drive the same session.
+  //
+  // Write fencing: every snapshot write first re-verifies the lease, so a
+  // process whose claim was reclaimed as stale (e.g. after a laptop sleep longer
+  // than `staleAfterMs`) stops writing as soon as it notices. The ledger sink
+  // only checks the cheap in-memory `isHeld()`, so it can still append within
+  // one heartbeat of such a reclaim; that window exists only after the owner
+  // was frozen for longer than `staleAfterMs` and is accepted.
   const persist = (sessionID) => {
     const persistence = runtime.sessionPersistence.get(sessionID)
     if (runtime.disposed || !persistence) return Promise.resolve(false)
     persistence.persistChain = persistence.persistChain
       .catch(() => false)
-      .then(() => persistState(persistence, client, sessionID))
+      .then(async () => {
+        if (persistence.lease && !(await persistence.lease.verify())) return false
+        return persistState(persistence, client, sessionID)
+      })
+      .then((written) => {
+        armIdleLeaseTimer(sessionID, persistence)
+        return written
+      })
     return persistence.persistChain
+  }
+
+  // A session may give its lease back only when this process is not driving it:
+  // no live (non-stopped) goal, no queued goal, and no turn, continuation,
+  // prompt, or load in flight.
+  const sessionReleaseEligible = (sessionID) => {
+    const focused = goalStates.get(sessionID)
+    if (focused && !focused.stopped) return false
+    if (listSessionGoals(sessionID).some((goal) => !goal.stopped)) return false
+    if (runtime.pendingCommandTurns.has(sessionID)) return false
+    if (runtime.activeCommandTurns.has(sessionID)) return false
+    if (activeContinues.has(sessionID)) return false
+    if (runtime.promptInFlightSessions.has(sessionID)) return false
+    if (runtime.sessionLoadPromises.has(sessionID)) return false
+    return true
+  }
+
+  const clearIdleLeaseTimer = (sessionID) => {
+    const timer = runtime.idleLeaseTimers.get(sessionID)
+    if (timer) clearTimeout(timer)
+    runtime.idleLeaseTimers.delete(sessionID)
+  }
+
+  // (Re)arm the per-session idle timer. The callback is bound to this plugin's
+  // runtime: a bare timer fires outside AsyncLocalStorage and would resolve the
+  // runtime collections to whichever plugin instance initialized last.
+  const armIdleLeaseTimer = (sessionID, persistence) => {
+    if (runtime.disposed || !persistenceOptions.idleLeaseReleaseMs) return
+    if (runtime.sessionPersistence.get(sessionID) !== persistence) return
+    clearIdleLeaseTimer(sessionID)
+    const timer = setTimeout(
+      bindRuntime(runtime, () => {
+        if (runtime.idleLeaseTimers.get(sessionID) !== timer) return
+        runtime.idleLeaseTimers.delete(sessionID)
+        return releaseIdleSession(sessionID, persistence)
+      }),
+      persistenceOptions.idleLeaseReleaseMs,
+    )
+    timer.unref?.()
+    runtime.idleLeaseTimers.set(sessionID, timer)
+  }
+
+  const touchSession = (sessionID) => {
+    const persistence = runtime.sessionPersistence.get(sessionID)
+    if (!persistence) return
+    persistence.touchEpoch = (persistence.touchEpoch || 0) + 1
+    armIdleLeaseTimer(sessionID, persistence)
+  }
+
+  // Unload an idle session and give its lease back. Host session metadata (the
+  // title/sidebar render) is deliberately left as written: the applied-title
+  // bookkeeping is dropped without restoring the title.
+  const releaseIdleSession = async (sessionID, persistence) => {
+    if (runtime.disposed || runtime.sessionPersistence.get(sessionID) !== persistence) return
+    if (!sessionReleaseEligible(sessionID)) {
+      // Poll while busy so a later active -> stopped transition still releases.
+      armIdleLeaseTimer(sessionID, persistence)
+      return
+    }
+    const epoch = persistence.touchEpoch || 0
+    const written = await persist(sessionID)
+    if (runtime.disposed || runtime.sessionPersistence.get(sessionID) !== persistence) return
+    // State may have changed, or the session been touched, during the write.
+    if (!written || (persistence.touchEpoch || 0) !== epoch || !sessionReleaseEligible(sessionID)) {
+      armIdleLeaseTimer(sessionID, persistence)
+      return
+    }
+    clearIdleLeaseTimer(sessionID)
+    runtime.sessionPersistence.delete(sessionID)
+    runtime.appliedTitles.delete(sessionID)
+    runtime.sidebarTerminals.delete(sessionID)
+    clearSessionRuntimeState(sessionID, { preserveExecutionContext: true })
+    const releasing = persistence.lease.release().catch(() => false)
+    runtime.sessionReleasePromises.set(sessionID, releasing)
+    try {
+      await releasing
+    } finally {
+      if (runtime.sessionReleasePromises.get(sessionID) === releasing) {
+        runtime.sessionReleasePromises.delete(sessionID)
+      }
+    }
+  }
+
+  // The claim vanished (another process reclaimed it as stale). Stop driving
+  // the session. This is not permanent passivity: the next explicit goal
+  // command re-acquires through ensureSessionLoaded, and goes passive normally
+  // if the other owner holds the lease.
+  const handleLeaseLost = (sessionID, lease) => {
+    if (runtime.disposed) return
+    const persistence = runtime.sessionPersistence.get(sessionID)
+    if (!persistence || persistence.lease !== lease) return
+    clearIdleLeaseTimer(sessionID)
+    runtime.continuationControllers.get(sessionID)?.abort()
+    runtime.sessionPersistence.delete(sessionID)
+    clearSessionRuntimeState(sessionID, { preserveExecutionContext: true })
+    void logPluginWarning(
+      client,
+      "Goal controls for this session moved to another process: this process's persistence lease was reclaimed as stale. Run a goal command again to retry.",
+    ).catch(() => {})
+  }
+
+  // Immediately before a goal-driving prompt: confirm the lease is still ours.
+  const leaseStillHeldForPrompt = async (sessionID) => {
+    if (!persistenceOptions.persistState) return true
+    const persistence = runtime.sessionPersistence.get(sessionID)
+    if (!persistence?.lease) return false
+    return persistence.lease.verify()
   }
 
   const lifecycleMessagesEnabled = pluginOptions.lifecycleMessages !== false
@@ -6188,7 +6331,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         : "another process"
       const warning = entry.reason === "legacy_lock"
         ? "Goal controls are passive for this session because its persistence lease is from an older release or is incomplete. Ordinary chat remains available. Close every OpenCode process using this session and upgrade them; if the report persists, remove only the affected session shard's adjacent lease artifacts (`.lock` and `.lock.claims-v2`) or fork the session before retrying goal controls."
-        : `Goal controls are passive for this session because ${owner} owns its persistence lease. Ordinary chat remains available; close the owner or fork the session before retrying goal controls.`
+        : `Goal controls are passive for this session because ${owner} holds its persistence lease while it is driving or recently touched the session. Ordinary chat remains available. An idle owner releases the lease within a few seconds, so retry the goal command; to work in parallel, fork the session (\`opencode --continue --fork\`).`
       // Host logging is advisory. A broken or backpressured logger must not
       // turn passive mode back into the session-wide hang it is meant to
       // prevent, and the contained rejection avoids an unhandled promise.
@@ -6209,7 +6352,16 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
     if (!persistenceOptions.persistState || !sessionID) return ACTIVE_PERSISTENCE_DISABLED
     const existingLoad = runtime.sessionLoadPromises.get(sessionID)
     if (existingLoad) return existingLoad
-    if (runtime.sessionPersistence.has(sessionID)) return ACTIVE_PERSISTENCE_OWNED
+    const unloading = runtime.sessionReleasePromises.get(sessionID)
+    if (unloading) {
+      await unloading
+      if (runtime.disposed) return PLUGIN_DISPOSED
+      return ensureSessionLoaded(sessionID, { retryPassive, executionContext, freshCommandBoundary })
+    }
+    if (runtime.sessionPersistence.has(sessionID)) {
+      touchSession(sessionID)
+      return ACTIVE_PERSISTENCE_OWNED
+    }
 
     const passive = runtime.passiveSessions.get(sessionID)
     pruneExpiredPendingCommandTurns(sessionID)
@@ -6231,12 +6383,17 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       })
       let lease
       try {
-        lease = await acquirePersistenceLease(paths.stateFilePath)
+        lease = await acquirePersistenceLease(paths.stateFilePath, {
+          heartbeatMs: persistenceOptions.leaseHeartbeatMs,
+          staleAfterMs: persistenceOptions.leaseStaleAfterMs,
+          onLost: bindRuntime(runtime, () => handleLeaseLost(sessionID, lease)),
+        })
       } catch (error) {
         if (!isPersistenceLeaseContendedError(error)) throw error
         return enterPassiveSession(sessionID, error)
       }
       const releaseDisposedSession = async () => {
+        clearIdleLeaseTimer(sessionID)
         runtime.sessionPersistence.delete(sessionID)
         await lease.release().catch(() => false)
         return PLUGIN_DISPOSED
@@ -6250,6 +6407,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       }
       runtime.passiveSessions.delete(sessionID)
       runtime.sessionPersistence.set(sessionID, persistence)
+      runtime.freshRecoveries.delete(sessionID)
       try {
         await migrateLegacyState(persistenceOptions, client)
         if (runtime.disposed) return releaseDisposedSession()
@@ -6263,7 +6421,14 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           status === "reconciled-blocked"
         ) await persist(sessionID)
         const recoveredGoal = goalStates.get(sessionID)
-        if (recoveredGoal?.stopped && recoveredGoal.stopReason === "recovered after restart") {
+        // Idle release reloads a paused-recovered goal on every later touch;
+        // only the load that actually flipped it announces the recovery.
+        const freshlyRecovered = runtime.freshRecoveries.delete(sessionID)
+        if (
+          freshlyRecovered &&
+          recoveredGoal?.stopped &&
+          recoveredGoal.stopReason === "recovered after restart"
+        ) {
           announceLifecycle(sessionID, `Goal recovered and paused. Run /${commandName} status, then /${commandName} resume when ready.`, {
             goal: recoveredGoal,
             transition: "recovered-paused",
@@ -6291,8 +6456,10 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           })
         }
         if (runtime.disposed) return releaseDisposedSession()
+        touchSession(sessionID)
         return ACTIVE_PERSISTENCE_OWNED
       } catch (error) {
+        clearIdleLeaseTimer(sessionID)
         runtime.sessionPersistence.delete(sessionID)
         await lease.release().catch(() => false)
         throw error
@@ -6329,6 +6496,8 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
     setLedgerSink((entry) => {
       const persistence = runtime.sessionPersistence.get(entry.sessionID)
       if (!persistence) return false
+      // Cheap in-memory check only; see the write-fencing note on `persist`.
+      if (!persistence.lease?.isHeld()) return false
       return appendLedgerLine(persistence.ledgerFilePath, entry, {
         maxBytes: persistence.ledgerMaxBytes,
         retentionFiles: persistence.ledgerRetentionFiles,
@@ -8591,6 +8760,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
                 expectedStopReason: limitReason,
               },
             )
+            if (!(await leaseStillHeldForPrompt(sessionID))) return
             currentRuntime().promptInFlightSessions.add(sessionID)
             let response
             try {
@@ -8895,6 +9065,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           }
         }
 
+        if (!(await leaseStillHeldForPrompt(sessionID))) return
         currentRuntime().promptInFlightSessions.add(sessionID)
         let response
         try {
@@ -9203,8 +9374,13 @@ function bindHooksToRuntime(hooks, runtime) {
   bound.dispose = bindRuntime(runtime, async () => {
     if (runtime.disposed) return
     runtime.disposed = true
+    for (const timer of runtime.idleLeaseTimers.values()) clearTimeout(timer)
+    runtime.idleLeaseTimers.clear()
     for (const controller of runtime.continuationControllers.values()) controller.abort()
-    await Promise.allSettled([...runtime.sessionLoadPromises.values()])
+    await Promise.allSettled([
+      ...runtime.sessionLoadPromises.values(),
+      ...runtime.sessionReleasePromises.values(),
+    ])
     for (const persistence of runtime.sessionPersistence.values()) {
       await persistence.persistChain.catch(() => false)
     }
@@ -9228,7 +9404,12 @@ export const GoalPlugin = async (context = {}, pluginOptions = {}) => {
       return bindHooksToRuntime(hooks, runtime)
     } catch (error) {
       runtime.disposed = true
-      await Promise.allSettled([...runtime.sessionLoadPromises.values()])
+      for (const timer of runtime.idleLeaseTimers.values()) clearTimeout(timer)
+      runtime.idleLeaseTimers.clear()
+      await Promise.allSettled([
+        ...runtime.sessionLoadPromises.values(),
+        ...runtime.sessionReleasePromises.values(),
+      ])
       for (const persistence of runtime.sessionPersistence.values()) {
         await persistence.persistChain.catch(() => false)
         await persistence.lease?.release().catch(() => false)

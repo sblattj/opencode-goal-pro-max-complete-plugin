@@ -607,7 +607,6 @@ function createLease(
  * reclaimable from another host only after 24 hours of silence. The lease
  * reports `isHeld()`/`verify()` and calls `onLost` once if its claim vanishes.
  *
-
  * Version 2 atomically publishes a long-lived regular-file guard at the legacy
  * `.lock` path. Its far-future mtime makes version-1's malformed-directory
  * recovery fail closed, while hard-link publication ensures the legacy path is
