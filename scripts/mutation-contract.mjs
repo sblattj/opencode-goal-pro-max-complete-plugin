@@ -251,6 +251,20 @@ const mutants = [
     test: "test/persistence-lease.test.js",
   },
   {
+    name: "heartbeating claims go stale only after the staleness window",
+    file: "src/persistence-lease.js",
+    from: "    return age > Math.max(staleAfterMs, 4 * heartbeatMs)",
+    to: "    return age < Math.max(staleAfterMs, 4 * heartbeatMs)",
+    test: "test/persistence-lease.test.js",
+  },
+  {
+    name: "claims without heartbeatMs keep the legacy rule and wait 24h on foreign hosts",
+    file: "src/persistence-lease.js",
+    from: "  if (Number.isFinite(heartbeatMs) && heartbeatMs > 0) {\n    return age >",
+    to: "  if (true) {\n    return age >",
+    test: "test/persistence-lease.test.js",
+  },
+  {
     name: "stored owner hostnames are validated separately from diagnostics",
     file: "src/persistence-lease.js",
     from: "    validStoredHostname(owner.hostname)",

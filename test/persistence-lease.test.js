@@ -1183,3 +1183,193 @@ test("persistence lease treats an invalid regular guard as manual-recovery conte
     await rm(dir, { recursive: true, force: true })
   }
 })
+
+// ---- heartbeat, staleness and loss detection ----
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+async function seedForeignClaim(state, fields, ageMs) {
+  const lock = `${state}.lock`
+  if (!(await lstat(`${lock}.claims-v2`).then(() => true, () => false))) {
+    await createV2LeaseDirectory(lock)
+  }
+  const token = randomUUID()
+  const claimPath = join(
+    persistenceLeaseInternals.claimDirectoryPathFor(lock),
+    persistenceLeaseInternals.claimNameFor(token),
+  )
+  await writeFile(claimPath, JSON.stringify({
+    protocol: 2,
+    token,
+    pid: process.pid,
+    hostname: hostname(),
+    createdAt: Date.now() - ageMs,
+    ...fields,
+  }))
+  const when = new Date(Date.now() - ageMs)
+  await utimes(claimPath, when, when)
+  return claimPath
+}
+
+async function withTempState(run) {
+  const dir = await mkdtemp(join(tmpdir(), "goal-lease-hb-"))
+  try {
+    return await run(join(dir, "state.json"))
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+}
+
+async function exists(path) {
+  return lstat(path).then(() => true, () => false)
+}
+
+test("new claims record the owner's heartbeat interval", async () => {
+  await withTempState(async (state) => {
+    const lease = await acquirePersistenceLease(state, { heartbeatMs: 7_000 })
+    try {
+      const [name] = await claimNames(`${state}.lock`)
+      const claim = JSON.parse(await readFile(
+        join(persistenceLeaseInternals.claimDirectoryPathFor(`${state}.lock`), name),
+        "utf8",
+      ))
+      assert.equal(claim.heartbeatMs, 7_000)
+      assert.equal(claim.protocol, 2)
+    } finally {
+      await lease.release()
+    }
+  })
+})
+
+test("the heartbeat refreshes the claim mtime", async () => {
+  await withTempState(async (state) => {
+    const lease = await acquirePersistenceLease(state, { heartbeatMs: 20 })
+    try {
+      const claimPath = join(
+        lease.claimDirectoryPath,
+        persistenceLeaseInternals.claimNameFor(lease.owner.token),
+      )
+      const old = new Date(Date.now() - 3_600_000)
+      await utimes(claimPath, old, old)
+      await sleep(250)
+      const info = await stat(claimPath)
+      assert.ok(Date.now() - info.mtimeMs < 60_000, "mtime was not refreshed")
+      assert.equal(lease.isHeld(), true)
+      assert.equal(await lease.verify(), true)
+    } finally {
+      await lease.release()
+    }
+  })
+})
+
+test("a heartbeating claim older than staleAfterMs is reclaimed despite a live pid", async () => {
+  await withTempState(async (state) => {
+    const stale = await seedForeignClaim(state, { heartbeatMs: 1_000 }, 10 * 60_000)
+    const lease = await acquirePersistenceLease(state, { staleAfterMs: 120_000 })
+    try {
+      assert.equal(await exists(stale), false)
+      assert.equal((await claimNames(`${state}.lock`)).length, 1)
+    } finally {
+      await lease.release()
+    }
+  })
+})
+
+test("a heartbeating claim with a fresh mtime still blocks", async () => {
+  await withTempState(async (state) => {
+    const fresh = await seedForeignClaim(state, { heartbeatMs: 1_000 }, 1_000)
+    await assert.rejects(acquirePersistenceLease(state), PersistenceLeaseContendedError)
+    assert.equal(await exists(fresh), true)
+  })
+})
+
+test("staleness honors four heartbeat intervals when that exceeds staleAfterMs", async () => {
+  await withTempState(async (state) => {
+    const claim = await seedForeignClaim(state, { heartbeatMs: 60_000 }, 150_000)
+    await assert.rejects(
+      acquirePersistenceLease(state, { staleAfterMs: 120_000 }),
+      PersistenceLeaseContendedError,
+    )
+    assert.equal(await exists(claim), true)
+  })
+})
+
+test("a same-host claim without heartbeatMs and a live pid blocks however old", async () => {
+  await withTempState(async (state) => {
+    const claim = await seedForeignClaim(state, {}, 48 * 3_600_000)
+    await assert.rejects(acquirePersistenceLease(state), PersistenceLeaseContendedError)
+    assert.equal(await exists(claim), true)
+  })
+})
+
+test("a foreign-host claim without heartbeatMs is reclaimed after 24h but blocks at 1h", async () => {
+  await withTempState(async (state) => {
+    const young = await seedForeignClaim(state, { hostname: "old-host.example" }, 3_600_000)
+    await assert.rejects(acquirePersistenceLease(state), PersistenceLeaseContendedError)
+    assert.equal(await exists(young), true)
+    await rm(young)
+    const old = await seedForeignClaim(state, { hostname: "old-host.example" }, 48 * 3_600_000)
+    const lease = await acquirePersistenceLease(state)
+    try {
+      assert.equal(await exists(old), false)
+    } finally {
+      await lease.release()
+    }
+  })
+})
+
+test("deleting the own claim reports loss once and verify() fails", async () => {
+  await withTempState(async (state) => {
+    const lost = []
+    const lease = await acquirePersistenceLease(state, {
+      heartbeatMs: 20,
+      onLost: (owner) => lost.push(owner),
+    })
+    assert.equal(lease.isHeld(), true)
+    await rm(join(
+      lease.claimDirectoryPath,
+      persistenceLeaseInternals.claimNameFor(lease.owner.token),
+    ))
+    await sleep(250)
+    assert.equal(lost.length, 1)
+    assert.equal(lost[0].token, lease.owner.token)
+    assert.equal(lease.isHeld(), false)
+    assert.equal(await lease.verify(), false)
+    await sleep(100)
+    assert.equal(lost.length, 1)
+  })
+})
+
+test("verify() detects a lost claim without waiting for the timer", async () => {
+  await withTempState(async (state) => {
+    let calls = 0
+    const lease = await acquirePersistenceLease(state, {
+      heartbeatMs: 3_600_000,
+      onLost: () => { calls += 1; throw new Error("callback errors are swallowed") },
+    })
+    await rm(join(
+      lease.claimDirectoryPath,
+      persistenceLeaseInternals.claimNameFor(lease.owner.token),
+    ))
+    assert.equal(await lease.verify(), false)
+    assert.equal(await lease.verify(), false)
+    assert.equal(calls, 1)
+    assert.equal(lease.isHeld(), false)
+  })
+})
+
+test("release() stops the heartbeat so no loss is reported afterwards", async () => {
+  await withTempState(async (state) => {
+    let calls = 0
+    const lease = await acquirePersistenceLease(state, {
+      heartbeatMs: 20,
+      onLost: () => { calls += 1 },
+    })
+    assert.equal(await lease.release(), true)
+    assert.equal(lease.isHeld(), false)
+    assert.equal(await lease.verify(), false)
+    await sleep(150)
+    assert.equal(calls, 0)
+    assert.deepEqual(await claimNames(`${state}.lock`), [])
+  })
+})
