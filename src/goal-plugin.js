@@ -230,6 +230,8 @@ function createRuntimeState() {
     // Sessions whose goal the load in progress flipped to "recovered after
     // restart", so only that load announces the recovery.
     freshRecoveries: new Set(),
+    // sessionID -> number of hook/tool calls for it still running.
+    sessionHookDepth: new Map(),
     disposed: false,
   }
 }
@@ -6172,6 +6174,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
     if (activeContinues.has(sessionID)) return false
     if (runtime.promptInFlightSessions.has(sessionID)) return false
     if (runtime.sessionLoadPromises.has(sessionID)) return false
+    if (runtime.sessionHookDepth.has(sessionID)) return false
     return true
   }
 
@@ -9350,6 +9353,36 @@ function bindRuntime(runtime, handler) {
   }
 }
 
+// While a hook or tool call for a session is still running, that session's
+// lease must not be idle-released underneath it: a handler may load the session,
+// await the host for longer than the idle grace, and only then mutate goal state.
+function holdSessionDuring(runtime, sessionID, handler, args) {
+  if (typeof sessionID !== "string" || !sessionID) return handler(...args)
+  const depth = runtime.sessionHookDepth
+  depth.set(sessionID, (depth.get(sessionID) || 0) + 1)
+  const leave = () => {
+    const remaining = (depth.get(sessionID) || 1) - 1
+    if (remaining > 0) depth.set(sessionID, remaining)
+    else depth.delete(sessionID)
+  }
+  try {
+    const result = handler(...args)
+    if (result && typeof result.then === "function") {
+      return Promise.resolve(result).finally(leave)
+    }
+    leave()
+    return result
+  } catch (error) {
+    leave()
+    throw error
+  }
+}
+
+function hookSessionID(name, args) {
+  if (name === "event") return getSessionID(args[0]?.event)
+  return args[0]?.sessionID
+}
+
 function bindHooksToRuntime(hooks, runtime) {
   const bound = {}
   for (const [name, value] of Object.entries(hooks)) {
@@ -9361,14 +9394,21 @@ function bindHooksToRuntime(hooks, runtime) {
             toolName,
             {
               ...definition,
-              execute: bindRuntime(runtime, definition.execute),
+              execute: bindRuntime(runtime, (...args) =>
+                holdSessionDuring(runtime, args[1]?.sessionID, definition.execute, args),
+              ),
             },
           ]
         }),
       )
       continue
     }
-    bound[name] = typeof value === "function" ? bindRuntime(runtime, value) : value
+    bound[name] =
+      typeof value === "function"
+        ? bindRuntime(runtime, (...args) =>
+            holdSessionDuring(runtime, hookSessionID(name, args), value, args),
+          )
+        : value
   }
 
   bound.dispose = bindRuntime(runtime, async () => {
@@ -9491,6 +9531,8 @@ export const testInternals = {
   goalDisplayState,
   formatStatus,
   getSessionID,
+  holdSessionDuring,
+  hookSessionID,
   goalIsBlocked,
   goalIsComplete,
   isIdleEvent,

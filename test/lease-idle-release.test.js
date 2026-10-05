@@ -594,3 +594,32 @@ test("child-session events churn the child lease once per event, parent goal unt
     assert.equal(seenClaims.size, events, "each spaced child event is one acquire/release cycle")
   })
 })
+
+// A handler may load a session, await the host for longer than the idle grace,
+// and only then mutate goal state; the hook wrapper holds the session meanwhile.
+test("a running hook or tool call holds its session against idle release", async () => {
+  const { testInternals } = await import(moduleURL)
+  const { holdSessionDuring, hookSessionID } = testInternals
+  const runtime = { sessionHookDepth: new Map() }
+
+  let finish
+  const slow = holdSessionDuring(runtime, "S", () => new Promise((resolve) => { finish = resolve }), [])
+  const nested = holdSessionDuring(runtime, "S", async () => "nested", [])
+  assert.equal(runtime.sessionHookDepth.get("S"), 2)
+  assert.equal(await nested, "nested")
+  assert.equal(runtime.sessionHookDepth.get("S"), 1, "the slow call still holds the session")
+  finish("done")
+  assert.equal(await slow, "done")
+  assert.equal(runtime.sessionHookDepth.has("S"), false)
+
+  await assert.rejects(holdSessionDuring(runtime, "S", async () => { throw new Error("boom") }, []), /boom/)
+  assert.throws(() => holdSessionDuring(runtime, "S", () => { throw new Error("sync") }, []), /sync/)
+  assert.equal(holdSessionDuring(runtime, "S", (value) => value * 2, [21]), 42)
+  assert.equal(runtime.sessionHookDepth.size, 0, "rejections, throws and sync returns all release the hold")
+  assert.equal(holdSessionDuring(runtime, undefined, () => "no session", []), "no session")
+  assert.equal(runtime.sessionHookDepth.size, 0)
+
+  assert.equal(hookSessionID("chat.params", [{ sessionID: "A" }]), "A")
+  assert.equal(hookSessionID("event", [{ event: { properties: { sessionID: "B" } } }]), "B")
+  assert.equal(hookSessionID("event", [{ event: { properties: { info: { sessionID: "C" } } } }]), "C")
+})
