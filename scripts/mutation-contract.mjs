@@ -258,6 +258,34 @@ const mutants = [
     test: "test/persistence-lease.test.js",
   },
   {
+    name: "idle release never unloads a session that still has a live goal",
+    file: "src/goal-plugin.js",
+    from: "    if (focused && !focused.stopped) return false\n    if (listSessionGoals(sessionID).some((goal) => !goal.stopped)) return false\n",
+    to: "",
+    test: "test/lease-idle-release.test.js",
+  },
+  {
+    name: "idle release never unloads a session with an unfinished command turn",
+    file: "src/goal-plugin.js",
+    from: "    if (runtime.pendingCommandTurns.has(sessionID)) return false\n",
+    to: "",
+    test: "test/lease-idle-release.test.js",
+  },
+  {
+    name: "snapshot writes re-verify the lease before touching state.json",
+    file: "src/goal-plugin.js",
+    from: "        if (persistence.lease && !(await persistence.lease.verify())) return false\n",
+    to: "",
+    test: "test/lease-idle-release.test.js",
+  },
+  {
+    name: "a goal turn is never prompted after the lease is lost",
+    file: "src/goal-plugin.js",
+    from: "        if (!(await leaseStillHeldForPrompt(sessionID))) return\n        currentRuntime().promptInFlightSessions.add(sessionID)\n        let response",
+    to: "        currentRuntime().promptInFlightSessions.add(sessionID)\n        let response",
+    test: "test/lease-idle-release.test.js",
+  },
+  {
     name: "claims without heartbeatMs keep the legacy rule and wait 24h on foreign hosts",
     file: "src/persistence-lease.js",
     from: "  if (Number.isFinite(heartbeatMs) && heartbeatMs > 0) {\n    return age >",
@@ -393,8 +421,8 @@ const mutants = [
   {
     name: "overlapping hooks await one complete session load",
     file: "src/goal-plugin.js",
-    from: "    const existingLoad = runtime.sessionLoadPromises.get(sessionID)\n    if (existingLoad) return existingLoad\n    if (runtime.sessionPersistence.has(sessionID)) return ACTIVE_PERSISTENCE_OWNED",
-    to: "    if (runtime.sessionPersistence.has(sessionID)) return ACTIVE_PERSISTENCE_OWNED\n    const existingLoad = runtime.sessionLoadPromises.get(sessionID)\n    if (existingLoad) return existingLoad",
+    from: "    const existingLoad = runtime.sessionLoadPromises.get(sessionID)\n    if (existingLoad) return existingLoad\n",
+    to: "    const existingLoad = runtime.sessionLoadPromises.get(sessionID)\n    if (existingLoad && runtime.sessionPersistence.has(sessionID)) return ACTIVE_PERSISTENCE_OWNED\n    if (existingLoad) return existingLoad\n",
     test: "test/goal-plugin.test.js",
   },
   {

@@ -463,6 +463,21 @@ export interface GoalPluginOptions {
    */
   ledgerFilePath?: string
 
+  /**
+   * Milliseconds after the last touch before an idle session's persistence
+   * lease is handed back so another OpenCode process can open the session. A
+   * session is idle when it has no live or queued goal and no turn in flight.
+   * `0` disables idle release (the lease is held until the process exits).
+   * @default 3000
+   */
+  idleLeaseReleaseMs?: number
+
+  /** Lease heartbeat interval in ms (mainly for tests). @default 15000 */
+  leaseHeartbeatMs?: number
+
+  /** Lease staleness window in ms (mainly for tests). @default 120000 */
+  leaseStaleAfterMs?: number
+
   /** Maximum bytes in one lifecycle-ledger generation. @default 2097152 */
   ledgerMaxBytes?: number
 
