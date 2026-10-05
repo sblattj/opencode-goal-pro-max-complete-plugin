@@ -16,6 +16,9 @@ const MAX_OWNER_FILE_BYTES = 4 * 1024
 const MAX_OWNER_TOKEN_LENGTH = 256
 const MAX_OWNER_HOSTNAME_LENGTH = 255
 const MAX_ACQUIRE_ATTEMPTS = 5
+const DEFAULT_HEARTBEAT_MS = 15_000
+const DEFAULT_STALE_AFTER_MS = 120_000
+const LEGACY_FOREIGN_HOST_STALE_MS = 24 * 60 * 60 * 1000
 
 function validStoredHostname(value) {
   return (
@@ -216,6 +219,25 @@ function ownerIsBlocking(owner, localHostname) {
   return processIsAlive(owner.pid) !== false
 }
 
+// A claim is stale (reclaimable) when its owner stopped refreshing it. A claim
+// carrying heartbeatMs is judged by mtime age alone, so a reused pid or a
+// renamed host cannot pin it. A claim without heartbeatMs comes from a plugin
+// that never heartbeats: it keeps the pid/host rule, except that a claim from
+// another host that has been silent for a full day is reclaimable.
+function claimIsStale(record, localHostname, nowMs, staleAfterMs) {
+  const mtimeMs = record.info?.mtimeMs
+  if (!Number.isFinite(mtimeMs)) return false
+  const age = nowMs - mtimeMs
+  const heartbeatMs = record.owner.heartbeatMs
+  if (Number.isFinite(heartbeatMs) && heartbeatMs > 0) {
+    return age > Math.max(staleAfterMs, 4 * heartbeatMs)
+  }
+  return (
+    record.owner.hostname !== localHostname &&
+    age > LEGACY_FOREIGN_HOST_STALE_MS
+  )
+}
+
 function claimNameFor(token) {
   return `${CLAIM_PREFIX}${token}${CLAIM_SUFFIX}`
 }
@@ -412,7 +434,7 @@ async function inspectClaims(
   lockPath,
   ownToken,
   localHostname,
-  { malformedGraceMs, now },
+  { malformedGraceMs, now, staleAfterMs = DEFAULT_STALE_AFTER_MS },
 ) {
   const entries = await fs.readdir(lockPath, { withFileTypes: true })
   let ownFound = false
@@ -450,6 +472,10 @@ async function inspectClaims(
       ownFound = true
       continue
     }
+    if (claimIsStale(record, localHostname, now(), staleAfterMs)) {
+      await removeUniqueClaim(claimPath)
+      continue
+    }
     if (ownerIsBlocking(record.owner, localHostname)) {
       return { blocker: record.owner, blocked: true, ownFound }
     }
@@ -468,15 +494,82 @@ function createLease(
   claimDirectoryPath,
   claimPath,
   owner,
-  { beforeClaimRemove } = {},
+  { beforeClaimRemove, heartbeatMs = DEFAULT_HEARTBEAT_MS, onLost } = {},
 ) {
   let releasing = false
   let released = false
+  let lost = false
+  let timer = null
+  let ticking = false
+
+  function stopTimer() {
+    if (timer) clearInterval(timer)
+    timer = null
+  }
+
+  function markLost() {
+    if (lost || released) return
+    lost = true
+    stopTimer()
+    try {
+      onLost?.(owner)
+    } catch {
+      // A lost-lease callback must never take down the timer or the host.
+    }
+  }
+
+  // Returns true when our claim is still present and was refreshed, false when
+  // the lease is lost, and null when this check could not decide (I/O error).
+  async function refresh() {
+    let claim
+    try {
+      claim = await readOwnerRecord(claimPath)
+    } catch {
+      return null
+    }
+    if (released || releasing) return null
+    if (claim.status === "missing" || claim.status !== "valid" || claim.owner.token !== owner.token) {
+      markLost()
+      return false
+    }
+    try {
+      const at = new Date()
+      await fs.utimes(claimPath, at, at)
+    } catch (error) {
+      if (error?.code === "ENOENT") {
+        markLost()
+        return false
+      }
+      return null
+    }
+    return true
+  }
+
+  if (Number.isFinite(heartbeatMs) && heartbeatMs > 0) {
+    timer = setInterval(() => {
+      if (ticking) return
+      ticking = true
+      refresh().catch(() => {}).finally(() => {
+        ticking = false
+      })
+    }, heartbeatMs)
+    timer.unref?.()
+  }
+
   return {
     lockPath,
     claimDirectoryPath,
     owner,
+    isHeld() {
+      return !released && !lost
+    },
+    async verify() {
+      if (released || lost) return false
+      const result = await refresh()
+      return result === null ? !released && !lost : result
+    },
     async release() {
+      stopTimer()
       if (released || releasing) return false
       releasing = true
       try {
@@ -504,8 +597,17 @@ function createLease(
 }
 
 /**
- * Hold an exclusive session lease for the plugin instance lifetime.
+ * Hold an exclusive session lease for as long as the owner keeps refreshing it.
  *
+ * The owner touches its claim file every `heartbeatMs` (unref'd timer). A peer
+ * may reclaim a claim that carries `heartbeatMs` once its mtime is older than
+ * max(`staleAfterMs`, 4 * heartbeatMs), whatever its pid or hostname, which
+ * survives pid reuse and hostname drift. Claims without `heartbeatMs` (older
+ * plugin versions never heartbeat) keep the same-host dead-pid rule and are
+ * reclaimable from another host only after 24 hours of silence. The lease
+ * reports `isHeld()`/`verify()` and calls `onLost` once if its claim vanishes.
+ *
+
  * Version 2 atomically publishes a long-lived regular-file guard at the legacy
  * `.lock` path. Its far-future mtime makes version-1's malformed-directory
  * recovery fail closed, while hard-link publication ensures the legacy path is
@@ -516,7 +618,13 @@ function createLease(
  */
 async function acquirePersistenceLeaseWithHooks(
   stateFilePath,
-  { malformedGraceMs = 30_000, now = () => Date.now() } = {},
+  {
+    malformedGraceMs = 30_000,
+    now = () => Date.now(),
+    heartbeatMs = DEFAULT_HEARTBEAT_MS,
+    staleAfterMs = DEFAULT_STALE_AFTER_MS,
+    onLost,
+  } = {},
   hooks = {},
 ) {
   const {
@@ -543,7 +651,7 @@ async function acquirePersistenceLeaseWithHooks(
       claimDirectoryPath,
       null,
       localHostname,
-      { malformedGraceMs, now },
+      { malformedGraceMs, now, staleAfterMs },
     )
     if (existing.blocked) throw new PersistenceLeaseContendedError(existing.blocker)
     const owner = {
@@ -552,6 +660,7 @@ async function acquirePersistenceLeaseWithHooks(
       pid: process.pid,
       hostname: localHostname,
       createdAt: Date.now(),
+      heartbeatMs,
     }
     const claimPath = join(claimDirectoryPath, claimNameFor(owner.token))
     let claimPublished = false
@@ -577,7 +686,7 @@ async function acquirePersistenceLeaseWithHooks(
         claimDirectoryPath,
         owner.token,
         localHostname,
-        { malformedGraceMs, now },
+        { malformedGraceMs, now, staleAfterMs },
       )
       if (!observed.ownFound || observed.blocked) {
         lastBlocker = observed.blocker
@@ -593,7 +702,7 @@ async function acquirePersistenceLeaseWithHooks(
         claimDirectoryPath,
         claimPath,
         owner,
-        { beforeClaimRemove },
+        { beforeClaimRemove, heartbeatMs, onLost },
       )
     } catch (error) {
       if (claimPublished) await removeUniqueClaim(claimPath).catch(() => false)
@@ -609,7 +718,11 @@ export async function acquirePersistenceLease(stateFilePath, options = {}) {
 }
 
 export const persistenceLeaseInternals = Object.freeze({
+  DEFAULT_HEARTBEAT_MS,
+  DEFAULT_STALE_AFTER_MS,
+  LEGACY_FOREIGN_HOST_STALE_MS,
   acquirePersistenceLeaseWithHooks,
+  claimIsStale,
   claimDirectoryPathFor,
   claimNameFor,
   inspectLegacyGuard,
