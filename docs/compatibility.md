@@ -34,11 +34,31 @@ or change that session's goal workflow. The contender keeps ordinary chat and
 unrelated tools available, but goal controls are denied and ambient hooks do not
 attempt a takeover. Canonical goal tools return the stable envelope code
 `session_owned_elsewhere`; a `/goal` slash command instead produces a
-human-readable denial through its normal model-rendered command turn. Once the
-owner exits, an explicit goal command or tool may acquire the shard; recovered
-active goals load paused and require an explicit resume. Forking creates a
-distinct session shard and remains the supported way to work concurrently from
-the same conversation.
+human-readable denial through its normal model-rendered command turn. Since
+1.3.0 an owner releases the lease once the session has been idle for
+`idleLeaseReleaseMs` (3 s by default). Idle means no active or queued goal,
+command turn, continuation, prompt, load, or hook/tool call is in flight for it.
+An explicit goal command or tool may then acquire the shard. The same is true
+once the owner exits. Recovered active goals load paused and require an
+explicit resume. Distinct sessions always run concurrently. Forking creates a
+distinct session shard and remains the supported way to run two goals at once
+from the same conversation.
+
+Since 1.3.0 every claim records a `heartbeatMs` and is touched on that interval
+(15 s by default). A heartbeating claim older than
+`max(leaseStaleAfterMs, 4 × heartbeatMs)` (120 s by default) is stale and can be
+reclaimed whatever its pid or host. That covers a crashed process, a reused pid,
+and a claim left on a shared filesystem by another machine. A claim without
+`heartbeatMs`, written by an older release, keeps the earlier rule: it is
+reclaimable when its local pid is dead, or when it comes from another host and
+is more than 24 hours old. An owner whose claim has been reclaimed or removed
+stops writing for that session immediately (no persist, ledger append, or goal
+prompt), logs a warning, and unloads the session. A host that sleeps longer than
+the stale window can therefore wake to find its session taken over. This is
+intended: the alternative is a session pinned forever by a frozen process. The
+claim layout and protocol version (`claims-v2`) are unchanged, so 1.2.x and
+1.3.x processes interoperate. A 1.2.x owner never idle-releases, though, so a
+1.3.x contender has to wait for that owner to exit.
 
 The immutable-claim lease protocol atomically hard-links a complete regular-file
 compatibility guard at `<shard>/state.json.lock`; active owners publish unique

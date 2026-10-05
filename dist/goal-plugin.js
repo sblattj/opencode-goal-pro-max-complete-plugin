@@ -14635,6 +14635,9 @@ var MAX_OWNER_FILE_BYTES = 4 * 1024;
 var MAX_OWNER_TOKEN_LENGTH = 256;
 var MAX_OWNER_HOSTNAME_LENGTH = 255;
 var MAX_ACQUIRE_ATTEMPTS = 5;
+var DEFAULT_HEARTBEAT_MS = 15000;
+var DEFAULT_STALE_AFTER_MS = 120000;
+var LEGACY_FOREIGN_HOST_STALE_MS = 24 * 60 * 60 * 1000;
 function validStoredHostname(value) {
   return typeof value === "string" && value.length >= 1 && value.length <= MAX_OWNER_HOSTNAME_LENGTH;
 }
@@ -14773,6 +14776,17 @@ function ownerIsBlocking(owner, localHostname) {
   if (owner.hostname !== localHostname)
     return true;
   return processIsAlive(owner.pid) !== false;
+}
+function claimIsStale(record2, localHostname, nowMs, staleAfterMs) {
+  const mtimeMs = record2.info?.mtimeMs;
+  if (!Number.isFinite(mtimeMs))
+    return false;
+  const age = nowMs - mtimeMs;
+  const heartbeatMs = record2.owner.heartbeatMs;
+  if (Number.isFinite(heartbeatMs) && heartbeatMs > 0) {
+    return age > Math.max(staleAfterMs, 4 * heartbeatMs);
+  }
+  return record2.owner.hostname !== localHostname && age > LEGACY_FOREIGN_HOST_STALE_MS;
 }
 function claimNameFor(token) {
   return `${CLAIM_PREFIX}${token}${CLAIM_SUFFIX}`;
@@ -14933,7 +14947,7 @@ async function removeUniqueClaim(claimPath) {
     throw error51;
   }
 }
-async function inspectClaims(lockPath, ownToken, localHostname, { malformedGraceMs, now }) {
+async function inspectClaims(lockPath, ownToken, localHostname, { malformedGraceMs, now, staleAfterMs = DEFAULT_STALE_AFTER_MS }) {
   const entries = await fs.readdir(lockPath, { withFileTypes: true });
   let ownFound = false;
   for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
@@ -14964,6 +14978,10 @@ async function inspectClaims(lockPath, ownToken, localHostname, { malformedGrace
       ownFound = true;
       continue;
     }
+    if (claimIsStale(record2, localHostname, now(), staleAfterMs)) {
+      await removeUniqueClaim(claimPath);
+      continue;
+    }
     if (ownerIsBlocking(record2.owner, localHostname)) {
       return { blocker: record2.owner, blocked: true, ownFound };
     }
@@ -14975,14 +14993,77 @@ function retryDelay(token, attempt) {
   const offset = Number.parseInt(token.slice(attempt * 2, attempt * 2 + 2), 16) || 0;
   return new Promise((resolve) => setTimeout(resolve, 1 + offset % 7));
 }
-function createLease(lockPath, claimDirectoryPath, claimPath, owner, { beforeClaimRemove } = {}) {
+function createLease(lockPath, claimDirectoryPath, claimPath, owner, { beforeClaimRemove, heartbeatMs = DEFAULT_HEARTBEAT_MS, onLost } = {}) {
   let releasing = false;
   let released = false;
+  let lost = false;
+  let timer = null;
+  let ticking = false;
+  function stopTimer() {
+    if (timer)
+      clearInterval(timer);
+    timer = null;
+  }
+  function markLost() {
+    if (lost || released)
+      return;
+    lost = true;
+    stopTimer();
+    try {
+      onLost?.(owner);
+    } catch {}
+  }
+  async function refresh() {
+    let claim;
+    try {
+      claim = await readOwnerRecord(claimPath);
+    } catch {
+      return null;
+    }
+    if (released || releasing)
+      return null;
+    if (claim.status === "missing" || claim.status !== "valid" || claim.owner.token !== owner.token) {
+      markLost();
+      return false;
+    }
+    try {
+      const at = new Date;
+      await fs.utimes(claimPath, at, at);
+    } catch (error51) {
+      if (error51?.code === "ENOENT") {
+        markLost();
+        return false;
+      }
+      return null;
+    }
+    return true;
+  }
+  if (Number.isFinite(heartbeatMs) && heartbeatMs > 0) {
+    timer = setInterval(() => {
+      if (ticking)
+        return;
+      ticking = true;
+      refresh().catch(() => {}).finally(() => {
+        ticking = false;
+      });
+    }, heartbeatMs);
+    timer.unref?.();
+  }
   return {
     lockPath,
     claimDirectoryPath,
     owner,
+    isHeld() {
+      return !released && !lost;
+    },
+    async verify() {
+      if (released || lost)
+        return false;
+      const result = await refresh();
+      return result === null ? !released && !lost : result;
+    },
     async release() {
+      stopTimer();
       if (released || releasing)
         return false;
       releasing = true;
@@ -15010,7 +15091,13 @@ function createLease(lockPath, claimDirectoryPath, claimPath, owner, { beforeCla
     }
   };
 }
-async function acquirePersistenceLeaseWithHooks(stateFilePath, { malformedGraceMs = 30000, now = () => Date.now() } = {}, hooks = {}) {
+async function acquirePersistenceLeaseWithHooks(stateFilePath, {
+  malformedGraceMs = 30000,
+  now = () => Date.now(),
+  heartbeatMs = DEFAULT_HEARTBEAT_MS,
+  staleAfterMs = DEFAULT_STALE_AFTER_MS,
+  onLost
+} = {}, hooks = {}) {
   const {
     beforeGuardLink,
     afterGuardLink,
@@ -15029,7 +15116,7 @@ async function acquirePersistenceLeaseWithHooks(stateFilePath, { malformedGraceM
     if (!await ensureClaimDirectory(claimDirectoryPath)) {
       continue;
     }
-    const existing = await inspectClaims(claimDirectoryPath, null, localHostname, { malformedGraceMs, now });
+    const existing = await inspectClaims(claimDirectoryPath, null, localHostname, { malformedGraceMs, now, staleAfterMs });
     if (existing.blocked)
       throw new PersistenceLeaseContendedError(existing.blocker);
     const owner = {
@@ -15037,7 +15124,8 @@ async function acquirePersistenceLeaseWithHooks(stateFilePath, { malformedGraceM
       token: randomUUID(),
       pid: process.pid,
       hostname: localHostname,
-      createdAt: Date.now()
+      createdAt: Date.now(),
+      heartbeatMs
     };
     const claimPath = join(claimDirectoryPath, claimNameFor(owner.token));
     let claimPublished = false;
@@ -15058,7 +15146,7 @@ async function acquirePersistenceLeaseWithHooks(stateFilePath, { malformedGraceM
         owner: { ...owner },
         attempt
       });
-      const observed = await inspectClaims(claimDirectoryPath, owner.token, localHostname, { malformedGraceMs, now });
+      const observed = await inspectClaims(claimDirectoryPath, owner.token, localHostname, { malformedGraceMs, now, staleAfterMs });
       if (!observed.ownFound || observed.blocked) {
         lastBlocker = observed.blocker;
         await removeUniqueClaim(claimPath);
@@ -15067,7 +15155,7 @@ async function acquirePersistenceLeaseWithHooks(stateFilePath, { malformedGraceM
         continue;
       }
       await ensureLegacyGuard(lockPath, { beforeGuardLink, afterGuardLink, linkGuard });
-      return createLease(lockPath, claimDirectoryPath, claimPath, owner, { beforeClaimRemove });
+      return createLease(lockPath, claimDirectoryPath, claimPath, owner, { beforeClaimRemove, heartbeatMs, onLost });
     } catch (error51) {
       if (claimPublished)
         await removeUniqueClaim(claimPath).catch(() => false);
@@ -15082,7 +15170,11 @@ async function acquirePersistenceLease(stateFilePath, options = {}) {
   return acquirePersistenceLeaseWithHooks(stateFilePath, options);
 }
 var persistenceLeaseInternals = Object.freeze({
+  DEFAULT_HEARTBEAT_MS,
+  DEFAULT_STALE_AFTER_MS,
+  LEGACY_FOREIGN_HOST_STALE_MS,
   acquirePersistenceLeaseWithHooks,
+  claimIsStale,
   claimDirectoryPathFor,
   claimNameFor,
   inspectLegacyGuard,
@@ -15630,6 +15722,7 @@ var MAX_LEDGER_LINE_BYTES = 16 * 1024;
 var MIGRATION_LEASE_RETRIES = 200;
 var MIGRATION_LEASE_DELAY_MS = 25;
 var PASSIVE_SESSION_RETRY_MS = 250;
+var DEFAULT_IDLE_LEASE_RELEASE_MS = 3000;
 var SESSION_OWNED_ELSEWHERE = "session_owned_elsewhere";
 var ACTIVE_PERSISTENCE_DISABLED = Object.freeze({ kind: "active", persistence: "disabled" });
 var ACTIVE_PERSISTENCE_OWNED = Object.freeze({ kind: "active", persistence: "owned" });
@@ -15685,6 +15778,10 @@ function createRuntimeState() {
     sessionPersistence: new Map,
     sessionLoadPromises: new Map,
     passiveSessions: new Map,
+    idleLeaseTimers: new Map,
+    sessionReleasePromises: new Map,
+    freshRecoveries: new Set,
+    sessionHookDepth: new Map,
     disposed: false
   };
 }
@@ -16862,6 +16959,9 @@ function normalizePersistenceOptions(options = {}, { env = process.env, cwd } = 
     ledgerFilePath,
     ledgerMaxBytes,
     ledgerRetentionFiles,
+    idleLeaseReleaseMs: options.idleLeaseReleaseMs === undefined ? DEFAULT_IDLE_LEASE_RELEASE_MS : toNonNegativeInteger(options.idleLeaseReleaseMs, DEFAULT_IDLE_LEASE_RELEASE_MS),
+    leaseHeartbeatMs: toPositiveInteger(options.leaseHeartbeatMs, undefined),
+    leaseStaleAfterMs: toPositiveInteger(options.leaseStaleAfterMs, undefined),
     projectRoot: cwd,
     enforceProjectBoundary: !hasExplicitLocation
   };
@@ -17033,6 +17133,7 @@ function deserializeGoal(goal) {
     lastCheckpoint: goal?.lastCheckpoint || null
   };
   if (!hydrated.stopped) {
+    currentRuntime().freshRecoveries.add(hydrated.sessionID);
     hydrated.stopped = true;
     hydrated.stopReason = "recovered after restart";
     hydrated.lastStatus = "Recovered persisted goal state. Review the goal status and resume it when ready.";
@@ -19015,7 +19116,7 @@ function sessionOwnedElsewhereMessage(commandName = "goal", commandRegistered = 
   if (reason === "legacy_lock") {
     return "Goal controls are unavailable because this session has an older or incomplete persistence lease. " + "No goal state was read or changed here. Ordinary chat remains available. " + "Close every OpenCode process using this session and upgrade them first. If the report persists, remove only the affected session shard's adjacent lease artifacts (`.lock` and `.lock.claims-v2`) or open a fork with `opencode --continue --fork`, " + `then retry ${retryTarget}.`;
   }
-  return "Goal controls are unavailable in this OpenCode instance because another process owns this session's goal workflow. " + "No goal state was read or changed here. Ordinary chat remains available. " + `Close the owning process or open a fork with \`opencode --continue --fork\`, then retry ${retryTarget}.`;
+  return "Goal controls are unavailable in this OpenCode instance because another process owns this session's goal workflow. " + "No goal state was read or changed here. Ordinary chat remains available. " + `The owner holds the session while it is driving or recently touched it, and an idle owner releases it within a few seconds, so retry ${retryTarget}; ` + "to work in parallel, open a fork with `opencode --continue --fork`.";
 }
 function inactiveGoalToolResult(loadResult, commandName = "goal", disposed = false, commandRegistered = true) {
   if (disposed || loadResult?.kind === "disposed") {
@@ -19776,8 +19877,113 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
     const persistence = runtime.sessionPersistence.get(sessionID);
     if (runtime.disposed || !persistence)
       return Promise.resolve(false);
-    persistence.persistChain = persistence.persistChain.catch(() => false).then(() => persistState(persistence, client, sessionID));
+    persistence.persistChain = persistence.persistChain.catch(() => false).then(async () => {
+      if (persistence.lease && !await persistence.lease.verify())
+        return false;
+      return persistState(persistence, client, sessionID);
+    }).then((written) => {
+      armIdleLeaseTimer(sessionID, persistence);
+      return written;
+    });
     return persistence.persistChain;
+  };
+  const sessionReleaseEligible = (sessionID) => {
+    const focused = goalStates.get(sessionID);
+    if (focused && !focused.stopped)
+      return false;
+    if (listSessionGoals(sessionID).some((goal) => !goal.stopped))
+      return false;
+    if (runtime.pendingCommandTurns.has(sessionID))
+      return false;
+    if (runtime.activeCommandTurns.has(sessionID))
+      return false;
+    if (activeContinues.has(sessionID))
+      return false;
+    if (runtime.promptInFlightSessions.has(sessionID))
+      return false;
+    if (runtime.sessionLoadPromises.has(sessionID))
+      return false;
+    if (runtime.sessionHookDepth.has(sessionID))
+      return false;
+    return true;
+  };
+  const clearIdleLeaseTimer = (sessionID) => {
+    const timer = runtime.idleLeaseTimers.get(sessionID);
+    if (timer)
+      clearTimeout(timer);
+    runtime.idleLeaseTimers.delete(sessionID);
+  };
+  const armIdleLeaseTimer = (sessionID, persistence) => {
+    if (runtime.disposed || !persistenceOptions.idleLeaseReleaseMs)
+      return;
+    if (runtime.sessionPersistence.get(sessionID) !== persistence)
+      return;
+    clearIdleLeaseTimer(sessionID);
+    const timer = setTimeout(bindRuntime(runtime, () => {
+      if (runtime.idleLeaseTimers.get(sessionID) !== timer)
+        return;
+      runtime.idleLeaseTimers.delete(sessionID);
+      return releaseIdleSession(sessionID, persistence);
+    }), persistenceOptions.idleLeaseReleaseMs);
+    timer.unref?.();
+    runtime.idleLeaseTimers.set(sessionID, timer);
+  };
+  const touchSession = (sessionID) => {
+    const persistence = runtime.sessionPersistence.get(sessionID);
+    if (!persistence)
+      return;
+    persistence.touchEpoch = (persistence.touchEpoch || 0) + 1;
+    armIdleLeaseTimer(sessionID, persistence);
+  };
+  const releaseIdleSession = async (sessionID, persistence) => {
+    if (runtime.disposed || runtime.sessionPersistence.get(sessionID) !== persistence)
+      return;
+    if (!sessionReleaseEligible(sessionID)) {
+      armIdleLeaseTimer(sessionID, persistence);
+      return;
+    }
+    const epoch = persistence.touchEpoch || 0;
+    const written = await persist(sessionID);
+    if (runtime.disposed || runtime.sessionPersistence.get(sessionID) !== persistence)
+      return;
+    if (!written || (persistence.touchEpoch || 0) !== epoch || !sessionReleaseEligible(sessionID)) {
+      armIdleLeaseTimer(sessionID, persistence);
+      return;
+    }
+    clearIdleLeaseTimer(sessionID);
+    runtime.sessionPersistence.delete(sessionID);
+    runtime.appliedTitles.delete(sessionID);
+    runtime.sidebarTerminals.delete(sessionID);
+    clearSessionRuntimeState(sessionID, { preserveExecutionContext: true });
+    const releasing = persistence.lease.release().catch(() => false);
+    runtime.sessionReleasePromises.set(sessionID, releasing);
+    try {
+      await releasing;
+    } finally {
+      if (runtime.sessionReleasePromises.get(sessionID) === releasing) {
+        runtime.sessionReleasePromises.delete(sessionID);
+      }
+    }
+  };
+  const handleLeaseLost = (sessionID, lease) => {
+    if (runtime.disposed)
+      return;
+    const persistence = runtime.sessionPersistence.get(sessionID);
+    if (!persistence || persistence.lease !== lease)
+      return;
+    clearIdleLeaseTimer(sessionID);
+    runtime.continuationControllers.get(sessionID)?.abort();
+    runtime.sessionPersistence.delete(sessionID);
+    clearSessionRuntimeState(sessionID, { preserveExecutionContext: true });
+    logPluginWarning(client, "Goal controls for this session moved to another process: this process's persistence lease was reclaimed as stale. Run a goal command again to retry.").catch(() => {});
+  };
+  const leaseStillHeldForPrompt = async (sessionID) => {
+    if (!persistenceOptions.persistState)
+      return true;
+    const persistence = runtime.sessionPersistence.get(sessionID);
+    if (!persistence?.lease)
+      return false;
+    return persistence.lease.verify();
   };
   const lifecycleMessagesEnabled = pluginOptions.lifecycleMessages !== false;
   const lifecycleMessenger = typeof pluginOptions.lifecycleMessenger === "function" ? pluginOptions.lifecycleMessenger : (sessionID, text) => defaultLifecycleMessenger(client, sessionID, text);
@@ -19832,7 +20038,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
     runtime.passiveSessions.set(sessionID, entry);
     if (!previous?.warned) {
       const owner = entry.owner?.pid && entry.owner?.hostname ? `pid ${entry.owner.pid} on ${entry.owner.hostname}` : "another process";
-      const warning = entry.reason === "legacy_lock" ? "Goal controls are passive for this session because its persistence lease is from an older release or is incomplete. Ordinary chat remains available. Close every OpenCode process using this session and upgrade them; if the report persists, remove only the affected session shard's adjacent lease artifacts (`.lock` and `.lock.claims-v2`) or fork the session before retrying goal controls." : `Goal controls are passive for this session because ${owner} owns its persistence lease. Ordinary chat remains available; close the owner or fork the session before retrying goal controls.`;
+      const warning = entry.reason === "legacy_lock" ? "Goal controls are passive for this session because its persistence lease is from an older release or is incomplete. Ordinary chat remains available. Close every OpenCode process using this session and upgrade them; if the report persists, remove only the affected session shard's adjacent lease artifacts (`.lock` and `.lock.claims-v2`) or fork the session before retrying goal controls." : `Goal controls are passive for this session because ${owner} holds its persistence lease while it is driving or recently touched the session. Ordinary chat remains available. An idle owner releases the lease within a few seconds, so retry the goal command; to work in parallel, fork the session (\`opencode --continue --fork\`).`;
       logPluginWarning(client, warning).catch(() => {});
     }
     return passiveLoadResult(entry);
@@ -19846,8 +20052,17 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
     const existingLoad = runtime.sessionLoadPromises.get(sessionID);
     if (existingLoad)
       return existingLoad;
-    if (runtime.sessionPersistence.has(sessionID))
+    const unloading = runtime.sessionReleasePromises.get(sessionID);
+    if (unloading) {
+      await unloading;
+      if (runtime.disposed)
+        return PLUGIN_DISPOSED;
+      return ensureSessionLoaded(sessionID, { retryPassive, executionContext, freshCommandBoundary });
+    }
+    if (runtime.sessionPersistence.has(sessionID)) {
+      touchSession(sessionID);
       return ACTIVE_PERSISTENCE_OWNED;
+    }
     const passive = runtime.passiveSessions.get(sessionID);
     pruneExpiredPendingCommandTurns(sessionID);
     const commandTurnInFlight = runtime.pendingCommandTurns.has(sessionID) || !freshCommandBoundary && runtime.activeCommandTurns.has(sessionID);
@@ -19862,13 +20077,18 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       });
       let lease;
       try {
-        lease = await acquirePersistenceLease(paths.stateFilePath);
+        lease = await acquirePersistenceLease(paths.stateFilePath, {
+          heartbeatMs: persistenceOptions.leaseHeartbeatMs,
+          staleAfterMs: persistenceOptions.leaseStaleAfterMs,
+          onLost: bindRuntime(runtime, () => handleLeaseLost(sessionID, lease))
+        });
       } catch (error51) {
         if (!isPersistenceLeaseContendedError(error51))
           throw error51;
         return enterPassiveSession(sessionID, error51);
       }
       const releaseDisposedSession = async () => {
+        clearIdleLeaseTimer(sessionID);
         runtime.sessionPersistence.delete(sessionID);
         await lease.release().catch(() => false);
         return PLUGIN_DISPOSED;
@@ -19883,6 +20103,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       };
       runtime.passiveSessions.delete(sessionID);
       runtime.sessionPersistence.set(sessionID, persistence);
+      runtime.freshRecoveries.delete(sessionID);
       try {
         await migrateLegacyState(persistenceOptions, client);
         if (runtime.disposed)
@@ -19894,7 +20115,8 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         if (status === "loaded" || status === "missing" || status === "reconstructed" || status === "reconciled-blocked")
           await persist(sessionID);
         const recoveredGoal = goalStates.get(sessionID);
-        if (recoveredGoal?.stopped && recoveredGoal.stopReason === "recovered after restart") {
+        const freshlyRecovered = runtime.freshRecoveries.delete(sessionID);
+        if (freshlyRecovered && recoveredGoal?.stopped && recoveredGoal.stopReason === "recovered after restart") {
           announceLifecycle(sessionID, `Goal recovered and paused. Run /${commandName} status, then /${commandName} resume when ready.`, {
             goal: recoveredGoal,
             transition: "recovered-paused",
@@ -19919,8 +20141,10 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         }
         if (runtime.disposed)
           return releaseDisposedSession();
+        touchSession(sessionID);
         return ACTIVE_PERSISTENCE_OWNED;
       } catch (error51) {
+        clearIdleLeaseTimer(sessionID);
         runtime.sessionPersistence.delete(sessionID);
         await lease.release().catch(() => false);
         throw error51;
@@ -19944,6 +20168,8 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
     setLedgerSink((entry) => {
       const persistence = runtime.sessionPersistence.get(entry.sessionID);
       if (!persistence)
+        return false;
+      if (!persistence.lease?.isHeld())
         return false;
       return appendLedgerLine(persistence.ledgerFilePath, entry, {
         maxBytes: persistence.ledgerMaxBytes,
@@ -21353,6 +21579,8 @@ ${completionHandback}` : "";
               expectedState: "paused",
               expectedStopReason: limitReason
             });
+            if (!await leaseStillHeldForPrompt(sessionID))
+              return;
             currentRuntime().promptInFlightSessions.add(sessionID);
             let response2;
             try {
@@ -21503,6 +21731,8 @@ ${completionHandback}` : "";
             return;
           }
         }
+        if (!await leaseStillHeldForPrompt(sessionID))
+          return;
         currentRuntime().promptInFlightSessions.add(sessionID);
         let response;
         try {
@@ -21708,6 +21938,35 @@ function bindRuntime(runtime, handler) {
     return runtimeStorage.run(runtime, () => handler(...args));
   };
 }
+function holdSessionDuring(runtime, sessionID, handler, args) {
+  if (typeof sessionID !== "string" || !sessionID)
+    return handler(...args);
+  const depth = runtime.sessionHookDepth;
+  depth.set(sessionID, (depth.get(sessionID) || 0) + 1);
+  const leave = () => {
+    const remaining = (depth.get(sessionID) || 1) - 1;
+    if (remaining > 0)
+      depth.set(sessionID, remaining);
+    else
+      depth.delete(sessionID);
+  };
+  try {
+    const result = handler(...args);
+    if (result && typeof result.then === "function") {
+      return Promise.resolve(result).finally(leave);
+    }
+    leave();
+    return result;
+  } catch (error51) {
+    leave();
+    throw error51;
+  }
+}
+function hookSessionID(name, args) {
+  if (name === "event")
+    return getSessionID(args[0]?.event);
+  return args[0]?.sessionID;
+}
 function bindHooksToRuntime(hooks, runtime) {
   const bound = {};
   for (const [name, value] of Object.entries(hooks)) {
@@ -21719,21 +21978,27 @@ function bindHooksToRuntime(hooks, runtime) {
           toolName,
           {
             ...definition,
-            execute: bindRuntime(runtime, definition.execute)
+            execute: bindRuntime(runtime, (...args) => holdSessionDuring(runtime, args[1]?.sessionID, definition.execute, args))
           }
         ];
       }));
       continue;
     }
-    bound[name] = typeof value === "function" ? bindRuntime(runtime, value) : value;
+    bound[name] = typeof value === "function" ? bindRuntime(runtime, (...args) => holdSessionDuring(runtime, hookSessionID(name, args), value, args)) : value;
   }
   bound.dispose = bindRuntime(runtime, async () => {
     if (runtime.disposed)
       return;
     runtime.disposed = true;
+    for (const timer of runtime.idleLeaseTimers.values())
+      clearTimeout(timer);
+    runtime.idleLeaseTimers.clear();
     for (const controller of runtime.continuationControllers.values())
       controller.abort();
-    await Promise.allSettled([...runtime.sessionLoadPromises.values()]);
+    await Promise.allSettled([
+      ...runtime.sessionLoadPromises.values(),
+      ...runtime.sessionReleasePromises.values()
+    ]);
     for (const persistence of runtime.sessionPersistence.values()) {
       await persistence.persistChain.catch(() => false);
     }
@@ -21756,7 +22021,13 @@ var GoalPlugin = async (context = {}, pluginOptions = {}) => {
       return bindHooksToRuntime(hooks, runtime);
     } catch (error51) {
       runtime.disposed = true;
-      await Promise.allSettled([...runtime.sessionLoadPromises.values()]);
+      for (const timer of runtime.idleLeaseTimers.values())
+        clearTimeout(timer);
+      runtime.idleLeaseTimers.clear();
+      await Promise.allSettled([
+        ...runtime.sessionLoadPromises.values(),
+        ...runtime.sessionReleasePromises.values()
+      ]);
       for (const persistence of runtime.sessionPersistence.values()) {
         await persistence.persistChain.catch(() => false);
         await persistence.lease?.release().catch(() => false);
@@ -21823,6 +22094,8 @@ var testInternals = {
   goalDisplayState,
   formatStatus,
   getSessionID,
+  holdSessionDuring,
+  hookSessionID,
   goalIsBlocked,
   goalIsComplete,
   isIdleEvent,

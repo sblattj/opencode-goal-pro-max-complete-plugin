@@ -10,12 +10,12 @@ A full install is **two entries in two different files**. `opencode.json`'s `plu
 
 Always write the spec in the **named form** `<package>@<source>`. A bare `github:owner/repo` or a bare tarball URL is accepted by the config and then silently never loads: OpenCode looks the installed package up by the name `npm-package-arg` parses out of the spec, a bare git or tarball spec has none, and the host falls back to the whole spec string as a directory name and throws *after* the files are on disk, with nothing logged.
 
-> **`v1.2.0` is the git tag; nothing is on npm.** `v1.2.0` is the current release, and it is what the specs below and the files in [`examples/`](../examples/) pin; `v1.0.0` was the first release cut under the name `opencode-goal-pro-max-complete-plugin`. The npm name is a different question: it is **unclaimed, not reserved** — `npm view opencode-goal-pro-max-complete-plugin` answers `E404`, and npm has no reservation mechanism short of publishing, so anyone could take the name before this project does. Do not trust a `<pkg>@npm` spec for this package: install from the git tag, from the local `file://` form below, or with the [installer](install.md), which uses the local form.
+> **`v1.3.0` is the git tag; nothing is on npm.** `v1.3.0` is the current release, and it is what the specs below and the files in [`examples/`](../examples/) pin; `v1.0.0` was the first release cut under the name `opencode-goal-pro-max-complete-plugin`. The npm name is a different question: it is **unclaimed, not reserved** — `npm view opencode-goal-pro-max-complete-plugin` answers `E404`, and npm has no reservation mechanism short of publishing, so anyone could take the name before this project does. Do not trust a `<pkg>@npm` spec for this package: install from the git tag, from the local `file://` form below, or with the [installer](install.md), which uses the local form.
 
 ```jsonc
 // opencode.json — the server half: commands, tools, hooks, sidebar payload
 {
-  "plugin": ["opencode-goal-pro-max-complete-plugin@github:sblattj/opencode-goal-pro-max-complete-plugin#v1.2.0"],
+  "plugin": ["opencode-goal-pro-max-complete-plugin@github:sblattj/opencode-goal-pro-max-complete-plugin#v1.3.0"],
   "command": {
     "goal": {
       "description": "Set a session-scoped goal and auto-continue until complete.",
@@ -28,13 +28,13 @@ Always write the spec in the **named form** `<package>@<source>`. A bare `github
 
 ```jsonc
 // tui.json, beside it — the TUI half: the sidebar panel
-{ "plugin": ["opencode-goal-pro-max-complete-plugin@github:sblattj/opencode-goal-pro-max-complete-plugin#v1.2.0"] }
+{ "plugin": ["opencode-goal-pro-max-complete-plugin@github:sblattj/opencode-goal-pro-max-complete-plugin#v1.3.0"] }
 ```
 
 Or let OpenCode write both entries:
 
 ```sh
-opencode plugin 'opencode-goal-pro-max-complete-plugin@github:sblattj/opencode-goal-pro-max-complete-plugin#v1.2.0' --global
+opencode plugin 'opencode-goal-pro-max-complete-plugin@github:sblattj/opencode-goal-pro-max-complete-plugin#v1.3.0' --global
 ```
 
 ### Spec forms
@@ -42,15 +42,15 @@ opencode plugin 'opencode-goal-pro-max-complete-plugin@github:sblattj/opencode-g
 Both of these name the package before the source, and both work:
 
 ```
-opencode-goal-pro-max-complete-plugin@github:sblattj/opencode-goal-pro-max-complete-plugin#v1.2.0
-opencode-goal-pro-max-complete-plugin@https://github.com/sblattj/opencode-goal-pro-max-complete-plugin/archive/refs/tags/v1.2.0.tar.gz
+opencode-goal-pro-max-complete-plugin@github:sblattj/opencode-goal-pro-max-complete-plugin#v1.3.0
+opencode-goal-pro-max-complete-plugin@https://github.com/sblattj/opencode-goal-pro-max-complete-plugin/archive/refs/tags/v1.3.0.tar.gz
 ```
 
 These do **not** work and fail *silently*, for the reason above:
 
 ```
-github:sblattj/opencode-goal-pro-max-complete-plugin#v1.2.0
-https://github.com/sblattj/opencode-goal-pro-max-complete-plugin/archive/refs/tags/v1.2.0.tar.gz
+github:sblattj/opencode-goal-pro-max-complete-plugin#v1.3.0
+https://github.com/sblattj/opencode-goal-pro-max-complete-plugin/archive/refs/tags/v1.3.0.tar.gz
 ```
 
 Pin a tag rather than tracking a branch, so an install is reproducible.
@@ -298,6 +298,8 @@ Pass options when registering the plugin to change the defaults for all goals.
 | `persistState` | `true` | `false` keeps purely in-memory behaviour and also disables the ledger |
 | `stateFilePath` | `.opencode/goals/state.json` | Root of the persisted shard namespace; overrides `OPENCODE_GOAL_STATE_PATH` |
 | `ledgerMaxBytes` / `ledgerRetentionFiles` | `2 MiB` / `3` | Retention `0` discards the active ledger at the size ceiling |
+| `idleLeaseReleaseMs` | `3000` | How long a session must stay idle (no active goal, turn, continuation, prompt, or running hook) before this process releases its lease so another process can take the session (see [State and persistence](#state-and-persistence)). `0` keeps every lease until the process exits, as releases before 1.3.0 did |
+| `leaseHeartbeatMs` / `leaseStaleAfterMs` | `15000` / `120000` | Lease heartbeat interval, and the age after which a claim that is not heartbeating counts as stale and can be reclaimed. The effective stale window is `max(leaseStaleAfterMs, 4 × leaseHeartbeatMs)` |
 | `resultRetentionMs` / `maxStoredResults` | 7 days / `200` | How long and how many completed-goal summaries stay reachable through `/goal status` |
 
 On approval a goal is archived as achieved; on **rejection** it is *not* archived — it pauses with stop reason `audit rejected` and the reason in its status, so you can address the gap and `/goal resume`. Audit **messages** are visibility only: enabling them does not turn on the auditor. The evidence gate always applies.
@@ -314,7 +316,11 @@ The state directory is owner-only and the JSON file is written `0600`, because i
 
 **Lifecycle ledger.** Alongside each shard is an append-only `state.json.ledger.jsonl` (also `0600`). Every lifecycle event — set, edit, auto-continue, pause, resume, blocked, completed, limit — is one JSON line. The in-memory history is capped, so the ledger is the durable record: if a state file is missing or corrupted, still-active goals are reconstructed from it at startup and reloaded **paused**, with a recovery note, so unattended auto-continue does not resume blindly. Terminal events are written to the ledger *before* the state write, so a terminal outcome survives a failed write (**fail-closed**); such a failure is logged at error level.
 
-**One writer per session shard.** If the same session is opened in a second process, that process enters **passive goal mode**: ordinary chat and unrelated tools keep working, but `/goal` commands and goal tools report that another process owns the workflow, and canonical tools return the stable envelope code `error: "session_owned_elsewhere"`. The passive process never reads, mutates, persists, or auto-continues that session's state, and never falls back to an unpersisted copy. After the owner exits, retry an explicit goal command; the process acquires the shard and loads any recovered goal paused. To work concurrently without waiting, fork: `opencode --continue --fork`.
+**One writer per session shard.** If the same session is opened in a second process, that process enters **passive goal mode**: ordinary chat and unrelated tools keep working, but `/goal` commands and goal tools report that another process owns the workflow, and canonical tools return the stable envelope code `error: "session_owned_elsewhere"`. The passive process never reads, mutates, persists, or auto-continues that session's state, and never falls back to an unpersisted copy.
+
+**An idle owner gives the session back.** A process holds a session's lease only while it is driving that session: an active (unpaused) goal or a queued one, a `/goal` turn, a continuation, a prompt, or a hook or tool call still running for that session. Once none of those is true for `idleLeaseReleaseMs` (3 s by default), the owner persists, drops its in-memory copy, and releases the lease. A goal-less session, or one whose goal is paused, stopped, or finished, therefore never pins the session to whichever process touched it first. Retry the goal command a few seconds later and the second process acquires the shard. If the owner comes back to that session, it reloads it from disk. Goals in *different* sessions never contend, because each session has its own shard. If you want two goals running at the same moment in one conversation, fork it: `opencode --continue --fork`.
+
+**A dead or frozen owner is reclaimed.** A live owner heartbeats its claim file every `leaseHeartbeatMs` (15 s). A claim whose heartbeat is older than `max(leaseStaleAfterMs, 4 × heartbeat)` (120 s by default) is stale, whatever its pid or host, and a contender may reclaim it. An owner that finds its claim gone or replaced stops writing at once. It does not persist, append to the ledger, or prompt for that session again, logs a warning, and unloads the session. One consequence: if a laptop sleeps for longer than the stale window, another process can take over a session from an owner that is still running. The sleeping process notices when it wakes and stands down.
 
 Ownership uses immutable per-process claim files, so a delayed stale-lock cleanup or a duplicate release cannot delete a newer owner's lease. A complete regular-file compatibility guard is published atomically at `<shard>/state.json.lock`, and the owner is elected from claims in the sibling `<shard>/state.json.lock.claims-v2/` directory. That no-replace publication makes startup safe against older releases: either the older lock directory wins and the current plugin stays passive, or the guard wins and the older release cannot reclaim it. Legacy, incomplete, tampered, or unsupported layouts fail closed rather than being rewritten online; the filesystem must support regular-file hard links and preserve the guard's future timestamp. The full protocol, including what each layout does on startup, is in [`compatibility.md`](compatibility.md#supported-package-surface).
 
@@ -522,7 +528,7 @@ If a goal does not continue:
 
 1. Check for a deliberate pause: user intervention, a hard limit, repeated tool-free or no-progress turns, prompt failures, or a rejected completion audit all stop unattended work by design.
 2. Run `/goal resume` only after resolving the reported reason. Resume creates a fresh local budget window; it does not erase the objective or history.
-3. If a goal control reports that another process owns the session, close that owner and retry, or fork. If it reports an older, incomplete, tampered, or unsupported lease, close and upgrade every process that could own the session first; if it persists, remove only the affected shard's adjacent `.lock` file or legacy directory **and** its `.lock.claims-v2` directory. Keep the state and ledger. Never point two copies of one session at different state paths — that creates divergent histories.
+3. If a goal control reports that another process owns the session, wait a few seconds and retry. An idle owner releases the lease within `idleLeaseReleaseMs`, but an owner running an active goal keeps it, so pause that goal there, or fork. If it reports an older, incomplete, tampered, or unsupported lease, close and upgrade every process that could own the session first; if it persists, remove only the affected shard's adjacent `.lock` file or legacy directory **and** its `.lock.claims-v2` directory. Keep the state and ledger. Never point two copies of one session at different state paths — that creates divergent histories.
 4. Check OpenCode's structured logs for persistence, SDK-shape, prompt, or auditor errors.
 5. Confirm the project directory and the state-path precedence above. A daemon started elsewhere makes a relative path surprising.
 6. From an install, run the shipped verifier — `npx opencode-goal-pro-max-complete-plugin verify`, or `npx -y github:sblattj/opencode-goal-pro-max-complete-plugin verify` without one; both delegate to the `npm run verify` script (`scripts/verify.mjs`). A bare invocation with no subcommand prints the usage and exits 0. Use it when diagnosing registration problems. The packaging contracts (`npm run smoke`, `npm run smoke:packed-host`, and the rest of the ladder) live in a git checkout only: `package.json` `files` ships `scripts/verify.mjs` and nothing else from `scripts/`, so running them inside `node_modules` fails with `MODULE_NOT_FOUND`.
@@ -553,7 +559,7 @@ npm run release:check        # the complete gate, in order (~3 min)
 
 Most of the commands above need a file this package's published tarball does not ship — a script under `scripts/` (only `cli.mjs`, `install.mjs`, and `verify.mjs` are published) or the `test/` directory (not published at all) — so, aside from `npm run verify` described above, this whole section is meant to run from a clone of the repository, never from an installed package.
 
-The two `smoke:todo-*` rungs are the only ones that need the `opencode` binary on `PATH` and a freshly bundled `dist/` (`npm run bundle`) — the installer copies `dist/`, so a stale bundle smokes the old code. Both are deliberately **not** in `release:check`, because the binary is not a dev dependency; their scratch roots are overridable with `SMOKE_TODO_MIRROR_DIR` and `SMOKE_TODO_SAFETY_DIR`.
+The two `smoke:todo-*` rungs and `smoke:multi-process` are the only ones that need the `opencode` binary on `PATH` and a freshly bundled `dist/` (`npm run bundle`) — the installer copies `dist/`, so a stale bundle smokes the old code. All three are deliberately **not** in `release:check`, because the binary is not a dev dependency; the todo rungs' scratch roots are overridable with `SMOKE_TODO_MIRROR_DIR` and `SMOKE_TODO_SAFETY_DIR`. `smoke:multi-process` runs two real `opencode serve` processes on one project and checks three things. Goals in distinct sessions run at the same time. A session left idle by one process is taken over by the other. A session with a running goal stays with its owner.
 
 Point OpenCode at your checkout for local testing with the package **directory**, not a file inside it. Keep test files outside OpenCode's auto-loaded plugin directory — it will try to load plugin-like files it finds there. See [`CONTRIBUTING.md`](../CONTRIBUTING.md) for the full contribution checklist, [`SECURITY.md`](../SECURITY.md) for vulnerability reporting, [`releasing.md`](releasing.md) for how a release is cut, and [`verification.md`](verification.md) for what each rung of the gate proves.
 
