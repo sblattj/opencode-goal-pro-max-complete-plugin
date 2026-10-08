@@ -50,6 +50,12 @@ function legacyHomeStateFilePath(env = process.env) {
 }
 const MAX_HISTORY_ENTRIES = 20
 const MAX_STALLED_COMPACTIONS = 2
+// A stall brake (no progress, no tool calls, stalled compactions, format or
+// prompt failures) past its threshold no longer pauses the goal: it nudges the
+// model and doubles the continuation cooldown per strike past the threshold,
+// up to 2^MAX_CONTINUATION_BACKOFF_EXPONENT x minDelayMs (96 s at the 1.5 s
+// default). Budget limits remain the backstop that ends a stuck run.
+const MAX_CONTINUATION_BACKOFF_EXPONENT = 6
 // Marks a plugin-synthesized parent wake so the receiving pass knows it is
 // re-examining an assistant turn that has already been scored.
 const CHILD_WAKE_EVENT_FLAG = Symbol.for("opencode-goal-plugin.childWake")
@@ -2056,6 +2062,8 @@ function normalizePersistedGoal(rawGoal) {
     stopReason: typeof rawGoal.stopReason === "string" ? rawGoal.stopReason : "",
     promptFailures: toNonNegativeInteger(rawGoal.promptFailures),
     formatFailures: toNonNegativeInteger(rawGoal.formatFailures),
+    pendingAuditRejection:
+      typeof rawGoal.pendingAuditRejection === "string" ? rawGoal.pendingAuditRejection.slice(0, 400) : "",
     compactionEpoch: toNonNegativeInteger(rawGoal.compactionEpoch),
     stalledCompactions: toNonNegativeInteger(rawGoal.stalledCompactions),
     lastCompactionEventID:
@@ -2910,6 +2918,33 @@ function sleep(ms, signal) {
   })
 }
 
+// How many strikes past its threshold the worst stall brake currently is
+// (0 = every brake is inside its grace window). Each counter already decays
+// on a productive turn, so the backoff heals without extra state.
+function continuationStallStrikes(goal) {
+  const options = goal.options || {}
+  const over = (count, threshold) =>
+    Number.isFinite(count) && Number.isFinite(threshold) && threshold > 0
+      ? Math.max(0, count - threshold + 1)
+      : 0
+  return Math.max(
+    over(goal.noProgressTurns, options.noProgressTurnsBeforePause),
+    over(goal.noToolCallTurns, options.noToolCallTurnsBeforePause),
+    over(goal.formatFailures, options.maxPromptFailures),
+    over(goal.promptFailures, options.maxPromptFailures),
+    over(goal.stalledCompactions, MAX_STALLED_COMPACTIONS),
+  )
+}
+
+// The idle-driven cooldown between continuations: minDelayMs while healthy,
+// doubled per stall strike past a threshold, capped.
+function continuationDelayMs(goal) {
+  const base = goal.options.minDelayMs
+  const strikes = continuationStallStrikes(goal)
+  if (strikes <= 0) return base
+  return base * 2 ** Math.min(strikes, MAX_CONTINUATION_BACKOFF_EXPONENT)
+}
+
 function buildLimitWarning(goal) {
   const unlimitedTurns = isUnlimitedTurnBudget(goal.options.maxTurns)
   const remainingTurns = goal.options.maxTurns - goal.turnCount
@@ -3022,6 +3057,9 @@ function buildContinueMessage(
     completionUnverified = false,
     blockerUnstated = false,
     completionRejection = "",
+    // A stall brake past its threshold: why the model is being nudged. Empty
+    // keeps the steady-state continuation byte-for-byte unchanged.
+    stallNudge = "",
     // v1.0.1 T19: the todo-mirror mode, so the continuation can carry the
     // staleness nudge (T14) when the mirror has drifted from the plan. Both
     // production call sites build-and-send in the same step (no preview/probe
@@ -3111,6 +3149,26 @@ function buildContinueMessage(
       "<evidence_required>",
       "Previous blocker was rejected: it was not concrete. State what user input is needed and why, immediately before `[goal:blocked]`; otherwise continue.",
       "</evidence_required>",
+    )
+  }
+
+  // Stall nudge: the goal is never paused for stalling, so the continuation
+  // itself has to break the loop. A stalled compaction loop is read straight
+  // from the goal so the post-compaction continuation carries it too.
+  const stallReasons = [stallNudge]
+  if (!budgetWrapup && toNonNegativeInteger(goal.stalledCompactions) >= MAX_STALLED_COMPACTIONS) {
+    stallReasons.push(
+      `${goal.stalledCompactions} context compactions happened without a productive turn.`,
+    )
+  }
+  const stallText = stallReasons.filter(Boolean).join(" ")
+  if (!budgetWrapup && stallText) {
+    lines.push(
+      "",
+      "<next_step>",
+      `Stalled: ${stallText}`,
+      "Re-plan in one or two sentences, then take ONE concrete tool-using step toward the goal now (run, read, edit, or test something). Do not restate the plan or summarize without acting. Only use [goal:blocked] for a concrete blocker that needs the user.",
+      "</next_step>",
     )
   }
 
@@ -4257,6 +4315,7 @@ function buildGoalState(sessionID, condition, options, meta = {}, lastStatus = "
     stopReason: "",
     promptFailures: 0,
     formatFailures: 0,
+    pendingAuditRejection: "",
     compactionEpoch: 0,
     stalledCompactions: 0,
     lastCompactionEventID: "",
@@ -4506,31 +4565,27 @@ function buildAgentToolHandlers({
           goal = auditedGoal
           if (!verdict || verdict.approved !== true) {
             const reason = (verdict && verdict.reason) || "completion not substantiated"
-            goal.stopped = true
-            goal.stopReason = "audit rejected"
-            goal.lastStatus = `Completion audit rejected: ${summarizeText(reason, 200)}. Address it, then run /${commandName} resume.`
+            // A rejected claim never pauses: the goal stays active, this tool
+            // result tells the model why, and the next continuation repeats it.
+            goal.pendingAuditRejection = summarizeText(reason, 400)
+            goal.lastStatus = `Completion audit rejected: ${summarizeText(reason, 200)}. Goal stays active; continuing with the audit feedback.`
             pushHistory(goal, "audit-rejected", `Agent tool completion audit rejected: ${summarizeText(reason, 300)}`)
             await persist(sessionID)
             const rejectedGoalAfterPersist = currentGoal(sessionID, auditedGoalID, auditedRunID)
-            if (
-              rejectedGoalAfterPersist !== goal ||
-              !goal.stopped ||
-              goal.stopReason !== "audit rejected"
-            ) {
+            if (rejectedGoalAfterPersist !== goal) {
               return "Completion audit was rejected, but the goal changed while that state was persisted; current state was left untouched."
             }
             if (auditMessagesEnabled) {
-              await announceAudit(sessionID, `Audit result: completion rejected — ${summarizeText(reason, 160)}.`)
+              await announceAudit(sessionID, `Audit result: completion rejected — ${summarizeText(reason, 160)}. Goal continues.`)
             } else {
-              announceLifecycle(sessionID, "Goal paused — completion audit rejected. Run status for details.", {
+              announceLifecycle(sessionID, "Completion audit rejected — goal continues with the audit feedback.", {
                 goal,
                 transition: "audit-rejected",
                 reason,
-                expectedState: "paused",
-                expectedStopReason: "audit rejected",
+                expectedState: goalDisplayState(goal),
               })
             }
-            return `Completion audit rejected: ${summarizeText(reason, 200)}. Goal paused; use /${commandName} resume after addressing the issue.`
+            return `Completion audit rejected: ${summarizeText(reason, 200)}. The goal stays active: address this feedback with real, verified work, then claim completion again.`
           }
         }
         goal.lastStatus = "Goal completed."
@@ -8127,20 +8182,17 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         currentRuntime().continuationControllers.delete(sessionID)
         activeContinues.delete(sessionID)
 
+        // A compaction loop no longer pauses or aborts the session: the goal
+        // stays active, the next continuation carries a stall nudge (read from
+        // stalledCompactions by buildContinueMessage) and the cooldown backs
+        // off per extra stalled compaction. Budget limits remain the backstop.
         if (goal.stalledCompactions >= MAX_STALLED_COMPACTIONS) {
-          await pauseActiveGoal(sessionID, {
-            stopReason: "stalled compaction",
-            status: `Goal paused after ${goal.stalledCompactions} compactions without a productive assistant or tool turn.`,
-            history: `Paused after ${goal.stalledCompactions} compactions without productive non-compaction work.`,
-          })
-          if (typeof client?.session?.abort === "function") {
-            try {
-              await sessionApi.abort(sessionID)
-            } catch (error) {
-              await logPluginError(client, "Failed to abort a stalled compaction loop", error)
-            }
-          }
-          return
+          goal.lastStatus = `${goal.stalledCompactions} compactions without a productive assistant or tool turn; continuing with a stall nudge and backoff.`
+          pushHistory(
+            goal,
+            "warning",
+            `Observed ${goal.stalledCompactions} compactions without productive non-compaction work; nudging the next continuation instead of pausing.`,
+          )
         }
         await persist(sessionID)
         return
@@ -8483,8 +8535,16 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         // Set when the rejection has a more specific cause than "no evidence
         // line" — currently an unsatisfied action plan.
         let completionRejection = ""
+        // Set when the independent completion auditor rejected the claim (this
+        // turn, or earlier through the tool path's pendingAuditRejection).
+        let auditRejected = false
+        // Set when a stall brake is past its threshold: the continuation
+        // carries a re-plan nudge instead of the goal pausing.
+        let stallNudge = ""
 
-        if (!terminalBoundary && goalIsComplete(turnText)) {
+        // Labelled so a rejected completion audit can leave the whole gate and
+        // fall through to the continuation that carries the audit feedback.
+        completionGate: if (!terminalBoundary && goalIsComplete(turnText)) {
           const evidence = extractCompletionEvidence(turnText)
           // Plan gate: a recorded action plan outranks a "done" message. The
           // goal completes only when every action is done with verdict=pass or
@@ -8513,7 +8573,8 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
             // it in memory and potentially in the persisted state.
             if (!activeGoal(sessionID, goalID, runID)) return
             // Optional independent auditor: an approved verdict
-            // archives; a rejected verdict restores (pauses) the goal instead.
+            // archives; a rejected verdict keeps the goal active and re-prompts
+            // with the auditor's reason.
             if (completionAuditor) {
               let verdict
               try {
@@ -8537,29 +8598,29 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
               }
               if (!verdict || verdict.approved !== true) {
                 const reason = (verdict && verdict.reason) || "completion not substantiated"
-                auditedGoal.stopped = true
-                auditedGoal.stopReason = "audit rejected"
-                auditedGoal.lastStatus = `Completion audit rejected: ${summarizeText(reason, 200)}. Address it, then run /${commandName} resume.`
+                // A rejected claim never pauses: the goal stays active and the
+                // next continuation carries the auditor's reason.
+                completionUnverified = true
+                auditRejected = true
+                completionRejection =
+                  `Previous completion was rejected by the completion audit: ${summarizeText(reason, 400)}. ` +
+                  "Address that feedback with real, verified work before claiming completion again."
+                auditedGoal.lastStatus = `Completion audit rejected: ${summarizeText(reason, 200)}. Goal stays active; continuing with the audit feedback.`
                 pushHistory(auditedGoal, "audit-rejected", `Completion audit rejected: ${summarizeText(reason, 300)}`)
                 await persist(sessionID)
-                const rejectedGoalAfterPersist = currentGoal(sessionID, goalID, runID)
-                if (
-                  rejectedGoalAfterPersist !== auditedGoal ||
-                  !auditedGoal.stopped ||
-                  auditedGoal.stopReason !== "audit rejected"
-                ) return
+                if (!activeGoal(sessionID, goalID, runID)) return
                 if (auditMessagesEnabled) {
-                  await announceAudit(sessionID, `Audit result: completion rejected — ${summarizeText(reason, 160)}.`)
+                  await announceAudit(sessionID, `Audit result: completion rejected — ${summarizeText(reason, 160)}. Goal continues.`)
                 } else {
-                  announceLifecycle(sessionID, "Goal paused — completion audit rejected. Run status for details.", {
+                  announceLifecycle(sessionID, "Completion audit rejected — goal continues with the audit feedback.", {
                     goal: auditedGoal,
                     transition: "audit-rejected",
                     reason,
-                    expectedState: "paused",
-                    expectedStopReason: "audit rejected",
+                    expectedState: "active",
                   })
                 }
-                return
+                if (!activeGoal(sessionID, goalID, runID)) return
+                break completionGate
               }
               pushHistory(
                 auditedGoal,
@@ -8870,40 +8931,26 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
             activeGoalAfterMessages.noProgressTurns >=
             activeGoalAfterMessages.options.noProgressTurnsBeforePause
           ) {
-            // Accumulate format-validation failures even when the stall gate fires
-            // first and returns early, so the formatFailures cap remains reachable
-            // for low-output unverified completions. Without this, a model that
-            // repeatedly emits bare [goal:complete] with low output tokens causes
-            // the stall gate to fire before formatFailures can accumulate, and
-            // /goal resume resets it to zero, making the cap permanently unreachable.
-            if (completionUnverified || blockerUnstated) {
-              activeGoalAfterMessages.formatFailures += 1
-            }
-            activeGoalAfterMessages.stopped = true
-            activeGoalAfterMessages.stopReason = "no progress"
-            activeGoalAfterMessages.lastStatus = `Goal auto-continue paused after ${activeGoalAfterMessages.noProgressTurns} low-progress turn(s); the latest turn produced ${turnOutputTokens} output token(s). Run /${commandName} resume to continue.`
+            // The goal is never paused for stalling: the counter keeps climbing
+            // (so the cooldown backs off, see continuationDelayMs) and the next
+            // continuation carries a re-plan nudge. Budget limits are the
+            // backstop. An unverified completion on this turn is counted once,
+            // on the normal format-validation path below.
+            stallNudge = `${activeGoalAfterMessages.noProgressTurns} consecutive low-progress turn(s) (latest: ${turnOutputTokens} output token(s), no tool call).`
+            activeGoalAfterMessages.lastStatus = `Low-progress threshold reached (${activeGoalAfterMessages.noProgressTurns}/${activeGoalAfterMessages.options.noProgressTurnsBeforePause}); continuing with a re-plan nudge and backoff.`
             pushHistory(
               activeGoalAfterMessages,
-              "paused",
-              `Paused after ${activeGoalAfterMessages.noProgressTurns} low-progress turn(s) below ${activeGoalAfterMessages.options.noProgressTokenThreshold} output tokens.`,
+              "warning",
+              `${activeGoalAfterMessages.noProgressTurns} low-progress turn(s) below ${activeGoalAfterMessages.options.noProgressTokenThreshold} output tokens; nudging the model instead of pausing.`,
             )
-            await persist(sessionID)
-            announceLifecycle(sessionID, "Goal paused — no progress threshold reached.", {
-              goal: activeGoalAfterMessages,
-              transition: "no-progress-paused",
-              reason: activeGoalAfterMessages.stopReason,
-              expectedState: "paused",
-              expectedStopReason: "no progress",
-            })
-            return
+          } else {
+            activeGoalAfterMessages.lastStatus = `Low-progress turn detected (${activeGoalAfterMessages.noProgressTurns}/${activeGoalAfterMessages.options.noProgressTurnsBeforePause}); monitoring for another stalled turn.`
+            pushHistory(
+              activeGoalAfterMessages,
+              "warning",
+              `Observed a low-progress turn below ${activeGoalAfterMessages.options.noProgressTokenThreshold} output tokens; grace count ${activeGoalAfterMessages.noProgressTurns}/${activeGoalAfterMessages.options.noProgressTurnsBeforePause}.`,
+            )
           }
-
-          activeGoalAfterMessages.lastStatus = `Low-progress turn detected (${activeGoalAfterMessages.noProgressTurns}/${activeGoalAfterMessages.options.noProgressTurnsBeforePause}); monitoring for another stalled turn before pausing.`
-          pushHistory(
-            activeGoalAfterMessages,
-            "warning",
-            `Observed a low-progress turn below ${activeGoalAfterMessages.options.noProgressTokenThreshold} output tokens; grace count ${activeGoalAfterMessages.noProgressTurns}/${activeGoalAfterMessages.options.noProgressTurnsBeforePause}.`,
-          )
         } else if (
           // A wake pass observes the same assistant turn the deferring pass
           // already scored, so it must neither charge nor clear the counter.
@@ -8939,43 +8986,57 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
             activeGoalAfterMessages.noToolCallTurns >=
             activeGoalAfterMessages.options.noToolCallTurnsBeforePause
           ) {
-            activeGoalAfterMessages.stopped = true
-            activeGoalAfterMessages.stopReason = "no tool calls"
-            activeGoalAfterMessages.lastStatus = `Goal auto-continue paused after ${activeGoalAfterMessages.noToolCallTurns} continuation turn(s) with no tool calls (possible self-chat loop). Run /${commandName} resume to continue.`
+            // Possible self-chat loop: never paused. Nudge toward one concrete
+            // tool-using step and back off (continuationDelayMs).
+            stallNudge = `${activeGoalAfterMessages.noToolCallTurns} consecutive continuation turn(s) without a tool call (possible self-chat loop).`
+            activeGoalAfterMessages.lastStatus = `No-tool-call threshold reached (${activeGoalAfterMessages.noToolCallTurns}/${activeGoalAfterMessages.options.noToolCallTurnsBeforePause}); continuing with a re-plan nudge and backoff.`
             pushHistory(
               activeGoalAfterMessages,
-              "paused",
-              `Paused after ${activeGoalAfterMessages.noToolCallTurns} continuation turn(s) that produced no tool calls.`,
+              "warning",
+              `${activeGoalAfterMessages.noToolCallTurns} continuation turn(s) produced no tool calls; nudging the model instead of pausing.`,
             )
-            await persist(sessionID)
-            announceLifecycle(sessionID, "Goal paused — no-tool-call threshold reached.", {
-              goal: activeGoalAfterMessages,
-              transition: "no-tool-calls-paused",
-              reason: activeGoalAfterMessages.stopReason,
-              expectedState: "paused",
-              expectedStopReason: "no tool calls",
-            })
-            return
+          } else {
+            activeGoalAfterMessages.lastStatus = `Continuation turn produced no tool calls (${activeGoalAfterMessages.noToolCallTurns}/${activeGoalAfterMessages.options.noToolCallTurnsBeforePause}); monitoring for another.`
+            pushHistory(
+              activeGoalAfterMessages,
+              "warning",
+              `Observed a continuation turn with no tool calls; grace count ${activeGoalAfterMessages.noToolCallTurns}/${activeGoalAfterMessages.options.noToolCallTurnsBeforePause}.`,
+            )
           }
-
-          activeGoalAfterMessages.lastStatus = `Continuation turn produced no tool calls (${activeGoalAfterMessages.noToolCallTurns}/${activeGoalAfterMessages.options.noToolCallTurnsBeforePause}); monitoring for another before pausing.`
-          pushHistory(
-            activeGoalAfterMessages,
-            "warning",
-            `Observed a continuation turn with no tool calls; grace count ${activeGoalAfterMessages.noToolCallTurns}/${activeGoalAfterMessages.options.noToolCallTurnsBeforePause}.`,
-          )
         } else if (turnHasToolCall || !latestAssistant) {
           activeGoalAfterMessages.noToolCallTurns = 0
         }
+        // A pass that did not charge the gates (a child-wake pass, or one that
+        // follows a deferred continuation) still owes the model the nudge while
+        // a counter sits at or past its threshold; otherwise a nudge computed on
+        // a deferred pass would be lost.
+        if (!stallNudge) {
+          const stallOptions = activeGoalAfterMessages.options
+          if (
+            stallOptions.noProgressTurnsBeforePause > 0 &&
+            activeGoalAfterMessages.noProgressTurns >= stallOptions.noProgressTurnsBeforePause
+          ) {
+            stallNudge = `${activeGoalAfterMessages.noProgressTurns} consecutive low-progress turn(s), no tool call.`
+          } else if (
+            stallOptions.noToolCallTurnsBeforePause > 0 &&
+            activeGoalAfterMessages.noToolCallTurns >= stallOptions.noToolCallTurnsBeforePause
+          ) {
+            stallNudge = `${activeGoalAfterMessages.noToolCallTurns} consecutive continuation turn(s) without a tool call (possible self-chat loop).`
+          }
+        }
 
         const elapsedSinceLastContinue = Date.now() - activeGoalAfterMessages.lastContinueAt
+        // minDelayMs while healthy; backed off exponentially while a stall
+        // brake is past its threshold, so a stuck model is never driven at
+        // full speed (the brakes nudge instead of pausing).
+        const continuationDelay = continuationDelayMs(activeGoalAfterMessages)
         let cooldownWaited = false
         if (
           activeGoalAfterMessages.lastContinueAt &&
-          elapsedSinceLastContinue < activeGoalAfterMessages.options.minDelayMs
+          elapsedSinceLastContinue < continuationDelay
         ) {
           const delayCompleted = await sleep(
-            activeGoalAfterMessages.options.minDelayMs - elapsedSinceLastContinue,
+            continuationDelay - elapsedSinceLastContinue,
             continueController.signal,
           )
           if (!delayCompleted) return
@@ -9020,9 +9081,23 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         activeGoalBeforePrompt.turnCount += 1
         activeGoalBeforePrompt.lastContinueAt = Date.now()
         if (!budgetWrapup) {
+          // A tool-path audit rejection rides the next continuation once, when
+          // this turn carries no more specific completion feedback of its own.
+          if (activeGoalBeforePrompt.pendingAuditRejection) {
+            if (!completionUnverified && !blockerUnstated) {
+              completionUnverified = true
+              auditRejected = true
+              completionRejection =
+                `Previous completion was rejected by the completion audit: ${activeGoalBeforePrompt.pendingAuditRejection}. ` +
+                "Address that feedback with real, verified work before claiming completion again."
+            }
+            activeGoalBeforePrompt.pendingAuditRejection = ""
+          }
           if (completionUnverified) {
             activeGoalBeforePrompt.formatFailures += 1
-            activeGoalBeforePrompt.lastStatus = completionRejection
+            activeGoalBeforePrompt.lastStatus = auditRejected
+              ? `Completion audit rejected; re-prompting with the audit feedback on turn ${activeGoalBeforePrompt.turnCount}.`
+              : completionRejection
               ? `Rejected a [goal:complete] against an unsatisfied action plan (${planStatusLabel(activeGoalBeforePrompt.plan)}); re-prompting on turn ${activeGoalBeforePrompt.turnCount}.`
               : `Rejected an unverified [goal:complete] (no [goal:evidence]); re-prompting for evidence on turn ${activeGoalBeforePrompt.turnCount}.`
           } else if (blockerUnstated) {
@@ -9037,34 +9112,24 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
               0,
               activeGoalBeforePrompt.formatFailures - 1,
             )
-            activeGoalBeforePrompt.lastStatus = turnText
+            activeGoalBeforePrompt.lastStatus = stallNudge
+              ? `Continuing with a stall nudge after turn ${activeGoalBeforePrompt.turnCount}.`
+              : turnText
               ? `Continuing after assistant turn ${activeGoalBeforePrompt.turnCount}.`
               : `Continuing after idle event ${activeGoalBeforePrompt.turnCount}.`
           }
 
-          // Pause after too many consecutive format-validation failures. Unlike
-          // promptFailures (which counts network/protocol errors), this counts turns
-          // where the model signalled completion or a blocker but omitted the required
-          // evidence or concrete-blocker line. The same maxPromptFailures cap applies;
-          // resume resets the counter via resetGoalBudget.
+          // Repeated format-validation failures (completion or blocker signalled
+          // without the required evidence or concrete-blocker line) no longer
+          // pause: the continuation keeps re-prompting for the right format, the
+          // cooldown backs off per failure past maxPromptFailures
+          // (continuationDelayMs), and budget limits remain the backstop.
           if (activeGoalBeforePrompt.formatFailures >= activeGoalBeforePrompt.options.maxPromptFailures) {
-            activeGoalBeforePrompt.stopped = true
-            activeGoalBeforePrompt.stopReason = "format validation failures"
-            activeGoalBeforePrompt.lastStatus = `Paused after ${activeGoalBeforePrompt.formatFailures} consecutive format-validation failure(s) (missing [goal:evidence] or concrete blocker). Run /${commandName} resume to retry.`
             pushHistory(
               activeGoalBeforePrompt,
-              "paused",
-              `Paused after ${activeGoalBeforePrompt.formatFailures} consecutive format-validation failure(s).`,
+              "warning",
+              `${activeGoalBeforePrompt.formatFailures} consecutive format-validation failure(s); re-prompting with backoff instead of pausing.`,
             )
-            await persist(sessionID)
-            announceLifecycle(sessionID, "Goal paused — repeated completion/blocker format failures.", {
-              goal: activeGoalBeforePrompt,
-              transition: "format-failures-paused",
-              reason: activeGoalBeforePrompt.stopReason,
-              expectedState: "paused",
-              expectedStopReason: "format validation failures",
-            })
-            return
           }
         }
 
@@ -9085,6 +9150,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
                     completionUnverified,
                     blockerUnstated,
                     completionRejection,
+                    stallNudge,
                     mirrorMode,
                   }),
                   sessionID,
@@ -9097,7 +9163,6 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           currentRuntime().promptInFlightSessions.delete(sessionID)
         }
 
-        let promptFailurePausedGoal = null
         if (response.error) {
           const activeGoalAfterPrompt = currentGoal(sessionID, goalID, runID)
           const message = `Auto-continue failed: ${response.error.name || "unknown error"}`
@@ -9111,11 +9176,11 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
             activeGoalAfterPrompt.promptFailures += 1
             activeGoalAfterPrompt.lastStatus = message
             pushHistory(activeGoalAfterPrompt, "error", message)
+            // Repeated prompt failures never pause: the claim was released
+            // above so the next idle retries, and continuationDelayMs backs the
+            // cooldown off exponentially per failure past maxPromptFailures.
             if (activeGoalAfterPrompt.promptFailures >= activeGoalAfterPrompt.options.maxPromptFailures) {
-              activeGoalAfterPrompt.stopped = true
-              activeGoalAfterPrompt.stopReason = "auto-continue failures"
-              activeGoalAfterPrompt.lastStatus = `${message}; paused after ${activeGoalAfterPrompt.promptFailures} failure(s). Run /${commandName} resume to retry.`
-              promptFailurePausedGoal = activeGoalAfterPrompt
+              activeGoalAfterPrompt.lastStatus = `${message}; ${activeGoalAfterPrompt.promptFailures} consecutive failure(s), retrying on the next idle with backoff.`
             }
           }
           await logPluginError(client, message, response.error)
@@ -9141,15 +9206,6 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           }
         }
         await persist(sessionID)
-        if (promptFailurePausedGoal) {
-          announceLifecycle(sessionID, "Goal paused — repeated auto-continue failures.", {
-            goal: promptFailurePausedGoal,
-            transition: "prompt-failures-paused",
-            reason: promptFailurePausedGoal.stopReason,
-            expectedState: "paused",
-            expectedStopReason: "auto-continue failures",
-          })
-        }
       } catch (error) {
         const activeGoalAfterError = currentGoal(sessionID, goalID, runID)
         if (activeGoalAfterError) {
@@ -9166,21 +9222,11 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           const message = `Auto-continue failed: ${error?.message || error}`
           activeGoalAfterError.lastStatus = message
           pushHistory(activeGoalAfterError, "error", message)
+          // Never paused for repeated failures; see the response.error branch.
           if (activeGoalAfterError.promptFailures >= activeGoalAfterError.options.maxPromptFailures) {
-            activeGoalAfterError.stopped = true
-            activeGoalAfterError.stopReason = "auto-continue failures"
-            activeGoalAfterError.lastStatus = `${message}; paused after ${activeGoalAfterError.promptFailures} failure(s). Run /${commandName} resume to retry.`
+            activeGoalAfterError.lastStatus = `${message}; ${activeGoalAfterError.promptFailures} consecutive failure(s), retrying on the next idle with backoff.`
           }
           await persist(sessionID)
-          if (activeGoalAfterError.stopped && activeGoalAfterError.stopReason === "auto-continue failures") {
-            announceLifecycle(sessionID, "Goal paused — repeated auto-continue failures.", {
-              goal: activeGoalAfterError,
-              transition: "prompt-failures-paused",
-              reason: activeGoalAfterError.stopReason,
-              expectedState: "paused",
-              expectedStopReason: "auto-continue failures",
-            })
-          }
         }
         await logPluginError(client, "Auto-continue failed", error)
       } finally {
