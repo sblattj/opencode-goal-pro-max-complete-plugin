@@ -747,6 +747,7 @@ test("control and handled-error results carry an escaped model-facing reporting 
     ["history", /No goal history/],
     ["list", /No goals yet/],
     ["pause", /No active goal/],
+    ["halt", /No active goal/],
     ["resume", /No active goal/],
     ["clear", /Goal cleared/],
     ["ship it --max-turns nope", /Goal flags could not be parsed/],
@@ -771,6 +772,7 @@ test("control and handled-error results carry an escaped model-facing reporting 
     ["edit", /No new objective provided/],
     ["focus", /Specify which goal to focus/],
     ["pause", /Goal paused: ship it/],
+    ["halt", /Goal is already paused/],
   ]) {
     assertControlFrame(await runRoutedCommand(hooks, sessionID, args), resultPattern)
   }
@@ -1540,18 +1542,22 @@ test("prompt builders stay within compact deterministic budgets", () => {
   // system block instead, which is re-injected on the same turn. +40 again in
   // 0.11.0 for the `context_remaining` line and the second limit warning, which
   // are the whole point of splitting spend from context pressure.
-  assert.ok(buildContinueMessage(goal).length <= 560)
-  assert.ok(buildContinueMessage(goal, { budgetWrapup: true }).length <= 680)
+  // +50 in the stop-policy change: the blocker line now says that blocking
+  // stops the whole goal and is only for input the user alone can give, so a
+  // model is deterred from stopping on every steering message.
+  assert.ok(buildContinueMessage(goal).length <= 610)
+  assert.ok(buildContinueMessage(goal, { budgetWrapup: true }).length <= 730)
   // v1.0.1 wave-3 integration: this fixture carries no `goal.mirror`/`goal.plan`,
   // so it would read "never mirrored" = stale if the mirror mode defaulted to
   // "plan". Every prompt builder that gained a `mirrorMode` option defaults it to
   // "off" instead, so this pre-existing, mirror-unrelated budget stays a check on
   // the core compaction context AND doubles as the control on that default.
-  assert.ok(buildCompactionContext(goal).length <= block.length + 650)
+  // +50 for the same blocker deterrence in the post-compaction instruction.
+  assert.ok(buildCompactionContext(goal).length <= block.length + 700)
   assert.ok(buildAuditPrompt(goal, "done").length <= block.length + 700)
 
   goal.lastCheckpoint = { summary: "a".repeat(10_000), timestamp: now }
-  assert.ok(buildCompactionContext(goal).length <= block.length + 900)
+  assert.ok(buildCompactionContext(goal).length <= block.length + 950)
 })
 
 test("blocked reason is extracted from line before marker", () => {
@@ -2239,7 +2245,7 @@ test("a goal stopped while deferred is not re-driven by its child's idle", async
   assert.equal(calls.length, 0, "a stopped goal must not be revived by a watched child")
 })
 
-for (const command of ["stop", "pause", "clear"]) {
+for (const command of ["stop", "pause", "halt", "clear"]) {
   test(`/goal ${command} still halts the loop with noInterruptOnUserMessage:true`, async () => {
     // This is the only escape hatch once human messages stop pausing the goal,
     // so it is the option's safety valve and must not regress.
@@ -8480,14 +8486,38 @@ test("repeated pause without a state transition emits one lifecycle notice", asy
   assert.match(await runGoal(hooks, sessionID, "pause"), /already paused/)
   assert.equal(lifecycle.filter((text) => /Goal paused/i.test(text)).length, 1)
 
+  // `/goal halt` is the same resumable pause, with the same single notice.
   await runGoal(hooks, sessionID, "resume")
   lifecycle.length = 0
-  const first = JSON.parse(await hooks.tool.goal_pause.execute({}, { sessionID }))
-  const second = JSON.parse(await hooks.tool.goal_pause.execute({}, { sessionID }))
-  assert.equal(first.ok, true)
-  assert.equal(second.ok, true)
-  assert.match(second.message, /already paused/)
+  assert.match(await runGoal(hooks, sessionID, "halt"), /Goal paused/)
+  assert.match(await runGoal(hooks, sessionID, "halt"), /already paused/)
   assert.equal(lifecycle.filter((text) => /Goal paused/i.test(text)).length, 1)
+  assert.equal(currentGoal(sessionID).stopReason, "paused")
+})
+
+test("/goal halt pauses like /goal pause and /goal resume restarts it; the model cannot pause", async () => {
+  const { hooks } = await createHooks()
+  const sessionID = "goal-halt-command"
+
+  await runGoal(hooks, sessionID, "ship it")
+  const running = await runGoal(hooks, sessionID, "status")
+  assert.match(running, /Suggested action: none needed; the goal keeps running\. Run \/goal halt to pause it/)
+
+  assert.match(await runGoal(hooks, sessionID, "halt"), /Goal paused: ship it/)
+  assert.equal(currentGoal(sessionID).stopped, true)
+  assert.equal(currentGoal(sessionID).stopReason, "paused")
+  assert.match(await runGoal(hooks, sessionID, "status"), /Suggested action: run \/goal resume to continue/)
+
+  assert.match(await runGoal(hooks, sessionID, "resume"), /Goal resumed/)
+  assert.equal(currentGoal(sessionID).stopped, false)
+
+  // Control: the model has no pause tool, and the legacy status path refuses.
+  assert.equal(hooks.tool.goal_pause, undefined)
+  assert.match(
+    await hooks.tool.update_goal.execute({ status: "paused" }, { sessionID }),
+    /^Pausing is user-only \(\/goal halt\)\./,
+  )
+  assert.equal(currentGoal(sessionID).stopped, false)
 })
 
 test("consecutive objective edits each emit lifecycle feedback", async () => {
@@ -9074,7 +9104,6 @@ test("GoalPlugin registers every goal tool by default without an external helper
     "goal_action_update",
     "goal_block",
     "goal_complete",
-    "goal_pause",
     "goal_plan_get",
     "goal_plan_set",
     "goal_resume",
@@ -9404,8 +9433,12 @@ test("agent tool handlers set, read, update, and clear a goal", async () => {
   assert.match(await handlers.updateGoal(sid, { objective: "ship it well" }), /Objective updated/)
   assert.equal(currentGoal(sid).condition, "ship it well")
 
-  assert.match(await handlers.updateGoal(sid, { status: "paused" }), /paused/i)
-  assert.equal(currentGoal(sid).stopped, true)
+  // Pausing is user-only: the agent path refuses it and the goal keeps running.
+  assert.equal(await handlers.updateGoal(sid, { status: "paused" }), "Pausing is user-only (/goal halt). If you are hard-blocked on user input, use goal_block with the concrete blocker; otherwise keep working.")
+  assert.equal(currentGoal(sid).stopped, false)
+  // A pause the USER made (/goal halt) can still be resumed when the user asks.
+  currentGoal(sid).stopped = true
+  currentGoal(sid).stopReason = "paused"
   assert.match(await handlers.updateGoal(sid, { status: "resumed" }), /resumed/i)
   assert.equal(currentGoal(sid).stopped, false)
 
@@ -9424,14 +9457,15 @@ test("agent tool handlers emit the same lifecycle transitions as slash commands"
 
   await handlers.setGoal(sid, { objective: "private agent objective" })
   await handlers.updateGoal(sid, { objective: "revised private agent objective" })
+  // Refused (user-only), so it emits no lifecycle transition.
   await handlers.updateGoal(sid, { status: "paused" })
-  await handlers.updateGoal(sid, { status: "resumed" })
   await handlers.updateGoal(sid, { status: "blocked", blocker: "private deployment key missing" })
+  await handlers.updateGoal(sid, { status: "resumed" })
   await handlers.clearGoal(sid)
 
   assert.deepEqual(
     lifecycle.map(({ text }) => text.match(/Goal (?:active|updated|paused|resumed|blocked|cleared)/i)?.[0]),
-    ["Goal active", "Goal updated", "Goal paused", "Goal resumed", "Goal blocked", "Goal cleared"],
+    ["Goal active", "Goal updated", "Goal blocked", "Goal resumed", "Goal cleared"],
   )
   assert.ok(lifecycle.every(({ sessionID }) => sessionID === sid))
   assert.ok(lifecycle.every(({ text }) => !text.includes("private")))
@@ -9504,7 +9538,6 @@ test("buildAgentTools wraps handlers into OpenCode tool defs and routes by sessi
     "goal_action_update",
     "goal_block",
     "goal_complete",
-    "goal_pause",
     "goal_plan_get",
     "goal_plan_set",
     "goal_resume",
@@ -9513,6 +9546,8 @@ test("buildAgentTools wraps handlers into OpenCode tool defs and routes by sessi
     "set_goal",
     "update_goal",
   ])
+  // Pausing is user-only (/goal halt): no model tool can pause a goal.
+  assert.equal(tools.goal_pause, undefined)
   // The set_goal description constrains autonomous use.
   assert.match(tools.set_goal.description, /ONLY call this when the user explicitly asks/)
 
@@ -9545,9 +9580,8 @@ test("canonical goal tools return versioned JSON envelopes and preserve focused 
     message: "New active goal: ship compact tools",
   })
   assert.match((await call("goal_status")).message, /Active goal: ship compact tools/)
-  assert.equal((await call("goal_pause")).ok, true)
-  assert.equal(currentGoal(ctx.sessionID).stopped, true)
-  assert.equal((await call("goal_resume")).ok, true)
+  assert.equal(tools.goal_pause, undefined, "pausing is user-only")
+  assert.equal((await call("goal_resume")).ok, false, "a running goal is not resumed")
   assert.equal(currentGoal(ctx.sessionID).stopped, false)
   assert.equal((await call("goal_block", { blocker: "need user credentials" })).ok, true)
   assert.equal(currentGoal(ctx.sessionID).stopReason, "blocked")
@@ -9696,11 +9730,20 @@ test("canonical errors use state and stable codes instead of parsing legacy pros
   const tools = buildAgentTools(toolHelper, handlers)
   const context = { sessionID: "typed-canonical-errors" }
 
-  const absent = JSON.parse(await tools.goal_pause.execute({}, context))
+  const absent = JSON.parse(await tools.goal_resume.execute({}, context))
   assert.equal(absent.error, "no_active_goal")
   assert.equal(await tools.update_goal.execute({ status: "paused" }, context), "No active goal to update. Use set_goal first.")
 
   await tools.goal_set.execute({ objective: "verify typed failures" }, context)
+  // Pausing is user-only, on every agent spelling, and changes nothing.
+  for (const status of ["paused", "pause", "halt", " Paused "]) {
+    assert.equal(
+      await tools.update_goal.execute({ status, objective: "rewritten by a pause attempt" }, context),
+      "Pausing is user-only (/goal halt). If you are hard-blocked on user input, use goal_block with the concrete blocker; otherwise keep working.",
+    )
+  }
+  assert.equal(currentGoal(context.sessionID).stopped, false)
+  assert.equal(currentGoal(context.sessionID).condition, "verify typed failures")
   const running = JSON.parse(await tools.goal_resume.execute({}, context))
   assert.equal(running.error, "already_running")
   const rejected = JSON.parse(await tools.goal_complete.execute({ summary: "claimed done" }, context))
@@ -11218,7 +11261,8 @@ test("agent updateGoal status='resumed' preserves identity and clears cleanly", 
   assert.equal(listSessionGoals(sid).length, 1)
   const goalId = currentGoal(sid).goalId
 
-  await handlers.updateGoal(sid, { status: "paused" })
+  // The user paused it (/goal halt); the agent may resume when asked to.
+  Object.assign(currentGoal(sid), { stopped: true, stopReason: "paused" })
   await handlers.updateGoal(sid, { status: "resumed" })
   assert.equal(listSessionGoals(sid).length, 1, "registry must have exactly one entry after resume")
   assert.equal(currentGoal(sid).goalId, goalId)
@@ -14207,7 +14251,8 @@ test("a NON-EMPTY todowrite is left alone when the goal is stopped", async () =>
   const hooks = await t10Hooks(sessionID, [{ id: "a1", title: "Ship the mirror" }])
   const { handlers } = makeAgentHandlers()
 
-  await handlers.updateGoal(sessionID, { status: "paused" })
+  // A user pause (/goal halt); the agent cannot pause a goal itself.
+  Object.assign(currentGoal(sessionID), { stopped: true, stopReason: "paused" })
   assert.equal(currentGoal(sessionID).stopped, true)
 
   const todos = [t10Row("native item")]
@@ -14500,7 +14545,8 @@ test("an empty todowrite in a stopped-goal session re-emits the last mirrored ro
   goal.mirror.rows = seedArgs.todos.map((row) => ({ ...row }))
   goal.mirror.at = T11_STAMPED_AT
 
-  await handlers.updateGoal(sessionID, { status: "paused" })
+  // A user pause (/goal halt); the agent cannot pause a goal itself.
+  Object.assign(currentGoal(sessionID), { stopped: true, stopReason: "paused" })
   assert.equal(currentGoal(sessionID).stopped, true)
 
   const { args, todos } = await t11EmptyCall(hooks, sessionID, "t11-stopped-empty-call")

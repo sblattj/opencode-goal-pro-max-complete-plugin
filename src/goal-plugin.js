@@ -304,7 +304,21 @@ const seenOutputTokens = runtimeCollection("seenOutputTokens")
 // unconditionally delete the new handler's guard, exposing a race window.
 const activeContinues = runtimeCollection("activeContinues")
 const CLEAR_COMMANDS = new Set(["clear", "stop", "off", "reset", "none", "cancel"])
-const PAUSE_COMMANDS = new Set(["pause"])
+// `halt` is the user's explicit stop for an unattended goal; it is the same
+// resumable pause as `pause` (`/goal resume` restarts it). Neither is a model
+// tool: only the user can pause a goal.
+const PAUSE_COMMANDS = new Set(["pause", "halt"])
+// One deterrence text for every place the model is told about blocking, so the
+// sites cannot drift. Blocking is the model's only way to stop a goal, and a
+// stopped goal needs the user to come back, so it is reserved for a hard block.
+const GOAL_BLOCK_DETERRENCE =
+  "Blocking stops the whole goal until the user comes back. Use it ONLY when no further progress is possible without input only the user can give (a credential, an irreversible decision, a physical action). A human message mid-goal is steering, not a reason to block or stop; record an open question in a checkpoint and keep working on other steps."
+// The continuation prompt is size-budgeted, so it carries the short form.
+const GOAL_BLOCK_CONTINUATION_LINE =
+  "Hard-blocked on input only the user can give? State it, then [goal:blocked]; that stops the goal. Otherwise keep working."
+// Returned when the agent tries to pause: pausing is user-only.
+const AGENT_PAUSE_REFUSAL = (commandName) =>
+  `Pausing is user-only (/${commandName} halt). If you are hard-blocked on user input, use goal_block with the concrete blocker; otherwise keep working.`
 // `sequence` is canonical. The former public spelling remains accepted at
 // the parser boundary so existing scripts do not break.
 const SEQUENCE_COMMANDS = ["sequence", "sisyphus"]
@@ -392,7 +406,6 @@ function messageHasToolCall(message) {
 const PLUGIN_TOOL_NAMES = new Set([
   "goal_status",
   "goal_set",
-  "goal_pause",
   "goal_resume",
   "goal_block",
   "goal_complete",
@@ -1276,6 +1289,11 @@ function formatStatus(
   if (goal.stopped) {
     lines.push(
       `Suggested action: ${goal.stopReason === "blocked" ? `address the blocker, then run /${commandName} resume` : `run /${commandName} resume to continue, or /${commandName} clear to discard`}`,
+    )
+  } else {
+    // Only the user stops a running goal; say how, so nobody has to guess.
+    lines.push(
+      `Suggested action: none needed; the goal keeps running. Run /${commandName} halt to pause it (/${commandName} resume restarts it), or /${commandName} clear to discard it.`,
     )
   }
   return lines.join("\n")
@@ -3208,7 +3226,7 @@ function buildContinueMessage(
     "Completion format—consecutive plain lines; no Markdown/backticks/blank line:",
     "[goal:evidence] <proof>",
     "[goal:complete]",
-    "Need user input? State why before [goal:blocked].",
+    GOAL_BLOCK_CONTINUATION_LINE,
   )
   const limitWarning = buildLimitWarning(goal)
   if (limitWarning) lines.push(limitWarning.trim())
@@ -3227,7 +3245,7 @@ function buildContinueMessage(
     lines.push(
       "",
       "<evidence_required>",
-      "Previous blocker was rejected: it was not concrete. State what user input is needed and why, immediately before `[goal:blocked]`; otherwise continue.",
+      "Previous blocker was rejected: it was not concrete. Keep working. Block only if no progress is possible without input only the user can give, and state exactly what it is immediately before `[goal:blocked]`.",
       "</evidence_required>",
     )
   }
@@ -3325,7 +3343,7 @@ function buildCompactionContext(goal, { mirrorMode = "off" } = {}) {
       ? ["<goal_plan>", formatPlanForPrompt(goal.plan), `progress: ${planStatusLabel(goal.plan)}`, "</goal_plan>"]
       : []),
     mirrorState(goal, mirrorMode) === "stale" ? MIRROR_COMPACTION_STALE_LINE : null,
-    "After compaction, continue from the next concrete unfinished step while the goal is active. Verify the result against the goal objective before ending; output [goal:complete] (preceded by a [goal:evidence] line) only when fully satisfied, or [goal:blocked] (preceded by a concrete blocker) only if user input is required.",
+    "After compaction, continue from the next concrete unfinished step while the goal is active. Verify the result against the goal objective before ending; output [goal:complete] (preceded by a [goal:evidence] line) only when fully satisfied, or [goal:blocked] (preceded by a concrete blocker) only if no further progress is possible without input only the user can give; blocking stops the whole goal.",
   ]
     .filter(Boolean)
     .join("\n")
@@ -4450,7 +4468,10 @@ function buildGoalState(sessionID, condition, options, meta = {}, lastStatus = "
   }
 }
 
-const AGENT_UPDATE_STATUSES = new Set(["complete", "blocked", "paused", "resumed"])
+// "paused" is deliberately absent: only the user pauses a goal (/goal halt or
+// /goal pause). updateGoal answers it with AGENT_PAUSE_REFUSAL.
+const AGENT_UPDATE_STATUSES = new Set(["complete", "blocked", "resumed"])
+const AGENT_PAUSE_STATUSES = new Set(["paused", "pause", "halt", "halted"])
 const AGENT_COMPLETE_SUCCESS = "Goal marked complete and archived."
 const AGENT_BLOCK_SUCCESS = "Goal marked blocked."
 
@@ -4582,6 +4603,12 @@ function buildAgentToolHandlers({
     let goal = goalStates.get(sessionID)
     if (!goal) return "No active goal to update. Use set_goal first."
 
+    // Pausing is user-only. Refuse before any other field is applied, so a
+    // combined objective+pause call changes nothing.
+    if (AGENT_PAUSE_STATUSES.has(String(args.status ?? "").trim().toLowerCase())) {
+      return AGENT_PAUSE_REFUSAL(commandName)
+    }
+
     // Reject the combination of an objective update with status='complete': the
     // completion would be archived under a condition that was never executed,
     // falsifying the audit trail. Require two separate calls.
@@ -4630,7 +4657,7 @@ function buildAgentToolHandlers({
     if (args.status !== undefined) {
       const status = String(args.status).trim().toLowerCase()
       if (!AGENT_UPDATE_STATUSES.has(status)) {
-        return `Invalid status: ${args.status} (expected complete, blocked, paused, or resumed).`
+        return `Invalid status: ${args.status} (expected complete, blocked, or resumed).`
       }
       if (status === "complete") {
         const evidence = typeof args.evidence === "string" ? args.evidence.trim() : ""
@@ -4845,24 +4872,6 @@ function buildAgentToolHandlers({
           })
         }
         return messages.join(" ")
-      } else if (status === "paused") {
-        if (goal.stopped && goal.stopReason === "paused") {
-          if (!messages.length) return "Goal is already paused."
-          messages.push("Goal is already paused.")
-        } else {
-          goal.stopped = true
-          goal.stopReason = "paused"
-          goal.lastStatus = "Goal paused."
-          pushHistory(goal, "paused", "Paused via agent tool.")
-          messages.push("Goal paused.")
-          lifecycleNotice = {
-            text: "Goal paused.",
-            transition: "paused",
-            reason: goal.stopReason,
-            expectedState: "paused",
-            expectedStopReason: "paused",
-          }
-        }
       } else if (status === "resumed") {
         if (!goal.stopped)
           return "Goal is already running. Pause or stop it first if you want to reset the budget window."
@@ -5178,6 +5187,9 @@ function buildAgentTools(
     update: async (sessionID, args) => {
       const before = currentGoal(sessionID)
       if (!before) return goalToolFailure("no_active_goal", "No active goal for this session.")
+      if (AGENT_PAUSE_STATUSES.has(String(args.status ?? "").trim().toLowerCase())) {
+        return goalToolFailure("pause_user_only", AGENT_PAUSE_REFUSAL(commandName))
+      }
       if (args.status === "blocked" && (typeof args.blocker !== "string" || !args.blocker.trim())) {
         return goalToolFailure("missing_blocker", "A non-empty blocker is required.")
       }
@@ -5232,18 +5244,14 @@ function buildAgentTools(
       },
       execute: canonicalRun("set", canonicalHandlers.set),
     }),
-    goal_pause: toolHelper({
-      description: "Pause the current goal without discarding its state.",
-      args: {},
-      execute: canonicalRun("pause", (sessionID) => canonicalHandlers.update(sessionID, { status: "paused" })),
-    }),
     goal_resume: toolHelper({
-      description: "Resume a stopped goal with a fresh local budget window.",
+      description:
+        "Resume a stopped goal with a fresh local budget window. Call only when the user explicitly asks to resume the goal; never resume a goal the user halted on your own.",
       args: {},
       execute: canonicalRun("resume", (sessionID) => canonicalHandlers.update(sessionID, { status: "resumed" })),
     }),
     goal_block: toolHelper({
-      description: "Stop the current goal as blocked and state the concrete external requirement.",
+      description: `Stop the current goal as blocked and state the concrete input only the user can give. ${GOAL_BLOCK_DETERRENCE}`,
       args: { blocker: schema.string() },
       execute: canonicalRun("block", (sessionID, args) =>
         canonicalHandlers.update(sessionID, { status: "blocked", blocker: args.blocker }),
@@ -5346,7 +5354,8 @@ function buildAgentTools(
     }),
     update_goal: toolHelper({
       description:
-        "Update the current goal: revise its `objective`, and/or set its `status` to complete, blocked, paused, or resumed. Mark complete only after verifying the objective is truly done; include `evidence` (for complete) or `blocker` (for blocked).",
+        "Update the current goal: revise its `objective`, and/or set its `status` to complete, blocked, or resumed. Mark complete only after verifying the objective is truly done; include `evidence` (for complete) or `blocker` (for blocked). Pausing is user-only (/goal halt). " +
+        GOAL_BLOCK_DETERRENCE,
       args: {
         objective: schema.string().optional(),
         status: schema.string().optional(),
@@ -8278,7 +8287,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
             : [
                 "Start working toward this goal now.",
                 "When the goal is fully satisfied, summarize your evidence on a line starting with `[goal:evidence]`, then end your response with `[goal:complete]`. A `[goal:complete]` without a `[goal:evidence]` line is rejected and not recorded.",
-                "If you are truly blocked and need the user, state the concrete blocker on the line immediately before `[goal:blocked]`.",
+                `If you are hard-blocked, state the concrete blocker on the line immediately before \`[goal:blocked]\`. ${GOAL_BLOCK_DETERRENCE}`,
               ]),
           `Use \`/${commandName} history\` to inspect recent lifecycle events and checkpoints.`,
           "",
@@ -9573,7 +9582,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
             ...buildPlanSystemLines(goal, { mirrorMode }),
             "Keep working until the goal is fully satisfied.",
             "When fully satisfied, put a `[goal:evidence]` line summarizing what you verified immediately before `[goal:complete]`. A `[goal:complete]` without evidence is rejected.",
-            "If user input is required, explain the concrete blocker in the line immediately before `[goal:blocked]`. A `[goal:blocked]` without a concrete blocker is rejected.",
+            `If you are hard-blocked, explain the concrete blocker in the line immediately before \`[goal:blocked]\`. A \`[goal:blocked]\` without a concrete blocker is rejected. ${GOAL_BLOCK_DETERRENCE}`,
             "</opencode_goal_plugin>",
           ].join("\n")
 

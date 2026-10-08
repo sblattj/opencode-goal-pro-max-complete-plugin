@@ -126,7 +126,7 @@ Every flag below is a key of `GOAL_FLAG_SPECS` in `src/goal-plugin.js` (17 keys,
 | `/goal sequence a; b; c` | Strict queue: one objective at a time, auto-promoting on completion (alias `sisyphus`) |
 | `/goal edit <objective>` | Revise the objective in place, preserving budget and history and clearing pause/blocked state. Deliberately does **not** parse flags — the rest of the line is the new objective, verbatim |
 | `/goal history` | Lifecycle history and the latest checkpoint |
-| `/goal pause` | Pause without clearing |
+| `/goal halt` or `/goal pause` | Stop the loop without clearing it; `/goal resume` restarts it. This is the user's stop: the model has no pause tool (see [When a goal stops](#when-a-goal-stops)) |
 | `/goal resume` | Continue with a fresh local budget window |
 | `/goal clear` | Clear live goals and saved status (aliases `stop`, `off`, `reset`, `none`, `cancel`) |
 
@@ -158,21 +158,22 @@ The deploy step needs a production API token I don't have.
 - `[goal:complete]` is **only** honoured when the immediately adjacent line begins with `[goal:evidence]` and carries a non-empty summary of what was verified. A stale or non-adjacent evidence marker is rejected. The accepted evidence shows in `/goal status`.
 - `[goal:blocked]` is **only** honoured when the line immediately before it states a concrete blocker.
 - An unsubstantiated claim is not a stop: the plugin rejects it and re-prompts for the missing evidence or blocker.
+- `[goal:blocked]` stops the **whole goal** until the user comes back, so the model is told to use it **only** when no further progress is possible without input only the user can give: a credential, an irreversible decision, a physical action. A human message mid-goal is steering, not a reason to block; an open question belongs in a checkpoint while other work continues.
 - Markers must be on their own final line. The bracketed form is canonical; bare `goal:complete` / `goal:blocked` / `goal:evidence` are also accepted, because some models omit brackets. Natural-language phrases like "goal complete" are intentionally ignored.
 
 A marker is read from the turn's last **text-bearing** step, not its last message — see [the one live-session measurement](verification.md#one-live-session-measurement).
 
 ### Agent tools
 
-The same workflow is registered as callable model tools (`registerTools: false` to omit them). A clean tarball install exposes **14**, verified by `npm run smoke:packed-tools`:
+The same workflow is registered as callable model tools (`registerTools: false` to omit them). A clean tarball install exposes **13**, verified by `npm run smoke:packed-tools`:
 
 | Group | Tools |
 |---|---|
-| Canonical | `goal_status`, `goal_set`, `goal_pause`, `goal_resume`, `goal_block`, `goal_complete` — compact versioned JSON envelopes, so an agent can branch without parsing prose |
+| Canonical | `goal_status`, `goal_set`, `goal_resume`, `goal_block`, `goal_complete` — compact versioned JSON envelopes, so an agent can branch without parsing prose |
 | Plan | `goal_plan_set`, `goal_action_update`, `goal_plan_get` |
 | Compatibility aliases | `get_goal`, `get_goal_history`, `set_goal`, `update_goal`, `clear_goal` — unchanged text responses |
 
-`goal_set` / `set_goal` are constrained to user-requested goals. `goal_complete` takes a structured claim: a required non-empty `summary`, plus optional criterion/evidence pairs, checks (`passed`/`failed`/`not-run`), changed files, and known limitations; failed checks and empty criterion evidence are rejected before archival. Tools and the command path drive the same per-session multi-goal state.
+There is **no pause tool**: pausing is user-only (`/goal halt`), and `update_goal` with `status: "paused"` is refused with `Pausing is user-only (/goal halt). If you are hard-blocked on user input, use goal_block with the concrete blocker; otherwise keep working.` `goal_resume` stays, because resuming loses nothing and the user may ask the model to do it; its description limits it to an explicit user request. `goal_block` requires a concrete blocker and carries the same deterrence text as the markers above. `goal_set` / `set_goal` are constrained to user-requested goals. `goal_complete` takes a structured claim: a required non-empty `summary`, plus optional criterion/evidence pairs, checks (`passed`/`failed`/`not-run`), changed files, and known limitations; failed checks and empty criterion evidence are rejected before archival. Tools and the command path drive the same per-session multi-goal state.
 
 The plugin's **own** `goal_*` calls do not count as a turn's work — otherwise a model could hold the anti-self-chat brake off forever by calling `goal_plan_set` every turn. A host-namespaced spelling behind a non-alphanumeric separator (`…_goal_status`, `mcp.goal_plan_set`) counts too; `upgoal_set` and `goal_plan_setter` do not.
 
@@ -203,6 +204,34 @@ The plan and its rule are injected compactly into every auto-continue turn:
 
 ---
 
+## When a goal stops
+
+A goal runs until **you** stop it, it finishes, it runs out of budget, or the model is genuinely blocked. Nothing else stops it. This is the only list:
+
+| Stops the goal | Stop reason | How it restarts |
+|---|---|---|
+| You run `/goal halt` or `/goal pause` | `paused` | `/goal resume` |
+| You run `/goal clear` (or `stop`, `off`, `reset`, `none`, `cancel`) | the goal is discarded | set a new one |
+| A budget limit: the 80% wrap-up, or a 100% turn, clock, spend, or context ceiling | `budget wrap-up requested`, `max turns reached (n)`, `max duration reached (…)`, `max tokens reached (…)`, `context window reached (…)` | `/goal resume` (fresh budget window) |
+| Completion: an evidenced `[goal:complete]` or an accepted `goal_complete` | archived as achieved | — |
+| A **concrete** model block: `[goal:blocked]` after a stated blocker, or `goal_block` with one | `blocked` | address the blocker, then `/goal resume` |
+| A persistence-integrity fence: a terminal state or a continuation claim could not be written durably | `terminal persistence failed`, `continuation claim persistence failed` | fix the storage problem, then `/goal resume` |
+| Another goal takes focus, or this one is later in a `/goal sequence` | `backgrounded`, `queued` | `/goal focus <n>`; queued goals promote on their own |
+
+Everything else is recorded in `/goal status` and `/goal history` and the goal **keeps running** on the normal idle-driven auto-continue, with its existing cooldown and backoff:
+
+- a human message mid-goal (it steers the next continuation; it never pauses the goal)
+- a compaction, including one that stalls
+- an aborted turn, a provider or host error, a rejected permission request, an attachment-read error
+- a process restart or a goal recovered from the ledger
+- a planning-only agent such as `plan` (auto-continue waits while it is active and picks up again once an executing agent is back)
+- stalled turns: no progress, or no tool calls
+- a rejected completion audit, and repeated format failures on completion or blocker markers
+
+The model cannot pause a goal. It can only block one, and it is told that blocking stops the whole goal and needs you to come back, so it should block only when no further progress is possible without input only you can give.
+
+---
+
 ## Budget and brakes
 
 These are the 0.11.0 defaults, every one of them a field of `DEFAULT_OPTIONS` in `src/goal-plugin.js`.
@@ -214,14 +243,14 @@ These are the 0.11.0 defaults, every one of them a field of `DEFAULT_OPTIONS` in
 | Token spend | 100,000,000 cumulative tokens | `147k/100m` |
 | Context window | the model's own window, learned from the host; **no ceiling** if the host cannot say | `147k/200k ctx`, or the stat is dropped |
 | Min delay between continues | 1,500 ms | — |
-| No-progress pause | 2 consecutive stalled turns under 50 output tokens | — |
-| Talk-only pause | 10 consecutive tool-free continuation turns | — |
+| No-progress detection | 2 consecutive stalled turns under 50 output tokens; recorded, the goal keeps running | — |
+| Talk-only detection | 10 consecutive tool-free continuation turns; recorded, the goal keeps running | — |
 | Wrap-up threshold | 80% of spend, context, or clock — whichever arrives first (6.4 h of 8 h) | — |
-| Auto-continue failure pause | 3 consecutive prompt failures | — |
+| Auto-continue failure detection | 3 consecutive prompt failures; recorded, the goal keeps running with backoff | — |
 
 **Unlimited is `0`, not `Infinity`.** These options round-trip through persisted JSON, and `JSON.stringify(Infinity)` is the literal `null` — an unlimited goal written as `Infinity` would reload indistinguishable from a missing field and be handed a bounded default.
 
-**What actually brakes a default run.** With unlimited turns and an 8-hour clock, neither the turn counter nor (usually) the spend budget is the brake. Two cheaper pauses come first: the **talk-only pause** (ten consecutive tool-free continuation turns) and the **no-progress pause** (two consecutive stalled turns under 50 output tokens). Both judge the **whole turn** and both are **skipped for any turn that calls a tool anywhere in it**. So they catch a loop that has stopped *doing* anything, and they do **not** catch a loop that keeps working uselessly. For that run the binding brakes are the 8-hour window, the 100,000,000-token spend budget, and the model's own context window.
+**What actually brakes a default run.** With unlimited turns and an 8-hour clock, neither the turn counter nor (usually) the spend budget is the brake, and the stall detectors do not stop the goal either. The **talk-only** detector (ten consecutive tool-free continuation turns) and the **no-progress** detector (two consecutive stalled turns under 50 output tokens) record what stalled and keep the loop going. Both judge the **whole turn** and both are **skipped for any turn that calls a tool anywhere in it**. The binding brakes are the 8-hour window, the 100,000,000-token spend budget, and the model's own context window, plus `/goal halt` whenever you want to stop.
 
 **Wrap-up pauses the goal, so 80% is the real ceiling.** At `budgetWrapupRatio` of whichever of the three reachable budgets arrives first, the plugin sends one handoff prompt asking for a summary of what is done, what remains, and the next concrete step — and pauses. `/goal resume` restarts the spend and peak-context counters from zero. The 100% stop reasons (`max tokens reached`, `context window reached`, `max duration reached`) fire only when one turn crosses from below 80% straight past 100%.
 
@@ -275,10 +304,10 @@ Pass options when registering the plugin to change the defaults for all goals.
 | Option | Default | Notes |
 |---|---|---|
 | `maxRecentMessages` | `200` | The **visibility window**: how many recent messages are fetched to reconstruct the latest turn. A narrow window can slice off a long turn's tool-bearing head and leave only its text-only summary visible — the same false reading by another route. The host answers any limit with the same two queries, so a wider window costs rows, not round trips; omitting the limit is worse still, since the host then pages the whole session |
-| `noProgressTurnsBeforePause` | `2` | Grace window for low-output stalls; tokens are summed across the whole turn |
-| `noToolCallTurnsBeforePause` | `10` | Grace window for tool-free turns. Set the **plugin option** to `0` to disable the brake for legitimate writing/research workflows; `--no-tool-turns 0` is rejected as invalid |
+| `noProgressTurnsBeforePause` | `2` | Grace window for low-output stalls; tokens are summed across the whole turn. Reaching it records the stall; it no longer pauses the goal (the name is historical) |
+| `noToolCallTurnsBeforePause` | `10` | Grace window for tool-free turns. Reaching it records the stall; it no longer pauses the goal. Set the **plugin option** to `0` to disable the detector for legitimate writing/research workflows; `--no-tool-turns 0` is rejected as invalid |
 | `warnTurnsRemaining` / `warnDurationMsRemaining` / `warnTokensRemaining` | `3` / `600000` / `25000` | Thresholds for the "limits are near" warning. `warnTokensRemaining` is applied to both token ceilings. Under the shipped defaults the **turn** warning is silent, because an unlimited budget has nothing to run out of; the context warning is silent while no context ceiling is known |
-| `noInterruptOnUserMessage` | `true` | A new human message steers the next continuation instead of pausing the goal — `/goal pause` and `/goal stop` are the way to halt it. Set `false` to pause with `stopReason: "user intervention"` on any human message |
+| `noInterruptOnUserMessage` | `true` | **Deprecated; accepted but ignored.** A human message always steers the next continuation and never pauses the goal. `false` no longer pauses with `user intervention`. Stop a goal with `/goal halt` (resumable) or `/goal clear` |
 | `noContinueWhileChildrenActive` | `false` | When `true`, auto-continue is deferred while the session has active children (subagents, background tasks). Adds a `children` and a `status` call per idle. **Fails open** for hosts that cannot report children/status, for sessions with more concurrent children than can be tracked, and for children running goals of their own. Every deferral is reported in `/goal status` and the history, so a waiting goal is not mistaken for a hung one |
 | `commandName` | `goal` | The slash command the plugin owns; a leading slash is tolerated. Register the matching name in your OpenCode `command` config |
 | `registerCommand` | `true` | Set `false` to drive the workflow programmatically with no slash command |
@@ -291,7 +320,7 @@ Pass options when registering the plugin to change the defaults for all goals.
 | `mirrorTodos` | `plan` | Draw the session's native Todo list from the goal plan (see [Todo mirror](#todo-mirror)). `"off"` restores pre-1.0.1 behaviour exactly: every mirror hook returns before touching anything, every prompt surface that mentions the mirror is silent, and both plan tools' descriptions and `todowrite`'s own description are the stock text |
 | `completionAudit` | `false` | Spawn an independent OpenCode child session to verify a completion; it replies `[audit:approved]` or `[audit:rejected]` with a reason |
 | `auditor` | — | `async ({ goal, sessionID, latestText }) => ({ approved, reason })`; takes precedence over `completionAudit` |
-| `auditorOptions` | `{ timeoutMs: 120000, failurePolicy: "reject" }` | Ignored when a custom `auditor` is supplied. `failurePolicy: "reject"` means an unavailable API, missing child-session ID, provider error, or timeout **rejects** and pauses the goal. `"approve"` is an explicit escape hatch; a genuinely negative or malformed verdict still rejects |
+| `auditorOptions` | `{ timeoutMs: 120000, failurePolicy: "reject" }` | Ignored when a custom `auditor` is supplied. `failurePolicy: "reject"` means an unavailable API, missing child-session ID, provider error, or timeout **rejects** the claim; the goal is not archived and keeps running. `"approve"` is an explicit escape hatch; a genuinely negative or malformed verdict still rejects |
 | `auditMessages` / `lifecycleMessages` | `true` / `true` | Separate controls. Audit messages describe completion/block validation; lifecycle notices describe applied state transitions. When `auditMessages` is on it owns the terminal announcement; when off and lifecycle is on, the lifecycle channel emits one terminal fallback |
 | `auditMessenger` / `lifecycleMessenger` | — | `(sessionID, text)`; route notices somewhere other than the structured log and TUI toast |
 | `sdkShape` | `legacy` | Session-client argument shape: `legacy` (`{ path, body, query }`) or `flat` (`{ sessionID, … }`). Read-only calls may probe the alternate shape after an argument/schema `TypeError`; mutating calls are never replayed |
@@ -302,7 +331,7 @@ Pass options when registering the plugin to change the defaults for all goals.
 | `leaseHeartbeatMs` / `leaseStaleAfterMs` | `15000` / `120000` | Lease heartbeat interval, and the age after which a claim that is not heartbeating counts as stale and can be reclaimed. The effective stale window is `max(leaseStaleAfterMs, 4 × leaseHeartbeatMs)` |
 | `resultRetentionMs` / `maxStoredResults` | 7 days / `200` | How long and how many completed-goal summaries stay reachable through `/goal status` |
 
-On approval a goal is archived as achieved; on **rejection** it is *not* archived — it pauses with stop reason `audit rejected` and the reason in its status, so you can address the gap and `/goal resume`. Audit **messages** are visibility only: enabling them does not turn on the auditor. The evidence gate always applies.
+On approval a goal is archived as achieved; on **rejection** it is *not* archived — the reason is recorded in its status and history and the goal keeps running, so the next continuation can close the gap. Audit **messages** are visibility only: enabling them does not turn on the auditor. The evidence gate always applies.
 
 ---
 
@@ -314,7 +343,7 @@ Resolution precedence: the `stateFilePath` option → the `OPENCODE_GOAL_STATE_P
 
 The state directory is owner-only and the JSON file is written `0600`, because it may contain goal text, assistant checkpoints, and workflow history.
 
-**Lifecycle ledger.** Alongside each shard is an append-only `state.json.ledger.jsonl` (also `0600`). Every lifecycle event — set, edit, auto-continue, pause, resume, blocked, completed, limit — is one JSON line. The in-memory history is capped, so the ledger is the durable record: if a state file is missing or corrupted, still-active goals are reconstructed from it at startup and reloaded **paused**, with a recovery note, so unattended auto-continue does not resume blindly. Terminal events are written to the ledger *before* the state write, so a terminal outcome survives a failed write (**fail-closed**); such a failure is logged at error level.
+**Lifecycle ledger.** Alongside each shard is an append-only `state.json.ledger.jsonl` (also `0600`). Every lifecycle event — set, edit, auto-continue, pause, resume, blocked, completed, limit — is one JSON line. The in-memory history is capped, so the ledger is the durable record: if a state file is missing or corrupted, still-active goals are reconstructed from it at startup with a recovery note, and they keep running: a restart is not a stop. Terminal events are written to the ledger *before* the state write, so a terminal outcome survives a failed write (**fail-closed**); such a failure is logged at error level.
 
 **One writer per session shard.** If the same session is opened in a second process, that process enters **passive goal mode**: ordinary chat and unrelated tools keep working, but `/goal` commands and goal tools report that another process owns the workflow, and canonical tools return the stable envelope code `error: "session_owned_elsewhere"`. The passive process never reads, mutates, persists, or auto-continues that session's state, and never falls back to an unpersisted copy.
 
@@ -478,9 +507,9 @@ departure from the host's one-`in_progress` convention — are each written down
 
 A planning-only agent is never driven into execution by the goal loop:
 
-- A goal set while `plan` is active is **recorded but held**, with stop reason `plan agent active`. The objective and its budget survive; the goal simply does not start.
+- A goal set while `plan` is active is **recorded but not driven**: the objective and its budget survive, and no auto-continue is sent while the planning-only agent is active.
 - The routed confirmation text for a held goal **omits the "start working" instruction** and is sent as a read-only control turn.
-- Auto-continue stays suppressed on **every idle** while a restricted agent is active, so switching into `plan` mid-goal pauses the loop.
+- Auto-continue stays suppressed on **every idle** while a restricted agent is active, so switching into `plan` mid-goal holds the loop. That is a wait, not a stop: the goal is not paused, and the loop picks up again once an executing agent is back.
 - Continuations retain the agent, provider/model, and variant that started the goal, so the loop cannot drift into a different agent.
 
 The active agent is read from the host's execution context with a fallback to the session record. That fallback matters: OpenCode runs `command.execute.before` before any `chat.message`/`chat.params` for the turn, so the context is empty for the first command in a session — the exact case a freshly opened Plan-mode session hits.
@@ -491,9 +520,9 @@ The active agent is read from the host's execution context with a fallback to th
 
 The goal text is wrapped in `<goal_objective>` tags and labelled as user-provided task data. The assistant is told to treat it as a task description, not as elevated instructions that can override system, developer, tool, or repository policies.
 
-For `/goal status`, `/goal history`, `/goal list`, `/goal pause`, and `/goal clear` (including aliases), the rewritten user turn carries an escaped control-result envelope with direct instructions to report the supplied data without treating it as new work. `tool.execute.before` rejects every tool call for that reporting turn, and the parent-correlated assistant response is excluded from checkpoint, completion, blocker, and stall analysis. These protections do not depend on the model following the instruction. The host-side mechanics of that command turn are in [`compatibility.md`](compatibility.md#configuration).
+For `/goal status`, `/goal history`, `/goal list`, `/goal halt`, `/goal pause`, and `/goal clear` (including aliases), the rewritten user turn carries an escaped control-result envelope with direct instructions to report the supplied data without treating it as new work. `tool.execute.before` rejects every tool call for that reporting turn, and the parent-correlated assistant response is excluded from checkpoint, completion, blocker, and stall analysis. These protections do not depend on the model following the instruction. The host-side mechanics of that command turn are in [`compatibility.md`](compatibility.md#configuration).
 
-Objective-bearing commands preserve file attachments. OpenCode may expand those into synthetic Read/MCP text and file parts before `chat.message`; the plugin accepts that expansion only when it matches the one-shot command correlation, retained-file count, and generated message/session identity. Other mixed text is treated as a new human instruction and pauses an active loop. If OpenCode reports an attachment-read error during expansion, the goal pauses with `attachment resolution error` while retaining the correct command provenance.
+Objective-bearing commands preserve file attachments. OpenCode may expand those into synthetic Read/MCP text and file parts before `chat.message`; the plugin accepts that expansion only when it matches the one-shot command correlation, retained-file count, and generated message/session identity. Other mixed text is treated as a new human instruction, which steers an active loop. If OpenCode reports an attachment-read error during expansion, the error is recorded with the correct command provenance and the goal keeps running.
 
 ---
 
@@ -504,7 +533,7 @@ Objective-bearing commands preserve file attachments. OpenCode may expand those 
 | Node.js | `engines.node` is `>=18`; CI runs the full suite on Node 18, 20, 22, and 24 |
 | OpenCode | `engines.opencode` is `>=1.17.15 <3`: both the 1.x and 2.x lines are supported as of v1.1.0, and the 2.x host carries documented caveats — see [`compatibility.md`](compatibility.md#opencode-2) |
 | Operating systems | Filesystem-sensitive lifecycle tests run on Linux, macOS, and Windows; the installed-package type, host, and tool contracts also run on Windows |
-| Package entrypoints | Installed-tarball contracts verify all three export paths (`.`, `./server`, `./tui`), the plugin-manifest targets OpenCode reads from `exports`, consumer TypeScript resolution, the enumerated hook surface, and all 14 tools |
+| Package entrypoints | Installed-tarball contracts verify all three export paths (`.`, `./server`, `./tui`), the plugin-manifest targets OpenCode reads from `exports`, consumer TypeScript resolution, the enumerated hook surface, and all 13 tools |
 | Provider/backend quirks | Strict-template backends require the goal block to merge into the primary `system` message; covered by regression tests. See [`providers.md`](providers.md) |
 | Runtime dependencies | `zod` only, bundled into `dist/` |
 
@@ -526,9 +555,9 @@ Start with `/goal status`, then `/goal history`. Together they show whether a go
 
 If a goal does not continue:
 
-1. Check for a deliberate pause: user intervention, a hard limit, repeated tool-free or no-progress turns, prompt failures, or a rejected completion audit all stop unattended work by design.
+1. Check `Stopped:` in `/goal status`. Only the reasons in [When a goal stops](#when-a-goal-stops) stop a goal: your `/goal halt`/`/goal pause`, a budget limit, completion, a concrete model block, or a persistence fence. Stalls, audit rejections, prompt failures, and host errors are in `Last status:` and `/goal history`, and the goal keeps running through them.
 2. Run `/goal resume` only after resolving the reported reason. Resume creates a fresh local budget window; it does not erase the objective or history.
-3. If a goal control reports that another process owns the session, wait a few seconds and retry. An idle owner releases the lease within `idleLeaseReleaseMs`, but an owner running an active goal keeps it, so pause that goal there, or fork. If it reports an older, incomplete, tampered, or unsupported lease, close and upgrade every process that could own the session first; if it persists, remove only the affected shard's adjacent `.lock` file or legacy directory **and** its `.lock.claims-v2` directory. Keep the state and ledger. Never point two copies of one session at different state paths — that creates divergent histories.
+3. If a goal control reports that another process owns the session, wait a few seconds and retry. An idle owner releases the lease within `idleLeaseReleaseMs`, but an owner running an active goal keeps it, so halt that goal there (`/goal halt`), or fork. If it reports an older, incomplete, tampered, or unsupported lease, close and upgrade every process that could own the session first; if it persists, remove only the affected shard's adjacent `.lock` file or legacy directory **and** its `.lock.claims-v2` directory. Keep the state and ledger. Never point two copies of one session at different state paths — that creates divergent histories.
 4. Check OpenCode's structured logs for persistence, SDK-shape, prompt, or auditor errors.
 5. Confirm the project directory and the state-path precedence above. A daemon started elsewhere makes a relative path surprising.
 6. From an install, run the shipped verifier — `npx opencode-goal-pro-max-complete-plugin verify`, or `npx -y github:sblattj/opencode-goal-pro-max-complete-plugin verify` without one; both delegate to the `npm run verify` script (`scripts/verify.mjs`). A bare invocation with no subcommand prints the usage and exits 0. Use it when diagnosing registration problems. The packaging contracts (`npm run smoke`, `npm run smoke:packed-host`, and the rest of the ladder) live in a git checkout only: `package.json` `files` ships `scripts/verify.mjs` and nothing else from `scripts/`, so running them inside `node_modules` fails with `MODULE_NOT_FOUND`.
@@ -546,7 +575,7 @@ npm run benchmark:behavior   # 6 deterministic autonomy scenarios, no provider c
 npm run benchmark:todo-mirror # the todo mirror against a pre-v1.0.1 control, no provider call
 npm run smoke                # package export + command hook, no model call
 npm run smoke:packed-host    # install the packed tarball, exercise the host contract
-npm run smoke:packed-tools   # all 14 tools from an installed tarball
+npm run smoke:packed-tools   # all 13 tools from an installed tarball
 npm run smoke:packed-manifest # both plugin targets discovered from the packed exports
 npm run smoke:git-install    # no install-time scripts; dist matches a fresh bundle
 npm run smoke:todo-mirror    # real host: the plan is redrawn over the model's own list

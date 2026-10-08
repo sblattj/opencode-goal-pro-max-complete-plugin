@@ -643,7 +643,7 @@ test("real GoalPlugin loads under a fake v2 context and registers its tools", as
   const expectedTools = [
     "goal_status",
     "goal_set",
-    "goal_pause",
+    "goal_resume",
     "goal_plan_get",
     "goal_plan_set",
     "set_goal",
@@ -654,6 +654,8 @@ test("real GoalPlugin loads under a fake v2 context and registers its tools", as
     assert.ok(state.addedTools.has(name), `${name} registered`)
     assert.equal(state.addedTools.get(name).input.type, "object")
   }
+  // Pausing is user-only (/goal halt), so no pause tool is registered.
+  assert.equal(state.addedTools.has("goal_pause"), false)
   assert.ok(state.toolHooks.has("execute.before"))
   assert.ok(state.toolHooks.has("execute.after"))
   assert.ok(state.sessionHooks.has("prompt"))
