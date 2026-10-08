@@ -1,6 +1,6 @@
 # opencode-goal-pro-max-complete-plugin
 
-A session-scoped `/goal` workflow for [OpenCode](https://opencode.ai/): set a goal, and the plugin auto-continues the session until the goal is marked complete with evidence, a concrete blocker is reported, or a safety limit stops it. State persists per session, so a goal survives compaction and a restart, and the whole loop runs with no model call of its own.
+A session-scoped `/goal` workflow for [OpenCode](https://opencode.ai/): set a goal, and the plugin auto-continues the session until the goal is marked complete with evidence, a concrete blocker is reported, a budget limit is reached, or you halt it. State persists per session, so a goal survives compaction and a restart, and the whole loop runs with no model call of its own.
 
 ## Install
 
@@ -19,8 +19,8 @@ Requires Node 18 or newer and OpenCode `>=1.17.15 <3` — both the 1.x and 2.x l
 ## Use
 
 - `/goal <objective>` sets or replaces the focused goal. Flags such as `--max-turns 20` or `--budget 5m` go on the first line; everything after it is objective text, kept verbatim.
-- `/goal status` reports state, budget usage and the verified action plan. `/goal list`, `/goal pause`, `/goal resume`, `/goal clear` cover the rest.
-- A run stops on evidence-backed completion, a stated blocker, or a limit: 8 hours, 100m tokens of spend, the model's own context window, or a stalled loop.
+- `/goal status` reports state, budget usage and the verified action plan. `/goal list`, `/goal halt` (alias `/goal pause`), `/goal resume`, `/goal clear` cover the rest.
+- A run stops only on evidence-backed completion, a concrete blocker the model cannot get past without you, a budget limit (8 hours, 100m tokens of spend, the model's own context window), or your `/goal halt`. Messages you send mid-goal steer it and never pause it; compactions, errors, restarts and stalls are recorded and the goal keeps going. The full list is in [docs/reference.md](docs/reference.md#when-a-goal-stops).
 
 While a goal runs, its state rides the session title on every client, and the TUI panel renders the whole plan beside it:
 
