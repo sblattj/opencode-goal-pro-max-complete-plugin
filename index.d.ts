@@ -227,8 +227,8 @@ export interface CompletionAuditContext {
 export interface CompletionAuditorOptions {
   /**
    * How long, in milliseconds, the built-in auditor waits for a verdict from
-   * its child OpenCode session. A timeout rejects the audit and pauses the
-   * goal. Operational failures follow {@link failurePolicy}.
+   * its child OpenCode session. A timeout rejects the audit; the goal is not
+   * archived and keeps running. Operational failures follow {@link failurePolicy}.
    * @default 120000
    */
   timeoutMs?: number
@@ -262,9 +262,9 @@ export interface GoalPluginOptions {
    * Maximum number of auto-continue turns sent toward a goal before it is
    * stopped for exceeding limits. `0` means **unlimited** and is the default:
    * an arbitrary turn count stops a healthy long run for no reason. The
-   * no-tool-call and no-progress pauses catch a loop that has stopped doing
-   * anything, but neither catches a loop that keeps calling tools — for that
-   * run the 8-hour window is the brake. Overridable per-goal with
+   * no-tool-call and no-progress detectors record a loop that has stopped
+   * doing anything but do not stop the goal — the 8-hour window, the spend
+   * budget, the context ceiling and the user's `/goal halt` are the brakes. Overridable per-goal with
    * `--max-turns`, which also accepts `unlimited`, `none`, `inf`, `infinite`,
    * `infinity`, and `∞`.
    * @default 0
@@ -351,10 +351,11 @@ export interface GoalPluginOptions {
   noProgressTokenThreshold?: number
 
   /**
-   * Grace window for low-output stalls: the goal is paused only after this
+   * Grace window for low-output stalls: a stall is recorded only after this
    * many consecutive stalled low-output turns, rather than on the first
-   * one. Output tokens are summed over the whole turn (every assistant
-   * message answering one prompt). Overridable per-goal with
+   * one. It does not pause the goal; the name is historical. Output tokens
+   * are summed over the whole turn (every assistant message answering one
+   * prompt). Overridable per-goal with
    * `--no-progress-turns`.
    * @default 2
    */
@@ -366,17 +367,18 @@ export interface GoalPluginOptions {
    * the no-progress check by catching self-chat loops that still produce
    * output. Judging a run purely on tool calls is blunt, so the default is
    * ten consecutive tool-free turns. Overridable per-goal with
-   * `--no-tool-turns`. Set the plugin option to `0` to disable this heuristic.
+   * `--no-tool-turns`. Reaching it records the stall; it does not pause the
+   * goal. Set the plugin option to `0` to disable this heuristic.
    * @default 10
    */
   noToolCallTurnsBeforePause?: number
 
   /**
-   * When `true` (the default), a new human message does not pause an active
-   * goal: the goal loop keeps running and the message steers the next
-   * continuation. Set `false` to pause the goal with
-   * `stopReason: "user intervention"` instead. Plugin-owned command and
-   * continuation messages are never treated as interventions either way.
+   * Accepted but ignored. A human message never pauses a goal: the loop keeps
+   * running and the message steers the next continuation. `false` used to
+   * pause with `stopReason: "user intervention"`; it no longer does. Stop a
+   * goal with `/goal halt` (resumable with `/goal resume`) or `/goal clear`.
+   * @deprecated Human messages always steer; this option has no effect.
    * @default true
    */
   noInterruptOnUserMessage?: boolean
@@ -438,8 +440,8 @@ export interface GoalPluginOptions {
 
   /**
    * Whether to persist active/backgrounded goals and recent goal results
-   * to disk so they survive a restart. Recovered active goals are loaded
-   * in a paused state. Set to `false` for purely in-memory behavior (this
+   * to disk so they survive a restart. Recovered active goals load with a
+   * recovery note and keep running. Set to `false` for purely in-memory behavior (this
    * also disables the lifecycle ledger).
    * @default true
    */
@@ -518,11 +520,13 @@ export interface GoalPluginOptions {
 
   /**
    * Whether the plugin registers the agent-facing goal tools
-   * (canonical `goal_status`, `goal_set`, `goal_pause`, `goal_resume`,
-   * `goal_block`, `goal_complete`, the plan tools `goal_plan_get`,
+   * (canonical `goal_status`, `goal_set`, `goal_resume`, `goal_block`,
+   * `goal_complete`, the plan tools `goal_plan_get`,
    * `goal_plan_set`, `goal_action_update`, plus legacy `get_goal`,
    * `get_goal_history`, `set_goal`, `update_goal`, `clear_goal`).
-   * Canonical tools return versioned JSON envelopes. The tools are registered
+   * Canonical tools return versioned JSON envelopes. There is no pause tool:
+   * pausing is user-only (`/goal halt`), and `update_goal` refuses
+   * `status: "paused"`. The tools are registered
    * by default from dependencies included with this package; set this to
    * `false` to omit the tool surface.
    * @default true
@@ -577,8 +581,9 @@ export interface GoalPluginOptions {
 
   /**
    * Agent names treated as planning-only. A goal created while one of these
-   * agents is active is recorded but held paused instead of starting, and
-   * auto-continue stays suppressed while one is active. Matching is
+   * agents is active is recorded but not driven, and auto-continue stays
+   * suppressed while one is active. That is a wait, not a stop: the loop
+   * picks up again once an executing agent is back. Matching is
    * case-insensitive. Pass `[]` to release the restriction entirely.
    * @default ["plan"]
    */
@@ -611,8 +616,8 @@ export interface GoalPluginOptions {
   /**
    * Supply a custom completion auditor instead of the built-in
    * child-session one. Takes precedence over `completionAudit: true`.
-   * A verdict of `{ approved: false }` pauses the goal (stop reason
-   * `"audit rejected"`) instead of archiving it. A thrown error is
+   * A verdict of `{ approved: false }` records the rejection and keeps the
+   * goal running instead of archiving it. A thrown error is
    * treated as a rejection (fail closed).
    */
   auditor?: (context: CompletionAuditContext) => Promise<CompletionAuditVerdict>

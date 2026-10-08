@@ -36,7 +36,6 @@ const expectedTools = [
   "goal_action_update",
   "goal_block",
   "goal_complete",
-  "goal_pause",
   "goal_plan_get",
   "goal_plan_set",
   "goal_resume",
