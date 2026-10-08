@@ -15696,6 +15696,7 @@ function legacyHomeStateFilePath(env = process.env) {
 }
 var MAX_HISTORY_ENTRIES = 20;
 var MAX_STALLED_COMPACTIONS = 2;
+var MAX_CONTINUATION_BACKOFF_EXPONENT = 6;
 var CHILD_WAKE_EVENT_FLAG = Symbol.for("opencode-goal-plugin.childWake");
 var MAX_CHECKPOINTS = 5;
 var CHECKPOINT_CHAR_LIMIT = 280;
@@ -15733,6 +15734,7 @@ var DEFAULT_OPTIONS = {
   maxTokens: 1e8,
   contextWindowTokens: 0,
   minDelayMs: 1500,
+  promptRetryWakeMs: 5000,
   maxRecentMessages: 200,
   noProgressTokenThreshold: 50,
   noProgressTurnsBeforePause: 2,
@@ -15822,7 +15824,10 @@ var seenUsage = runtimeCollection("seenUsage");
 var seenOutputTokens = runtimeCollection("seenOutputTokens");
 var activeContinues = runtimeCollection("activeContinues");
 var CLEAR_COMMANDS = new Set(["clear", "stop", "off", "reset", "none", "cancel"]);
-var PAUSE_COMMANDS = new Set(["pause"]);
+var PAUSE_COMMANDS = new Set(["pause", "halt"]);
+var GOAL_BLOCK_DETERRENCE = "Blocking stops the whole goal until the user comes back. Use it ONLY when no further progress is possible without input only the user can give (a credential, an irreversible decision, a physical action). A human message mid-goal is steering, not a reason to block or stop; record an open question in a checkpoint and keep working on other steps.";
+var GOAL_BLOCK_CONTINUATION_LINE = "Hard-blocked on input only the user can give? State it, then [goal:blocked]; that stops the goal. Otherwise keep working.";
+var AGENT_PAUSE_REFUSAL = (commandName) => `Pausing is user-only (/${commandName} halt). If you are hard-blocked on user input, use goal_block with the concrete blocker; otherwise keep working.`;
 var SEQUENCE_COMMANDS = ["sequence", "sisyphus"];
 var GOAL_FLAG_SPECS = {
   "--max-turns": {
@@ -15875,7 +15880,6 @@ function messageHasToolCall(message) {
 var PLUGIN_TOOL_NAMES = new Set([
   "goal_status",
   "goal_set",
-  "goal_pause",
   "goal_resume",
   "goal_block",
   "goal_complete",
@@ -16201,17 +16205,15 @@ function looksLikePluginSessionTitle(title) {
   const text = typeof title === "string" ? title.trimStart() : "";
   return SESSION_TITLE_ICONS.some((icon) => text.startsWith(`${icon} `));
 }
-function restrictedAgentStopReason(agent) {
-  return isPlanAgent(agent) ? "plan agent active" : `${String(agent).trim().toLowerCase()} agent active`;
-}
 function terminalEvent(event) {
   const permissionReply = String(event?.properties?.reply ?? event?.properties?.response ?? event?.data?.reply ?? event?.data?.response ?? "");
   if (event?.type === "permission.replied" && /^(?:reject(?:ed)?|deny|denied)$/i.test(permissionReply)) {
     return {
       sessionID: getSessionID(event),
-      stopReason: "permission rejected",
-      status: "Goal paused after a permission request was rejected.",
-      history: "Paused after OpenCode reported a rejected permission request."
+      kind: "permission rejected",
+      eventKey: String(event?.properties?.requestID ?? event?.properties?.permissionID ?? event?.data?.requestID ?? ""),
+      status: "A permission request was rejected.",
+      history: "OpenCode reported a rejected permission request; the goal continues."
     };
   }
   let error51 = null;
@@ -16228,10 +16230,18 @@ function terminalEvent(event) {
   const summary = summarizeText(`${name}${message ? `: ${message}` : ""}`, 240) || "unknown provider error";
   return {
     sessionID: getSessionID(event) || messageSessionID(messageInfoFromEvent(event)),
-    stopReason: aborted2 ? "user interrupted" : "provider error",
-    status: aborted2 ? "Goal paused after user interruption." : `Goal paused after a terminal provider error: ${summary}`,
-    history: aborted2 ? "Paused after OpenCode reported that the active turn was aborted." : `Paused after OpenCode reported a terminal provider error: ${summary}`
+    kind: aborted2 ? "user interrupted" : "provider error",
+    eventKey: event?.type === "message.updated" ? messageID(messageInfoFromEvent(event)) : "",
+    status: aborted2 ? "The active turn was aborted." : `The provider reported an error: ${summary}`,
+    history: aborted2 ? "OpenCode reported that the active turn was aborted; the goal continues." : `OpenCode reported a provider error; the goal continues: ${summary}`
   };
+}
+var PROVIDER_ERROR_BACKOFF_BASE_MS = 5000;
+var PROVIDER_ERROR_BACKOFF_MAX_MS = 300000;
+function providerErrorBackoffMs(streak) {
+  if (!Number.isFinite(streak) || streak < 2)
+    return 0;
+  return Math.min(PROVIDER_ERROR_BACKOFF_MAX_MS, PROVIDER_ERROR_BACKOFF_BASE_MS * 2 ** (streak - 2));
 }
 function summarizeText(text, limit = CHECKPOINT_CHAR_LIMIT) {
   const normalized = String(text || "").replace(/\s+/g, " ").trim();
@@ -16483,6 +16493,8 @@ function formatStatus(goal, commandName = "goal", completionAuditLabel = "eviden
     lines.push(`Blocked reason: ${goal.blockedReason}`);
   if (goal.stopped) {
     lines.push(`Suggested action: ${goal.stopReason === "blocked" ? `address the blocker, then run /${commandName} resume` : `run /${commandName} resume to continue, or /${commandName} clear to discard`}`);
+  } else {
+    lines.push(`Suggested action: none needed; the goal keeps running. Run /${commandName} halt to pause it (/${commandName} resume restarts it), or /${commandName} clear to discard it.`);
   }
   return lines.join(`
 `);
@@ -16531,7 +16543,7 @@ function stopReason(goal) {
   if (!isUnlimitedTurnBudget(goal.options.maxTurns) && goal.turnCount >= goal.options.maxTurns) {
     return `max turns reached (${goal.options.maxTurns})`;
   }
-  if (Date.now() - goal.startedAt >= goal.options.maxDurationMs) {
+  if ((goal.pausedAt || Date.now()) - goal.startedAt >= goal.options.maxDurationMs) {
     return `max duration reached (${formatBudgetDuration(goal.options.maxDurationMs)})`;
   }
   if (goalSpendTokens(goal) >= goal.options.maxTokens) {
@@ -16889,11 +16901,12 @@ function normalizeOptions(options = {}) {
     maxTokens: toPositiveInteger(options.maxTokens, DEFAULT_OPTIONS.maxTokens),
     contextWindowTokens: Number.isSafeInteger(options.contextWindowTokens) && options.contextWindowTokens >= 0 ? options.contextWindowTokens : DEFAULT_OPTIONS.contextWindowTokens,
     minDelayMs: toPositiveInteger(options.minDelayMs, DEFAULT_OPTIONS.minDelayMs),
+    promptRetryWakeMs: toPositiveInteger(options.promptRetryWakeMs, DEFAULT_OPTIONS.promptRetryWakeMs),
     maxRecentMessages: toPositiveInteger(options.maxRecentMessages, DEFAULT_OPTIONS.maxRecentMessages),
     noProgressTokenThreshold: toPositiveInteger(options.noProgressTokenThreshold, DEFAULT_OPTIONS.noProgressTokenThreshold),
     noProgressTurnsBeforePause: toPositiveInteger(options.noProgressTurnsBeforePause, DEFAULT_OPTIONS.noProgressTurnsBeforePause),
     noToolCallTurnsBeforePause: Number.isSafeInteger(options.noToolCallTurnsBeforePause) && options.noToolCallTurnsBeforePause >= 0 ? options.noToolCallTurnsBeforePause : DEFAULT_OPTIONS.noToolCallTurnsBeforePause,
-    noInterruptOnUserMessage: options.noInterruptOnUserMessage !== false,
+    noInterruptOnUserMessage: true,
     noContinueWhileChildrenActive: options.noContinueWhileChildrenActive === true,
     budgetWrapupRatio: Number(options.budgetWrapupRatio) > 0 && Number(options.budgetWrapupRatio) < 1 ? Number(options.budgetWrapupRatio) : DEFAULT_OPTIONS.budgetWrapupRatio,
     warnTurnsRemaining: toPositiveInteger(options.warnTurnsRemaining, DEFAULT_OPTIONS.warnTurnsRemaining),
@@ -17067,6 +17080,7 @@ function normalizePersistedGoal(rawGoal) {
     stopReason: typeof rawGoal.stopReason === "string" ? rawGoal.stopReason : "",
     promptFailures: toNonNegativeInteger(rawGoal.promptFailures),
     formatFailures: toNonNegativeInteger(rawGoal.formatFailures),
+    pendingAuditRejection: typeof rawGoal.pendingAuditRejection === "string" ? rawGoal.pendingAuditRejection.slice(0, 400) : "",
     compactionEpoch: toNonNegativeInteger(rawGoal.compactionEpoch),
     stalledCompactions: toNonNegativeInteger(rawGoal.stalledCompactions),
     lastCompactionEventID: typeof rawGoal.lastCompactionEventID === "string" && rawGoal.lastCompactionEventID.length <= MAX_GOAL_META_LENGTH ? rawGoal.lastCompactionEventID : "",
@@ -17124,7 +17138,7 @@ function serializeGoal(goal) {
     lastCheckpoint: goal.lastCheckpoint || null
   };
 }
-function deserializeGoal(goal) {
+function deserializeGoal(goal, { recovery = "resume" } = {}) {
   const hydrated = {
     ...goal,
     messageIDs: new Set(goal?.messageIDs || []),
@@ -17134,10 +17148,21 @@ function deserializeGoal(goal) {
   };
   if (!hydrated.stopped) {
     currentRuntime().freshRecoveries.add(hydrated.sessionID);
-    hydrated.stopped = true;
-    hydrated.stopReason = "recovered after restart";
-    hydrated.lastStatus = "Recovered persisted goal state. Review the goal status and resume it when ready.";
-    pushHistory(hydrated, "recovered", "Recovered persisted goal state after plugin restart; auto-continue remains paused until you resume.");
+    if (recovery === "pause") {
+      hydrated.stopped = true;
+      hydrated.stopReason = "recovered after restart";
+      hydrated.lastStatus = "Recovered goal state from the lifecycle ledger. Review the goal status and resume it when ready.";
+      pushHistory(hydrated, "recovered", "Recovered goal state from the lifecycle ledger after a missing state file; auto-continue stays paused until you resume, because the ledger can predate a pause.");
+    } else {
+      if (!hydrated.pausedAt) {
+        const lastActivityAt = Math.max(toNonNegativeInteger(hydrated.startedAt), toNonNegativeInteger(hydrated.lastContinueAt), toNonNegativeInteger(hydrated.lastProgressAt));
+        const downtimeMs = Math.max(0, Date.now() - lastActivityAt);
+        if (lastActivityAt > 0 && downtimeMs > 0)
+          hydrated.startedAt += downtimeMs;
+      }
+      hydrated.lastStatus = "Recovered persisted goal state after a plugin restart; the goal is still active and continues at the next idle.";
+      pushHistory(hydrated, "recovered", "Recovered persisted goal state after plugin restart; the goal stays active and auto-continue resumes at the next idle.");
+    }
   }
   hydrated.continuationClaim = null;
   return hydrated;
@@ -17275,6 +17300,19 @@ async function reconcileLoadedStateWithLedger(persistenceOptions, client, onlySe
           latestLedgerState = { entry, alreadyApplied };
           latestLedgerTimestamp = timestamp;
         }
+      }
+      const laggingStop = latestLedgerState?.entry?.snapshot;
+      if (!latestLedgerState?.alreadyApplied && !goal.stopped && latestLedgerState?.entry?.type !== "blocked" && laggingStop?.stopped === true && typeof laggingStop.stopReason === "string" && laggingStop.stopReason && laggingStop.stopReason !== "blocked") {
+        goal.stopped = true;
+        goal.stopReason = summarizeText(laggingStop.stopReason, 160);
+        goal.lastStatus = `Recovered stopped goal state (${goal.stopReason}) from the lifecycle ledger after the saved snapshot lagged behind. Resume it explicitly to continue.`;
+        goal.continuationClaim = null;
+        goal.history = [
+          ...goal.history || [],
+          makeHistoryEntry(latestLedgerState.entry.type, latestLedgerState.entry.detail, normalizeTimestamp(latestLedgerState.entry.ts))
+        ].slice(-MAX_HISTORY_ENTRIES);
+        pauseGoalClock(goal);
+        continue;
       }
       if (latestLedgerState?.alreadyApplied || latestLedgerState?.entry?.type !== "blocked" || latestLedgerState.entry.snapshot?.stopped !== true || latestLedgerState.entry.snapshot?.stopReason !== "blocked")
         continue;
@@ -17560,7 +17598,7 @@ async function reconstructFromLedger(persistenceOptions, client, onlySessionID =
     if (normalized) {
       if (!normalized.stopped)
         focusCandidates.set(normalized.sessionID, normalized.goalId);
-      const hydrated = deserializeGoal(normalized);
+      const hydrated = deserializeGoal(normalized, { recovery: "pause" });
       registerSessionGoal(hydrated);
       if (stub.ordered)
         sessionOrdered.add(hydrated.sessionID);
@@ -17767,6 +17805,18 @@ function sleep(ms, signal) {
     signal.addEventListener("abort", onAbort, { once: true });
   });
 }
+function continuationStallStrikes(goal) {
+  const options = goal.options || {};
+  const over = (count, threshold) => Number.isFinite(count) && Number.isFinite(threshold) && threshold > 0 ? Math.max(0, count - threshold + 1) : 0;
+  return Math.max(over(goal.noProgressTurns, options.noProgressTurnsBeforePause), over(goal.noToolCallTurns, options.noToolCallTurnsBeforePause), over(goal.formatFailures, options.maxPromptFailures), over(goal.promptFailures, options.maxPromptFailures), over(goal.stalledCompactions, MAX_STALLED_COMPACTIONS));
+}
+function continuationDelayMs(goal) {
+  const base = goal.options.minDelayMs;
+  const strikes = continuationStallStrikes(goal);
+  if (strikes <= 0)
+    return base;
+  return base * 2 ** Math.min(strikes, MAX_CONTINUATION_BACKOFF_EXPONENT);
+}
 function buildLimitWarning(goal) {
   const unlimitedTurns = isUnlimitedTurnBudget(goal.options.maxTurns);
   const remainingTurns = goal.options.maxTurns - goal.turnCount;
@@ -17842,6 +17892,7 @@ function buildContinueMessage(goal, {
   completionUnverified = false,
   blockerUnstated = false,
   completionRejection = "",
+  stallNudge = "",
   mirrorMode = "off"
 } = {}) {
   const remainingTokens = Math.max(0, goal.options.maxTokens - goalSpendTokens(goal));
@@ -17871,7 +17922,7 @@ function buildContinueMessage(goal, {
     mirrorNudgeLine(goal, mirrorMode),
     "</goal_plan>"
   ].filter(Boolean));
-  lines.push("Completion format—consecutive plain lines; no Markdown/backticks/blank line:", "[goal:evidence] <proof>", "[goal:complete]", "Need user input? State why before [goal:blocked].");
+  lines.push("Completion format—consecutive plain lines; no Markdown/backticks/blank line:", "[goal:evidence] <proof>", "[goal:complete]", GOAL_BLOCK_CONTINUATION_LINE);
   const limitWarning = buildLimitWarning(goal);
   if (limitWarning)
     lines.push(limitWarning.trim());
@@ -17879,7 +17930,15 @@ function buildContinueMessage(goal, {
     lines.push("", "<evidence_required>", completionRejection || "Previous completion was rejected: evidence was missing. Verify first, then put `[goal:evidence] …` immediately before `[goal:complete]`.", "</evidence_required>");
   }
   if (blockerUnstated) {
-    lines.push("", "<evidence_required>", "Previous blocker was rejected: it was not concrete. State what user input is needed and why, immediately before `[goal:blocked]`; otherwise continue.", "</evidence_required>");
+    lines.push("", "<evidence_required>", "Previous blocker was rejected: it was not concrete. Keep working. Block only if no progress is possible without input only the user can give, and state exactly what it is immediately before `[goal:blocked]`.", "</evidence_required>");
+  }
+  const stallReasons = [stallNudge];
+  if (!budgetWrapup && toNonNegativeInteger(goal.stalledCompactions) >= MAX_STALLED_COMPACTIONS) {
+    stallReasons.push(`${goal.stalledCompactions} context compactions happened without a productive turn.`);
+  }
+  const stallText = stallReasons.filter(Boolean).join(" ");
+  if (!budgetWrapup && stallText) {
+    lines.push("", "<next_step>", `Stalled: ${stallText}`, "Re-plan in one or two sentences, then take ONE concrete tool-using step toward the goal now (run, read, edit, or test something). Do not restate the plan or summarize without acting. Only use [goal:blocked] for a concrete blocker that needs the user.", "</next_step>");
   }
   lines.push("</goal_continuation>");
   return lines.filter(Boolean).join(`
@@ -17917,7 +17976,7 @@ function buildCompactionContext(goal, { mirrorMode = "off" } = {}) {
     ...buildCompactionProgressSummary(goal),
     ...formatPlanForPrompt(goal.plan) ? ["<goal_plan>", formatPlanForPrompt(goal.plan), `progress: ${planStatusLabel(goal.plan)}`, "</goal_plan>"] : [],
     mirrorState(goal, mirrorMode) === "stale" ? MIRROR_COMPACTION_STALE_LINE : null,
-    "After compaction, continue from the next concrete unfinished step while the goal is active. Verify the result against the goal objective before ending; output [goal:complete] (preceded by a [goal:evidence] line) only when fully satisfied, or [goal:blocked] (preceded by a concrete blocker) only if user input is required."
+    "After compaction, continue from the next concrete unfinished step while the goal is active. Verify the result against the goal objective before ending; output [goal:complete] (preceded by a [goal:evidence] line) only when fully satisfied, or [goal:blocked] (preceded by a concrete blocker) only if no further progress is possible without input only the user can give; blocking stops the whole goal."
   ].filter(Boolean).join(`
 `);
 }
@@ -18221,6 +18280,8 @@ function findLatestExecutionContext(messages) {
   for (const message of [...messages || []].reverse()) {
     if (messageRole(message) !== "user")
       continue;
+    if (isHostSyntheticUserMessage(message))
+      continue;
     const info = isPlainObject2(message?.info) ? message.info : message;
     const context = normalizeExecutionContext(info);
     if (context)
@@ -18289,8 +18350,8 @@ function isOwnedPluginMessage(message, kind, ownedMessages = currentRuntime().ow
 function continuationSnapshot(messages, ownedMessages = currentRuntime().ownedPluginMessages) {
   const list = Array.isArray(messages) ? messages : [];
   const latestAssistant = findLatestAssistantMessage(list);
-  const latestRealUser = [...list].reverse().find((message) => messageRole(message) === "user" && !isPluginGeneratedMessage(message, ownedMessages));
-  const latestRelevant = [...list].reverse().find((message) => (messageRole(message) === "assistant" || messageRole(message) === "user") && !isCompactionAssistantMessage(message) && !isPluginGeneratedMessage(message, ownedMessages));
+  const latestRealUser = [...list].reverse().find((message) => isRealUserMessage(message, ownedMessages));
+  const latestRelevant = [...list].reverse().find((message) => (messageRole(message) === "assistant" || messageRole(message) === "user") && !isCompactionAssistantMessage(message) && !isHostSyntheticUserMessage(message) && !isPluginGeneratedMessage(message, ownedMessages));
   return {
     latestAssistantID: messageID(latestAssistant),
     latestRealUserMessageID: messageID(latestRealUser),
@@ -18305,6 +18366,19 @@ function isPluginCommandMessage(message, ownedMessages = currentRuntime().ownedP
 }
 function isPluginGeneratedMessage(message, ownedMessages = currentRuntime().ownedPluginMessages) {
   return isPluginContinuationMessage(message, ownedMessages) || isPluginCommandMessage(message, ownedMessages);
+}
+function isHostSyntheticUserMessage(message) {
+  if (messageRole(message) !== "user")
+    return false;
+  const parts = Array.isArray(message?.parts) ? message.parts : [];
+  if (parts.some((part) => part?.type === "compaction"))
+    return true;
+  if (parts.length === 0)
+    return false;
+  return parts.every((part) => part?.type === "text" && part.synthetic === true && !part?.metadata?.["opencode-goal-plugin"]);
+}
+function isRealUserMessage(message, ownedMessages = currentRuntime().ownedPluginMessages) {
+  return messageRole(message) === "user" && !isPluginGeneratedMessage(message, ownedMessages) && !isHostSyntheticUserMessage(message);
 }
 function pruneExpiredPendingCommandTurns(sessionID, now = Date.now()) {
   const runtime = currentRuntime();
@@ -18375,7 +18449,7 @@ function userInterventionDetected(messages, goal, ownedMessages = currentRuntime
       continue;
     if (isPluginContinuationMessage(list[i], ownedMessages)) {
       lastPluginContinuationIndex = i;
-    } else if (!isPluginGeneratedMessage(list[i], ownedMessages)) {
+    } else if (isRealUserMessage(list[i], ownedMessages)) {
       lastRealUserIndex = i;
     }
   }
@@ -18616,6 +18690,7 @@ function buildGoalState(sessionID, condition, options, meta3 = {}, lastStatus = 
     stopReason: "",
     promptFailures: 0,
     formatFailures: 0,
+    pendingAuditRejection: "",
     compactionEpoch: 0,
     stalledCompactions: 0,
     lastCompactionEventID: "",
@@ -18631,7 +18706,8 @@ function buildGoalState(sessionID, condition, options, meta3 = {}, lastStatus = 
     mirror: normalizeMirror()
   };
 }
-var AGENT_UPDATE_STATUSES = new Set(["complete", "blocked", "paused", "resumed"]);
+var AGENT_UPDATE_STATUSES = new Set(["complete", "blocked", "resumed"]);
+var AGENT_PAUSE_STATUSES = new Set(["paused", "pause", "halt", "halted"]);
 var AGENT_COMPLETE_SUCCESS = "Goal marked complete and archived.";
 var AGENT_BLOCK_SUCCESS = "Goal marked blocked.";
 function buildAgentToolHandlers({
@@ -18733,6 +18809,9 @@ function buildAgentToolHandlers({
     let goal = goalStates.get(sessionID);
     if (!goal)
       return "No active goal to update. Use set_goal first.";
+    if (AGENT_PAUSE_STATUSES.has(String(args.status ?? "").trim().toLowerCase())) {
+      return AGENT_PAUSE_REFUSAL(commandName);
+    }
     if (typeof args.objective === "string" && args.objective.trim() && String(args.status || "").trim().toLowerCase() === "complete") {
       return "Cannot combine an objective update with status='complete'. " + "Use two separate calls: first update the objective (which revises the goal), " + "then mark it complete after completing the revised work.";
     }
@@ -18763,7 +18842,7 @@ function buildAgentToolHandlers({
     if (args.status !== undefined) {
       const status = String(args.status).trim().toLowerCase();
       if (!AGENT_UPDATE_STATUSES.has(status)) {
-        return `Invalid status: ${args.status} (expected complete, blocked, paused, or resumed).`;
+        return `Invalid status: ${args.status} (expected complete, blocked, or resumed).`;
       }
       if (status === "complete") {
         const evidence = typeof args.evidence === "string" ? args.evidence.trim() : "";
@@ -18804,27 +18883,25 @@ function buildAgentToolHandlers({
           goal = auditedGoal;
           if (!verdict || verdict.approved !== true) {
             const reason = verdict && verdict.reason || "completion not substantiated";
-            goal.stopped = true;
-            goal.stopReason = "audit rejected";
-            goal.lastStatus = `Completion audit rejected: ${summarizeText(reason, 200)}. Address it, then run /${commandName} resume.`;
+            goal.pendingAuditRejection = summarizeText(reason, 400);
+            goal.lastStatus = `Completion audit rejected: ${summarizeText(reason, 200)}. Goal stays active; continuing with the audit feedback.`;
             pushHistory(goal, "audit-rejected", `Agent tool completion audit rejected: ${summarizeText(reason, 300)}`);
             await persist(sessionID);
             const rejectedGoalAfterPersist = currentGoal(sessionID, auditedGoalID, auditedRunID);
-            if (rejectedGoalAfterPersist !== goal || !goal.stopped || goal.stopReason !== "audit rejected") {
+            if (rejectedGoalAfterPersist !== goal) {
               return "Completion audit was rejected, but the goal changed while that state was persisted; current state was left untouched.";
             }
             if (auditMessagesEnabled) {
-              await announceAudit(sessionID, `Audit result: completion rejected — ${summarizeText(reason, 160)}.`);
+              await announceAudit(sessionID, `Audit result: completion rejected — ${summarizeText(reason, 160)}. Goal continues.`);
             } else {
-              announceLifecycle(sessionID, "Goal paused — completion audit rejected. Run status for details.", {
+              announceLifecycle(sessionID, "Completion audit rejected — goal continues with the audit feedback.", {
                 goal,
                 transition: "audit-rejected",
                 reason,
-                expectedState: "paused",
-                expectedStopReason: "audit rejected"
+                expectedState: goalDisplayState(goal)
               });
             }
-            return `Completion audit rejected: ${summarizeText(reason, 200)}. Goal paused; use /${commandName} resume after addressing the issue.`;
+            return `Completion audit rejected: ${summarizeText(reason, 200)}. The goal stays active: address this feedback with real, verified work, then claim completion again.`;
           }
         }
         goal.lastStatus = "Goal completed.";
@@ -18926,25 +19003,6 @@ ${completionHandback}` : AGENT_COMPLETE_SUCCESS;
           });
         }
         return messages.join(" ");
-      } else if (status === "paused") {
-        if (goal.stopped && goal.stopReason === "paused") {
-          if (!messages.length)
-            return "Goal is already paused.";
-          messages.push("Goal is already paused.");
-        } else {
-          goal.stopped = true;
-          goal.stopReason = "paused";
-          goal.lastStatus = "Goal paused.";
-          pushHistory(goal, "paused", "Paused via agent tool.");
-          messages.push("Goal paused.");
-          lifecycleNotice = {
-            text: "Goal paused.",
-            transition: "paused",
-            reason: goal.stopReason,
-            expectedState: "paused",
-            expectedStopReason: "paused"
-          };
-        }
       } else if (status === "resumed") {
         if (!goal.stopped)
           return "Goal is already running. Pause or stop it first if you want to reset the budget window.";
@@ -19172,6 +19230,9 @@ function buildAgentTools(toolHelper, handlers, ensureSessionLoaded = async () =>
       const before = currentGoal(sessionID);
       if (!before)
         return goalToolFailure("no_active_goal", "No active goal for this session.");
+      if (AGENT_PAUSE_STATUSES.has(String(args.status ?? "").trim().toLowerCase())) {
+        return goalToolFailure("pause_user_only", AGENT_PAUSE_REFUSAL(commandName));
+      }
       if (args.status === "blocked" && (typeof args.blocker !== "string" || !args.blocker.trim())) {
         return goalToolFailure("missing_blocker", "A non-empty blocker is required.");
       }
@@ -19219,18 +19280,13 @@ function buildAgentTools(toolHelper, handlers, ensureSessionLoaded = async () =>
       },
       execute: canonicalRun("set", canonicalHandlers.set)
     }),
-    goal_pause: toolHelper({
-      description: "Pause the current goal without discarding its state.",
-      args: {},
-      execute: canonicalRun("pause", (sessionID) => canonicalHandlers.update(sessionID, { status: "paused" }))
-    }),
     goal_resume: toolHelper({
-      description: "Resume a stopped goal with a fresh local budget window.",
+      description: "Resume a stopped goal with a fresh local budget window. Call only when the user explicitly asks to resume the goal; never resume a goal the user halted on your own.",
       args: {},
       execute: canonicalRun("resume", (sessionID) => canonicalHandlers.update(sessionID, { status: "resumed" }))
     }),
     goal_block: toolHelper({
-      description: "Stop the current goal as blocked and state the concrete external requirement.",
+      description: `Stop the current goal as blocked and state the concrete input only the user can give. ${GOAL_BLOCK_DETERRENCE}`,
       args: { blocker: schema.string() },
       execute: canonicalRun("block", (sessionID, args) => canonicalHandlers.update(sessionID, { status: "blocked", blocker: args.blocker }))
     }),
@@ -19316,7 +19372,7 @@ function buildAgentTools(toolHelper, handlers, ensureSessionLoaded = async () =>
       execute: run((sessionID, args) => handlers.setGoal(sessionID, args))
     }),
     update_goal: toolHelper({
-      description: "Update the current goal: revise its `objective`, and/or set its `status` to complete, blocked, paused, or resumed. Mark complete only after verifying the objective is truly done; include `evidence` (for complete) or `blocker` (for blocked).",
+      description: "Update the current goal: revise its `objective`, and/or set its `status` to complete, blocked, or resumed. Mark complete only after verifying the objective is truly done; include `evidence` (for complete) or `blocker` (for blocked). Pausing is user-only (/goal halt). " + GOAL_BLOCK_DETERRENCE,
       args: {
         objective: schema.string().optional(),
         status: schema.string().optional(),
@@ -19864,14 +19920,31 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
     const agent = await resolveSessionAgent(sessionID);
     return isRestrictedAgent(agent, restrictedAgents) ? agent : "";
   };
-  const holdGoalForRestrictedAgent = (goal, agent) => {
-    const label = isPlanAgent(agent) ? "Plan" : agent;
-    goal.stopped = true;
-    goal.stopReason = restrictedAgentStopReason(agent);
-    goal.lastStatus = `Goal recorded but held: the ${label} agent is planning-only. ` + `Switch to an executing agent, then run /${commandName} resume to start work.`;
+  const restrictedAgentLabel = (agent) => isPlanAgent(agent) ? "Plan" : agent;
+  const deferredStatus = (label) => `Goal deferred: the ${label} agent is planning-only. It starts automatically when an executing agent is active and the session goes idle. Run /${commandName} halt to stop it.`;
+  const deferGoalForRestrictedAgent = (goal, agent, { created = false } = {}) => {
+    const label = restrictedAgentLabel(agent);
+    if (goal.pausedAt && !created)
+      return label;
     pauseGoalClock(goal);
-    pushHistory(goal, "paused", `Created while the ${label} agent was active; held until an executing agent resumes it.`);
+    goal.lastStatus = deferredStatus(label);
+    pushHistory(goal, "deferred", created ? `Created while the ${label} agent was active; deferred until an executing agent goes idle.` : `Deferred auto-continue while the ${label} agent was active.`);
     return label;
+  };
+  const resumeGoalAfterRestrictedAgent = (goal) => {
+    if (!goal.pausedAt)
+      return false;
+    resumeGoalClock(goal);
+    const current = normalizeExecutionContext(currentRuntime().sessionExecutionContexts.get(goal.sessionID));
+    if (current?.agent && !isRestrictedAgent(current.agent, restrictedAgents)) {
+      goal.executionContext = current;
+    } else if (goal.executionContext?.agent && isRestrictedAgent(goal.executionContext.agent, restrictedAgents)) {
+      const { agent: _restricted, ...rest } = goal.executionContext;
+      goal.executionContext = normalizeExecutionContext(rest);
+    }
+    goal.lastStatus = "An executing agent is active; auto-continue resumed.";
+    pushHistory(goal, "resumed", "An executing agent became active; the deferred goal resumed.");
+    return true;
   };
   const persist = (sessionID) => {
     const persistence = runtime.sessionPersistence.get(sessionID);
@@ -20116,7 +20189,14 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           await persist(sessionID);
         const recoveredGoal = goalStates.get(sessionID);
         const freshlyRecovered = runtime.freshRecoveries.delete(sessionID);
-        if (freshlyRecovered && recoveredGoal?.stopped && recoveredGoal.stopReason === "recovered after restart") {
+        if (freshlyRecovered && recoveredGoal && !recoveredGoal.stopped) {
+          announceLifecycle(sessionID, `Goal recovered after a restart and still active; it continues at the next idle. Run /${commandName} halt to stop it.`, {
+            goal: recoveredGoal,
+            transition: "recovered-active",
+            reason: "recovered after restart",
+            expectedState: "active"
+          });
+        } else if (freshlyRecovered && recoveredGoal?.stopped && recoveredGoal.stopReason === "recovered after restart") {
           announceLifecycle(sessionID, `Goal recovered and paused. Run /${commandName} status, then /${commandName} resume when ready.`, {
             goal: recoveredGoal,
             transition: "recovered-paused",
@@ -20225,31 +20305,116 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       await logPluginError(client, "Failed to abort an accepted auto-continue after intervention", error51);
     }
   };
-  const pauseActiveGoal = async (sessionID, { stopReason: reason, status, history, abortAccepted = false }) => {
+  const promptRetryWakes = new Map;
+  const schedulePromptRetryWake = (sessionID, goal) => {
+    if (promptRetryWakes.has(sessionID))
+      return;
+    const goalId = goal.goalId;
+    const runId = goal.runId;
+    const delay = Math.max(continuationDelayMs(goal), goal.options.promptRetryWakeMs);
+    const timer = setTimeout(bindRuntime(runtime, async () => {
+      if (promptRetryWakes.get(sessionID) !== timer)
+        return;
+      promptRetryWakes.delete(sessionID);
+      const liveGoal = goalStates.get(sessionID);
+      if (!liveGoal || liveGoal.stopped || liveGoal.goalId !== goalId || liveGoal.runId !== runId || liveGoal.promptFailures <= 0 || currentRuntime().sessionStatuses.get(sessionID) !== "idle") {
+        return;
+      }
+      await hooks.event({ event: { type: "session.idle", properties: { sessionID } } });
+    }), delay);
+    timer.unref?.();
+    promptRetryWakes.set(sessionID, timer);
+  };
+  const providerErrorStreaks = new Map;
+  const interruptionNotes = new Map;
+  const clearProviderErrorStreak = (sessionID) => {
+    const streak = providerErrorStreaks.get(sessionID);
+    if (!streak)
+      return false;
+    if (streak.timer)
+      clearTimeout(streak.timer);
+    providerErrorStreaks.delete(sessionID);
+    return true;
+  };
+  const deferForProviderErrorBackoff = (sessionID, goal) => {
+    const streak = providerErrorStreaks.get(sessionID);
+    if (!streak || streak.goalId !== goal.goalId || streak.runId !== goal.runId) {
+      if (streak)
+        clearProviderErrorStreak(sessionID);
+      return false;
+    }
+    const remaining = streak.backoffUntil - Date.now();
+    if (remaining <= 0)
+      return false;
+    if (!streak.timer) {
+      const timer = setTimeout(bindRuntime(runtime, async () => {
+        const current = providerErrorStreaks.get(sessionID);
+        if (!current || current.timer !== timer)
+          return;
+        current.timer = null;
+        const liveGoal = goalStates.get(sessionID);
+        if (!liveGoal || liveGoal.stopped || liveGoal.goalId !== current.goalId || liveGoal.runId !== current.runId || currentRuntime().sessionStatuses.get(sessionID) !== "idle") {
+          return;
+        }
+        await hooks.event({ event: { type: "session.idle", properties: { sessionID } } });
+      }), remaining);
+      timer.unref?.();
+      streak.timer = timer;
+    }
+    return true;
+  };
+  const noteTurnInterruption = async (sessionID, { kind, eventKey = "", status, history }) => {
     const goal = goalStates.get(sessionID);
-    if (!goal)
+    if (!goal || goal.stopped)
       return false;
-    if (goal.stopped && goal.stopReason === reason)
+    const noteKey = `${goal.goalId}\x00${goal.runId}\x00${goal.lastContinueAt}\x00${kind}\x00${eventKey}`;
+    if (interruptionNotes.get(sessionID) === noteKey)
       return false;
-    currentRuntime().continuationControllers.get(sessionID)?.abort();
-    clearDeferredChildren(sessionID);
-    childDeferralNotices.delete(childDeferralKey(sessionID, goal));
-    goal.stopped = true;
-    goal.stopReason = reason;
-    goal.lastStatus = `${status} Run /${commandName} resume to continue.`;
-    goal.continuationClaim = null;
-    pushHistory(goal, "paused", history);
-    activeContinues.delete(sessionID);
+    interruptionNotes.set(sessionID, noteKey);
+    let backoffNote = "";
+    if (kind === "provider error") {
+      let streak = providerErrorStreaks.get(sessionID);
+      if (!streak || streak.goalId !== goal.goalId || streak.runId !== goal.runId) {
+        clearProviderErrorStreak(sessionID);
+        streak = {
+          goalId: goal.goalId,
+          runId: goal.runId,
+          count: 0,
+          countedContinueAt: null,
+          backoffUntil: 0,
+          timer: null
+        };
+        providerErrorStreaks.set(sessionID, streak);
+      }
+      if (streak.countedContinueAt !== goal.lastContinueAt) {
+        streak.count += 1;
+        streak.countedContinueAt = goal.lastContinueAt;
+        const backoffMs = providerErrorBackoffMs(streak.count);
+        streak.backoffUntil = Date.now() + backoffMs;
+        if (streak.timer) {
+          clearTimeout(streak.timer);
+          streak.timer = null;
+        }
+        backoffNote = backoffMs > 0 ? ` Provider error ${streak.count} in a row: the next auto-continue backs off ${Math.round(backoffMs / 1000)}s.` : "";
+      }
+    }
+    const runtimeState = currentRuntime();
+    if (kind === "user interrupted" && activeContinues.has(sessionID) && !runtimeState.promptInFlightSessions.has(sessionID)) {
+      runtimeState.continuationControllers.get(sessionID)?.abort();
+      runtimeState.continuationControllers.delete(sessionID);
+      activeContinues.delete(sessionID);
+    }
+    if (!activeContinues.has(sessionID))
+      goal.continuationClaim = null;
+    goal.lastStatus = `${status} The goal continues after the cooldown.${backoffNote} Run /${commandName} halt to stop it.`;
+    pushHistory(goal, "warning", `${history}${backoffNote}`);
     await persist(sessionID);
-    announceLifecycle(sessionID, `Goal paused — ${summarizeText(reason, 160)}.`, {
+    announceLifecycle(sessionID, `Goal continues — ${summarizeText(kind, 160)}.`, {
       goal,
-      transition: "paused",
-      reason,
-      expectedState: "paused",
-      expectedStopReason: reason
+      transition: "interrupted-continuing",
+      reason: kind,
+      expectedState: "active"
     });
-    if (abortAccepted)
-      await abortAcceptedContinuation(sessionID);
     return true;
   };
   const childStatusIsActive = (statusMap, childID) => {
@@ -20453,24 +20618,15 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       return null;
     const activeRestrictedAgent = await restrictedAgentFor(sessionID);
     if (activeRestrictedAgent) {
-      const label = isPlanAgent(activeRestrictedAgent) ? "Plan" : activeRestrictedAgent;
-      await pauseActiveGoal(sessionID, {
-        stopReason: restrictedAgentStopReason(activeRestrictedAgent),
-        status: `Auto-continue paused because the active agent switched to ${label}.`,
-        history: `Paused before auto-continue because the active session agent switched to ${label}.`
-      });
+      if (!goal.pausedAt) {
+        deferGoalForRestrictedAgent(goal, activeRestrictedAgent);
+        await persist(sessionID);
+        announceLifecycle(sessionID, `Goal deferred while ${restrictedAgentLabel(activeRestrictedAgent)} is active.`, { goal, transition: "deferred", reason: "restricted agent active", expectedState: "active" });
+      }
       return null;
     }
-    const newHumanMessage = refreshed.latestRealUserMessageID && refreshed.latestRealUserMessageID !== baseline.latestRealUserMessageID;
-    if (!goal.options.noInterruptOnUserMessage && (newHumanMessage || userInterventionDetected(messages, goal))) {
-      childDeferralNotices.delete(childDeferralKey(sessionID, goal));
-      await pauseActiveGoal(sessionID, {
-        stopReason: "user intervention",
-        status: "Auto-continue paused because a new human message arrived; the latest instruction wins.",
-        history: "Paused auto-continue after a real user message arrived; latest instruction wins."
-      });
-      return null;
-    }
+    if (resumeGoalAfterRestrictedAgent(goal))
+      await persist(sessionID);
     if (goal.options.noContinueWhileChildrenActive) {
       const deferralKey = childDeferralKey(sessionID, goal);
       const sequenceBeforeProbe = idleEventSequence;
@@ -20605,7 +20761,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       if (commandTurn && currentMessageID) {
         if (commandTurn.attachmentError === true) {
           const commandPart = pluginMarkedTextPart(message, "command");
-          commandPart.text = frameControlCommandText("Goal paused because OpenCode could not resolve an attached command file. Fix or remove the attachment, then run the goal command again or resume explicitly.");
+          commandPart.text = frameControlCommandText(`OpenCode could not resolve an attached command file, so this turn only reports that error. The goal is not paused: it continues after the cooldown without the attachment. Fix or remove the attachment and re-run the goal command to include it, or run /${commandName} halt to stop the goal.`);
           message.parts.splice(0, message.parts.length, commandPart);
         }
         runtime2.activeCommandTurns.set(sessionID, {
@@ -20622,23 +20778,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       const continuationID = activeContinues.get(sessionID);
       if (currentMessageID && pluginMessageMatches(message, "continuation", continuationID)) {
         rememberOwnedPluginMessage(message, sessionID, "continuation", continuationID);
-        return;
       }
-      const text = getText(message.parts);
-      const commandPrefix = `/${commandName}`;
-      if (text === commandPrefix || text.startsWith(`${commandPrefix} `))
-        return;
-      const goal = goalStates.get(sessionID);
-      if (!goal || goal.stopped)
-        return;
-      if (goal.options.noInterruptOnUserMessage)
-        return;
-      await pauseActiveGoal(sessionID, {
-        stopReason: "user intervention",
-        status: "Auto-continue paused because a new human message arrived; the latest instruction wins.",
-        history: "Paused immediately when a new human message arrived; latest instruction wins.",
-        abortAccepted: true
-      });
     },
     "tool.execute.before": async (input, output) => {
       const sessionID = input?.sessionID;
@@ -21087,7 +21227,7 @@ ${clearHandback}` : clearText);
       pushHistory(goal, "set", `Goal created with limits: ${describeTurnLimit(goal.options.maxTurns)} auto-continues, ${formatBudgetDuration(goal.options.maxDurationMs)}, ${goal.options.maxTokens.toLocaleString()} tokens, ${goal.options.contextWindowTokens.toLocaleString()}-token context window.`);
       const creationRestrictedAgent = await restrictedAgentFor(sessionID);
       if (creationRestrictedAgent) {
-        holdGoalForRestrictedAgent(goal, creationRestrictedAgent);
+        deferGoalForRestrictedAgent(goal, creationRestrictedAgent, { created: true });
       }
       sessionOrdered.delete(sessionID);
       cleanupGoal(sessionID);
@@ -21095,11 +21235,11 @@ ${clearHandback}` : clearText);
       registerSessionGoal(goal);
       focusGoal(sessionID, goal);
       await persist(sessionID);
-      const heldLabel = creationRestrictedAgent ? isPlanAgent(creationRestrictedAgent) ? "Plan" : creationRestrictedAgent : "";
-      announceLifecycle(sessionID, heldLabel ? `Goal recorded but held while ${heldLabel} is active.` : replacedGoal ? "Goal replaced and active." : "Goal active.", {
+      const heldLabel = creationRestrictedAgent ? restrictedAgentLabel(creationRestrictedAgent) : "";
+      announceLifecycle(sessionID, heldLabel ? `Goal recorded and deferred while ${heldLabel} is active.` : replacedGoal ? "Goal replaced and active." : "Goal active.", {
         goal,
-        transition: heldLabel ? "paused" : replacedGoal ? "replaced-active" : "active",
-        expectedState: heldLabel ? "paused" : "active"
+        transition: heldLabel ? "deferred" : replacedGoal ? "replaced-active" : "active",
+        expectedState: "active"
       });
       replaceCommandOutputText(output, [
         ...replacedGoal ? [
@@ -21107,19 +21247,19 @@ ${clearHandback}` : clearText);
           `Use \`/${commandName} add <condition>\` instead to keep it running in the background.`,
           ""
         ] : [],
-        heldLabel ? `Goal recorded but held: ${goal.condition}` : `New active goal: ${goal.condition}`,
+        heldLabel ? `Goal recorded, deferred while ${heldLabel} is active: ${goal.condition}` : `New active goal: ${goal.condition}`,
         goal.successCriteria ? `Success criteria: ${goal.successCriteria}` : null,
         goal.constraints ? `Constraints / non-goals: ${goal.constraints}` : null,
         goal.mode !== "normal" ? `Mode: ${goal.mode}` : null,
         "",
         ...heldLabel ? [
-          `The ${heldLabel} agent is planning-only, so this goal is not running.`,
+          `The ${heldLabel} agent is planning-only, so work on this goal is deferred.`,
           "Do not begin work on it now. Continue planning only.",
-          `Switch to an executing agent, then run \`/${commandName} resume\` to start work.`
+          "The goal starts automatically once an executing agent is active and the session goes idle."
         ] : [
           "Start working toward this goal now.",
           "When the goal is fully satisfied, summarize your evidence on a line starting with `[goal:evidence]`, then end your response with `[goal:complete]`. A `[goal:complete]` without a `[goal:evidence]` line is rejected and not recorded.",
-          "If you are truly blocked and need the user, state the concrete blocker on the line immediately before `[goal:blocked]`."
+          `If you are hard-blocked, state the concrete blocker on the line immediately before \`[goal:blocked]\`. ${GOAL_BLOCK_DETERRENCE}`
         ],
         `Use \`/${commandName} history\` to inspect recent lifecycle events and checkpoints.`,
         "",
@@ -21179,15 +21319,12 @@ ${clearHandback}` : clearText);
         runtime3.activeCommandTurns.delete(terminal.sessionID);
         if (passive)
           return;
-        await pauseActiveGoal(terminal.sessionID, {
-          ...resolvingCommandAttachments ? {
-            ...terminal,
-            stopReason: "attachment resolution error",
-            status: "Goal paused because OpenCode reported an error while resolving an attached command file. Fix or remove the attachment, then run the goal command again or resume explicitly.",
-            history: "Paused after OpenCode reported an error while resolving an attached command file."
-          } : terminal,
-          abortAccepted: true
-        });
+        await noteTurnInterruption(terminal.sessionID, resolvingCommandAttachments ? {
+          ...terminal,
+          kind: "attachment resolution error",
+          status: "OpenCode reported an error while resolving an attached command file; that turn reports the error instead of working.",
+          history: "OpenCode reported an error while resolving an attached command file; the goal continues."
+        } : terminal);
         return;
       }
       if (event?.type === "message.updated") {
@@ -21224,19 +21361,8 @@ ${clearHandback}` : clearText);
         currentRuntime().continuationControllers.delete(sessionID2);
         activeContinues.delete(sessionID2);
         if (goal2.stalledCompactions >= MAX_STALLED_COMPACTIONS) {
-          await pauseActiveGoal(sessionID2, {
-            stopReason: "stalled compaction",
-            status: `Goal paused after ${goal2.stalledCompactions} compactions without a productive assistant or tool turn.`,
-            history: `Paused after ${goal2.stalledCompactions} compactions without productive non-compaction work.`
-          });
-          if (typeof client?.session?.abort === "function") {
-            try {
-              await sessionApi.abort(sessionID2);
-            } catch (error51) {
-              await logPluginError(client, "Failed to abort a stalled compaction loop", error51);
-            }
-          }
-          return;
+          goal2.lastStatus = `${goal2.stalledCompactions} compactions without a productive assistant or tool turn; continuing with a stall nudge and backoff.`;
+          pushHistory(goal2, "warning", `Observed ${goal2.stalledCompactions} compactions without productive non-compaction work; nudging the next continuation instead of pausing.`);
         }
         await persist(sessionID2);
         return;
@@ -21292,6 +21418,7 @@ ${clearHandback}` : clearText);
         }
         if (messageRole(message) === "assistant" && !isCompactionAssistantMessage(messageEnvelope) && currentMessageID !== goal2.compactionSourceAssistantMessageID && currentOutputTokens > previousOutputTokens && runtime3.suppressedCommandAssistants.get(currentMessageID) !== currentSessionID) {
           goal2.lastProgressAt = Date.now();
+          clearProviderErrorStreak(goal2.sessionID);
           changed = true;
         }
         if (messageRole(message) === "assistant" && !isCompactionAssistantMessage(messageEnvelope) && currentMessageID !== goal2.compactionSourceAssistantMessageID && currentOutputTokens > previousOutputTokens && goal2.stalledCompactions > 0) {
@@ -21355,6 +21482,8 @@ ${clearHandback}` : clearText);
       const goal = goalStates.get(sessionID);
       if (!goal || goal.stopped || activeContinues.has(sessionID))
         return;
+      if (deferForProviderErrorBackoff(sessionID, goal))
+        return;
       const goalID = goal.goalId;
       const runID = goal.runId;
       const compactionEpoch = goal.compactionEpoch;
@@ -21371,6 +21500,8 @@ ${clearHandback}` : clearText);
         const messages = Array.isArray(hostMessages) ? hostMessages.slice(-goal.options.maxRecentMessages) : [];
         const activeGoalAfterMessages = activeGoal(sessionID, goalID, runID);
         if (!activeGoalAfterMessages || activeGoalAfterMessages.compactionEpoch !== compactionEpoch)
+          return;
+        if (continueController.signal.aborted)
           return;
         if (!activeGoalAfterMessages.executionContext) {
           activeGoalAfterMessages.executionContext = findLatestExecutionContext(messages);
@@ -21393,14 +21524,6 @@ ${clearHandback}` : clearText);
         }
         activeGoalAfterMessages.lastAssistantText = turnText;
         activeGoalAfterMessages.lastAssistantMessageID = latestAssistantID;
-        if (!activeGoalAfterMessages.options.noInterruptOnUserMessage && userInterventionDetected(messages, activeGoalAfterMessages)) {
-          await pauseActiveGoal(sessionID, {
-            stopReason: "user intervention",
-            status: "Auto-continue paused because a new human message arrived; the latest instruction wins.",
-            history: "Paused auto-continue after a real user message arrived; latest instruction wins."
-          });
-          return;
-        }
         const sourceAssistantMessageID = latestAssistantID || "<no-assistant>";
         if (activeGoalAfterMessages.continuationClaim?.runId === runID && activeGoalAfterMessages.continuationClaim?.compactionEpoch === compactionEpoch && activeGoalAfterMessages.continuationClaim?.sourceAssistantMessageID === sourceAssistantMessageID) {
           return;
@@ -21408,156 +21531,160 @@ ${clearHandback}` : clearText);
         let completionUnverified = false;
         let blockerUnstated = false;
         let completionRejection = "";
-        if (!terminalBoundary && goalIsComplete(turnText)) {
-          const evidence = extractCompletionEvidence(turnText);
-          const planBlockers = planCompletionBlockers(activeGoalAfterMessages.plan);
-          if (evidence && planBlockers.length) {
-            completionUnverified = true;
-            completionRejection = `Previous completion was rejected: the action plan is not satisfied (${planStatusLabel(activeGoalAfterMessages.plan)}). ` + `Outstanding: ${summarizeText(planBlockers.join("; "), 400)}. ` + "Record each action's claim, the evidence that could have falsified it, and verdict=pass with goal_action_update — or mark it blocked with a stated reason — before claiming completion.";
-            activeGoalAfterMessages.lastStatus = `Rejected [goal:complete]: action plan not satisfied (${planStatusLabel(activeGoalAfterMessages.plan)}).`;
-            pushHistory(activeGoalAfterMessages, "completion-unverified", `Assistant claimed completion with an unsatisfied action plan: ${summarizeText(planBlockers.join("; "), 300)}`);
-          } else if (evidence) {
-            await announceAudit(sessionID, `Auditing goal completion: verifying "${summarizeText(activeGoalAfterMessages.condition, 120)}" is satisfied before archiving.`);
-            if (!activeGoal(sessionID, goalID, runID))
-              return;
-            if (completionAuditor) {
-              let verdict;
-              try {
-                verdict = await completionAuditor({ goal: activeGoalAfterMessages, sessionID, latestText: turnText });
-              } catch (error51) {
-                await logPluginError(client, "Completion auditor threw", error51);
-                verdict = { approved: false, reason: "auditor error" };
-              }
-              const auditedGoal = activeGoal(sessionID, goalID, runID);
-              if (!auditedGoal) {
-                if (verdict && verdict.approved === true) {
-                  await announceAudit(sessionID, "Audit result: completion was approved but the goal was modified while the audit ran — completion not recorded.");
-                }
+        let auditRejected = false;
+        let stallNudge = "";
+        completionGate:
+          if (!terminalBoundary && goalIsComplete(turnText)) {
+            const evidence = extractCompletionEvidence(turnText);
+            const planBlockers = planCompletionBlockers(activeGoalAfterMessages.plan);
+            if (evidence && planBlockers.length) {
+              completionUnverified = true;
+              completionRejection = `Previous completion was rejected: the action plan is not satisfied (${planStatusLabel(activeGoalAfterMessages.plan)}). ` + `Outstanding: ${summarizeText(planBlockers.join("; "), 400)}. ` + "Record each action's claim, the evidence that could have falsified it, and verdict=pass with goal_action_update — or mark it blocked with a stated reason — before claiming completion.";
+              activeGoalAfterMessages.lastStatus = `Rejected [goal:complete]: action plan not satisfied (${planStatusLabel(activeGoalAfterMessages.plan)}).`;
+              pushHistory(activeGoalAfterMessages, "completion-unverified", `Assistant claimed completion with an unsatisfied action plan: ${summarizeText(planBlockers.join("; "), 300)}`);
+            } else if (evidence) {
+              await announceAudit(sessionID, `Auditing goal completion: verifying "${summarizeText(activeGoalAfterMessages.condition, 120)}" is satisfied before archiving.`);
+              if (!activeGoal(sessionID, goalID, runID))
                 return;
-              }
-              if (!verdict || verdict.approved !== true) {
-                const reason = verdict && verdict.reason || "completion not substantiated";
-                auditedGoal.stopped = true;
-                auditedGoal.stopReason = "audit rejected";
-                auditedGoal.lastStatus = `Completion audit rejected: ${summarizeText(reason, 200)}. Address it, then run /${commandName} resume.`;
-                pushHistory(auditedGoal, "audit-rejected", `Completion audit rejected: ${summarizeText(reason, 300)}`);
-                await persist(sessionID);
-                const rejectedGoalAfterPersist = currentGoal(sessionID, goalID, runID);
-                if (rejectedGoalAfterPersist !== auditedGoal || !auditedGoal.stopped || auditedGoal.stopReason !== "audit rejected")
+              if (completionAuditor) {
+                let verdict;
+                try {
+                  verdict = await completionAuditor({ goal: activeGoalAfterMessages, sessionID, latestText: turnText });
+                } catch (error51) {
+                  await logPluginError(client, "Completion auditor threw", error51);
+                  verdict = { approved: false, reason: "auditor error" };
+                }
+                const auditedGoal = activeGoal(sessionID, goalID, runID);
+                if (!auditedGoal) {
+                  if (verdict && verdict.approved === true) {
+                    await announceAudit(sessionID, "Audit result: completion was approved but the goal was modified while the audit ran — completion not recorded.");
+                  }
                   return;
+                }
+                if (!verdict || verdict.approved !== true) {
+                  const reason = verdict && verdict.reason || "completion not substantiated";
+                  completionUnverified = true;
+                  auditRejected = true;
+                  completionRejection = `Previous completion was rejected by the completion audit: ${summarizeText(reason, 400)}. ` + "Address that feedback with real, verified work before claiming completion again.";
+                  auditedGoal.lastStatus = `Completion audit rejected: ${summarizeText(reason, 200)}. Goal stays active; continuing with the audit feedback.`;
+                  pushHistory(auditedGoal, "audit-rejected", `Completion audit rejected: ${summarizeText(reason, 300)}`);
+                  await persist(sessionID);
+                  if (!activeGoal(sessionID, goalID, runID))
+                    return;
+                  if (auditMessagesEnabled) {
+                    await announceAudit(sessionID, `Audit result: completion rejected — ${summarizeText(reason, 160)}. Goal continues.`);
+                  } else {
+                    announceLifecycle(sessionID, "Completion audit rejected — goal continues with the audit feedback.", {
+                      goal: auditedGoal,
+                      transition: "audit-rejected",
+                      reason,
+                      expectedState: "active"
+                    });
+                  }
+                  if (!activeGoal(sessionID, goalID, runID))
+                    return;
+                  break completionGate;
+                }
+                pushHistory(auditedGoal, "audit-approved", verdict.reason ? `Completion audit approved: ${summarizeText(verdict.reason, 200)}` : "Completion audit approved.");
+              }
+              activeGoalAfterMessages.lastStatus = "Goal completed.";
+              const ledgerDurable = pushHistory(activeGoalAfterMessages, "completed", `Assistant marked the goal complete with evidence: ${summarizeText(evidence, 400)}`);
+              const ordered = sessionOrdered.has(sessionID);
+              const completedResult = rememberGoalResult(sessionID, activeGoalAfterMessages, "achieved", "", evidence);
+              const completionHandback = mirrorHandbackLine(activeGoalAfterMessages);
+              const completionHandbackSuffix = completionHandback ? `
+
+${completionHandback}` : "";
+              cleanupGoal(sessionID);
+              const promoted = ordered ? promoteNextOrderedGoal(sessionID) : null;
+              const postCompletionSnapshot = captureFocusedGoalSnapshot(sessionID);
+              const durable = await persistTerminalState(sessionID, "completion", ledgerDurable);
+              if (durable === false) {
+                const restored = restoreAfterTerminalPersistenceFailure(sessionID, activeGoalAfterMessages, {
+                  ordered,
+                  expectedCurrentSnapshot: postCompletionSnapshot,
+                  expectedResult: completedResult
+                });
                 if (auditMessagesEnabled) {
-                  await announceAudit(sessionID, `Audit result: completion rejected — ${summarizeText(reason, 160)}.`);
+                  await announceAudit(sessionID, restored ? "Audit result: completion verified, but storage failed; goal remains paused and was not archived." : "Audit result: completion verified, but its terminal write failed after goal state changed; current state was left untouched.");
                 } else {
-                  announceLifecycle(sessionID, "Goal paused — completion audit rejected. Run status for details.", {
-                    goal: auditedGoal,
-                    transition: "audit-rejected",
-                    reason,
+                  announceLifecycle(sessionID, restored ? "Goal paused — completion could not be recorded durably." : "Previous goal completion could not be confirmed durably after goal state changed.", restored ? {
+                    goal: activeGoalAfterMessages,
+                    transition: "terminal-persistence-failed",
+                    reason: activeGoalAfterMessages.stopReason,
                     expectedState: "paused",
-                    expectedStopReason: "audit rejected"
+                    expectedStopReason: "terminal persistence failed"
+                  } : {
+                    transition: "terminal-persistence-raced",
+                    requireCurrent: false
                   });
                 }
                 return;
               }
-              pushHistory(auditedGoal, "audit-approved", verdict.reason ? `Completion audit approved: ${summarizeText(verdict.reason, 200)}` : "Completion audit approved.");
-            }
-            activeGoalAfterMessages.lastStatus = "Goal completed.";
-            const ledgerDurable = pushHistory(activeGoalAfterMessages, "completed", `Assistant marked the goal complete with evidence: ${summarizeText(evidence, 400)}`);
-            const ordered = sessionOrdered.has(sessionID);
-            const completedResult = rememberGoalResult(sessionID, activeGoalAfterMessages, "achieved", "", evidence);
-            const completionHandback = mirrorHandbackLine(activeGoalAfterMessages);
-            const completionHandbackSuffix = completionHandback ? `
-
-${completionHandback}` : "";
-            cleanupGoal(sessionID);
-            const promoted = ordered ? promoteNextOrderedGoal(sessionID) : null;
-            const postCompletionSnapshot = captureFocusedGoalSnapshot(sessionID);
-            const durable = await persistTerminalState(sessionID, "completion", ledgerDurable);
-            if (durable === false) {
-              const restored = restoreAfterTerminalPersistenceFailure(sessionID, activeGoalAfterMessages, {
-                ordered,
-                expectedCurrentSnapshot: postCompletionSnapshot,
-                expectedResult: completedResult
-              });
+              const activePromoted = promoted ? activeGoal(sessionID, promoted.goalId, promoted.runId) : null;
               if (auditMessagesEnabled) {
-                await announceAudit(sessionID, restored ? "Audit result: completion verified, but storage failed; goal remains paused and was not archived." : "Audit result: completion verified, but its terminal write failed after goal state changed; current state was left untouched.");
+                await announceAudit(sessionID, (activePromoted ? "Audit result: completion accepted — goal archived as achieved; next ordered goal active." : "Audit result: completion accepted — goal archived as achieved.") + completionHandbackSuffix);
               } else {
-                announceLifecycle(sessionID, restored ? "Goal paused — completion could not be recorded durably." : "Previous goal completion could not be confirmed durably after goal state changed.", restored ? {
-                  goal: activeGoalAfterMessages,
-                  transition: "terminal-persistence-failed",
-                  reason: activeGoalAfterMessages.stopReason,
-                  expectedState: "paused",
-                  expectedStopReason: "terminal persistence failed"
-                } : {
-                  transition: "terminal-persistence-raced",
-                  requireCurrent: false
+                announceLifecycle(sessionID, (activePromoted ? "Goal achieved; next ordered goal active." : "Goal achieved.") + completionHandbackSuffix, {
+                  goal: activePromoted || activeGoalAfterMessages,
+                  transition: activePromoted ? "achieved-promoted" : "achieved",
+                  requireCurrent: Boolean(activePromoted),
+                  expectedState: activePromoted ? "active" : ""
                 });
               }
               return;
             }
-            const activePromoted = promoted ? activeGoal(sessionID, promoted.goalId, promoted.runId) : null;
-            if (auditMessagesEnabled) {
-              await announceAudit(sessionID, (activePromoted ? "Audit result: completion accepted — goal archived as achieved; next ordered goal active." : "Audit result: completion accepted — goal archived as achieved.") + completionHandbackSuffix);
-            } else {
-              announceLifecycle(sessionID, (activePromoted ? "Goal achieved; next ordered goal active." : "Goal achieved.") + completionHandbackSuffix, {
-                goal: activePromoted || activeGoalAfterMessages,
-                transition: activePromoted ? "achieved-promoted" : "achieved",
-                requireCurrent: Boolean(activePromoted),
-                expectedState: activePromoted ? "active" : ""
-              });
-            }
-            return;
-          }
-          completionUnverified = true;
-          activeGoalAfterMessages.lastStatus = "Rejected [goal:complete]: no [goal:evidence] line provided. Completion not recorded; re-prompting for evidence.";
-          pushHistory(activeGoalAfterMessages, "completion-unverified", "Assistant output [goal:complete] without a [goal:evidence] line; completion rejected, continuing.");
-        } else if (!terminalBoundary && goalIsBlocked(turnText)) {
-          const reason = extractBlockedReason(turnText);
-          if (reason) {
-            await announceAudit(sessionID, `Auditing goal blocker: the assistant reported it is blocked on "${summarizeText(activeGoalAfterMessages.condition, 120)}".`);
-            const blockedGoal = activeGoal(sessionID, goalID, runID);
-            if (!blockedGoal)
-              return;
-            blockedGoal.blockedReason = reason;
-            blockedGoal.lastStatus = "Assistant reported blocked.";
-            blockedGoal.stopped = true;
-            blockedGoal.stopReason = "blocked";
-            const ledgerDurable = pushHistory(blockedGoal, "blocked", reason);
-            const durable = await persistTerminalState(sessionID, "blocked", ledgerDurable);
-            const blockedGoalAfterPersist = currentGoal(sessionID, goalID, runID);
-            if (blockedGoalAfterPersist !== blockedGoal || !blockedGoal.stopped || blockedGoal.stopReason !== "blocked")
-              return;
-            if (durable === false) {
-              blockedGoal.stopReason = "terminal persistence failed";
-              blockedGoal.lastStatus = "Blocked state could not be persisted; goal remains paused.";
+            completionUnverified = true;
+            activeGoalAfterMessages.lastStatus = "Rejected [goal:complete]: no [goal:evidence] line provided. Completion not recorded; re-prompting for evidence.";
+            pushHistory(activeGoalAfterMessages, "completion-unverified", "Assistant output [goal:complete] without a [goal:evidence] line; completion rejected, continuing.");
+          } else if (!terminalBoundary && goalIsBlocked(turnText)) {
+            const reason = extractBlockedReason(turnText);
+            if (reason) {
+              await announceAudit(sessionID, `Auditing goal blocker: the assistant reported it is blocked on "${summarizeText(activeGoalAfterMessages.condition, 120)}".`);
+              const blockedGoal = activeGoal(sessionID, goalID, runID);
+              if (!blockedGoal)
+                return;
+              blockedGoal.blockedReason = reason;
+              blockedGoal.lastStatus = "Assistant reported blocked.";
+              blockedGoal.stopped = true;
+              blockedGoal.stopReason = "blocked";
+              const ledgerDurable = pushHistory(blockedGoal, "blocked", reason);
+              const durable = await persistTerminalState(sessionID, "blocked", ledgerDurable);
+              const blockedGoalAfterPersist = currentGoal(sessionID, goalID, runID);
+              if (blockedGoalAfterPersist !== blockedGoal || !blockedGoal.stopped || blockedGoal.stopReason !== "blocked")
+                return;
+              if (durable === false) {
+                blockedGoal.stopReason = "terminal persistence failed";
+                blockedGoal.lastStatus = "Blocked state could not be persisted; goal remains paused.";
+                if (auditMessagesEnabled) {
+                  await announceAudit(sessionID, "Audit result: blocker recognized, but storage failed; goal remains paused.");
+                } else {
+                  announceLifecycle(sessionID, "Goal paused — blocked state could not be recorded durably.", {
+                    goal: blockedGoal,
+                    transition: "terminal-persistence-failed",
+                    reason: blockedGoal.stopReason,
+                    expectedState: "paused",
+                    expectedStopReason: "terminal persistence failed"
+                  });
+                }
+                return;
+              }
               if (auditMessagesEnabled) {
-                await announceAudit(sessionID, "Audit result: blocker recognized, but storage failed; goal remains paused.");
+                await announceAudit(sessionID, `Audit result: goal paused as blocked — ${summarizeText(reason, 160)}. Run /${commandName} resume after addressing it.`);
               } else {
-                announceLifecycle(sessionID, "Goal paused — blocked state could not be recorded durably.", {
+                announceLifecycle(sessionID, `Goal blocked. Run /${commandName} status for the reason.`, {
                   goal: blockedGoal,
-                  transition: "terminal-persistence-failed",
-                  reason: blockedGoal.stopReason,
-                  expectedState: "paused",
-                  expectedStopReason: "terminal persistence failed"
+                  transition: "blocked",
+                  expectedState: "blocked",
+                  expectedStopReason: "blocked"
                 });
               }
               return;
             }
-            if (auditMessagesEnabled) {
-              await announceAudit(sessionID, `Audit result: goal paused as blocked — ${summarizeText(reason, 160)}. Run /${commandName} resume after addressing it.`);
-            } else {
-              announceLifecycle(sessionID, `Goal blocked. Run /${commandName} status for the reason.`, {
-                goal: blockedGoal,
-                transition: "blocked",
-                expectedState: "blocked",
-                expectedStopReason: "blocked"
-              });
-            }
-            return;
+            blockerUnstated = true;
+            activeGoalAfterMessages.lastStatus = "Rejected [goal:blocked]: no concrete blocker stated. Re-prompting for the specific blocker.";
+            pushHistory(activeGoalAfterMessages, "blocker-unstated", "Assistant output [goal:blocked] without a concrete blocker line; rejected, continuing.");
           }
-          blockerUnstated = true;
-          activeGoalAfterMessages.lastStatus = "Rejected [goal:blocked]: no concrete blocker stated. Re-prompting for the specific blocker.";
-          pushHistory(activeGoalAfterMessages, "blocker-unstated", "Assistant output [goal:blocked] without a concrete blocker line; rejected, continuing.");
-        }
         const limitReason = stopReason(activeGoalAfterMessages);
         if (limitReason) {
           let lifecycleAnnounced = false;
@@ -21626,25 +21753,13 @@ ${completionHandback}` : "";
         if (lowOutputLooksStalled && !childWakeEvent) {
           activeGoalAfterMessages.noProgressTurns += 1;
           if (activeGoalAfterMessages.noProgressTurns >= activeGoalAfterMessages.options.noProgressTurnsBeforePause) {
-            if (completionUnverified || blockerUnstated) {
-              activeGoalAfterMessages.formatFailures += 1;
-            }
-            activeGoalAfterMessages.stopped = true;
-            activeGoalAfterMessages.stopReason = "no progress";
-            activeGoalAfterMessages.lastStatus = `Goal auto-continue paused after ${activeGoalAfterMessages.noProgressTurns} low-progress turn(s); the latest turn produced ${turnOutputTokens} output token(s). Run /${commandName} resume to continue.`;
-            pushHistory(activeGoalAfterMessages, "paused", `Paused after ${activeGoalAfterMessages.noProgressTurns} low-progress turn(s) below ${activeGoalAfterMessages.options.noProgressTokenThreshold} output tokens.`);
-            await persist(sessionID);
-            announceLifecycle(sessionID, "Goal paused — no progress threshold reached.", {
-              goal: activeGoalAfterMessages,
-              transition: "no-progress-paused",
-              reason: activeGoalAfterMessages.stopReason,
-              expectedState: "paused",
-              expectedStopReason: "no progress"
-            });
-            return;
+            stallNudge = `${activeGoalAfterMessages.noProgressTurns} consecutive low-progress turn(s) (latest: ${turnOutputTokens} output token(s), no tool call).`;
+            activeGoalAfterMessages.lastStatus = `Low-progress threshold reached (${activeGoalAfterMessages.noProgressTurns}/${activeGoalAfterMessages.options.noProgressTurnsBeforePause}); continuing with a re-plan nudge and backoff.`;
+            pushHistory(activeGoalAfterMessages, "warning", `${activeGoalAfterMessages.noProgressTurns} low-progress turn(s) below ${activeGoalAfterMessages.options.noProgressTokenThreshold} output tokens; nudging the model instead of pausing.`);
+          } else {
+            activeGoalAfterMessages.lastStatus = `Low-progress turn detected (${activeGoalAfterMessages.noProgressTurns}/${activeGoalAfterMessages.options.noProgressTurnsBeforePause}); monitoring for another stalled turn.`;
+            pushHistory(activeGoalAfterMessages, "warning", `Observed a low-progress turn below ${activeGoalAfterMessages.options.noProgressTokenThreshold} output tokens; grace count ${activeGoalAfterMessages.noProgressTurns}/${activeGoalAfterMessages.options.noProgressTurnsBeforePause}.`);
           }
-          activeGoalAfterMessages.lastStatus = `Low-progress turn detected (${activeGoalAfterMessages.noProgressTurns}/${activeGoalAfterMessages.options.noProgressTurnsBeforePause}); monitoring for another stalled turn before pausing.`;
-          pushHistory(activeGoalAfterMessages, "warning", `Observed a low-progress turn below ${activeGoalAfterMessages.options.noProgressTokenThreshold} output tokens; grace count ${activeGoalAfterMessages.noProgressTurns}/${activeGoalAfterMessages.options.noProgressTurnsBeforePause}.`);
         } else if (!childWakeEvent && (turnOutputTokens !== null || assistantChanged || !latestAssistant)) {
           activeGoalAfterMessages.noProgressTurns = 0;
         }
@@ -21652,29 +21767,29 @@ ${completionHandback}` : "";
         if (noToolCallContinuation && !lowOutputLooksStalled && !childWakeEvent) {
           activeGoalAfterMessages.noToolCallTurns += 1;
           if (activeGoalAfterMessages.noToolCallTurns >= activeGoalAfterMessages.options.noToolCallTurnsBeforePause) {
-            activeGoalAfterMessages.stopped = true;
-            activeGoalAfterMessages.stopReason = "no tool calls";
-            activeGoalAfterMessages.lastStatus = `Goal auto-continue paused after ${activeGoalAfterMessages.noToolCallTurns} continuation turn(s) with no tool calls (possible self-chat loop). Run /${commandName} resume to continue.`;
-            pushHistory(activeGoalAfterMessages, "paused", `Paused after ${activeGoalAfterMessages.noToolCallTurns} continuation turn(s) that produced no tool calls.`);
-            await persist(sessionID);
-            announceLifecycle(sessionID, "Goal paused — no-tool-call threshold reached.", {
-              goal: activeGoalAfterMessages,
-              transition: "no-tool-calls-paused",
-              reason: activeGoalAfterMessages.stopReason,
-              expectedState: "paused",
-              expectedStopReason: "no tool calls"
-            });
-            return;
+            stallNudge = `${activeGoalAfterMessages.noToolCallTurns} consecutive continuation turn(s) without a tool call (possible self-chat loop).`;
+            activeGoalAfterMessages.lastStatus = `No-tool-call threshold reached (${activeGoalAfterMessages.noToolCallTurns}/${activeGoalAfterMessages.options.noToolCallTurnsBeforePause}); continuing with a re-plan nudge and backoff.`;
+            pushHistory(activeGoalAfterMessages, "warning", `${activeGoalAfterMessages.noToolCallTurns} continuation turn(s) produced no tool calls; nudging the model instead of pausing.`);
+          } else {
+            activeGoalAfterMessages.lastStatus = `Continuation turn produced no tool calls (${activeGoalAfterMessages.noToolCallTurns}/${activeGoalAfterMessages.options.noToolCallTurnsBeforePause}); monitoring for another.`;
+            pushHistory(activeGoalAfterMessages, "warning", `Observed a continuation turn with no tool calls; grace count ${activeGoalAfterMessages.noToolCallTurns}/${activeGoalAfterMessages.options.noToolCallTurnsBeforePause}.`);
           }
-          activeGoalAfterMessages.lastStatus = `Continuation turn produced no tool calls (${activeGoalAfterMessages.noToolCallTurns}/${activeGoalAfterMessages.options.noToolCallTurnsBeforePause}); monitoring for another before pausing.`;
-          pushHistory(activeGoalAfterMessages, "warning", `Observed a continuation turn with no tool calls; grace count ${activeGoalAfterMessages.noToolCallTurns}/${activeGoalAfterMessages.options.noToolCallTurnsBeforePause}.`);
         } else if (turnHasToolCall || !latestAssistant) {
           activeGoalAfterMessages.noToolCallTurns = 0;
         }
+        if (!stallNudge) {
+          const stallOptions = activeGoalAfterMessages.options;
+          if (stallOptions.noProgressTurnsBeforePause > 0 && activeGoalAfterMessages.noProgressTurns >= stallOptions.noProgressTurnsBeforePause) {
+            stallNudge = `${activeGoalAfterMessages.noProgressTurns} consecutive low-progress turn(s), no tool call.`;
+          } else if (stallOptions.noToolCallTurnsBeforePause > 0 && activeGoalAfterMessages.noToolCallTurns >= stallOptions.noToolCallTurnsBeforePause) {
+            stallNudge = `${activeGoalAfterMessages.noToolCallTurns} consecutive continuation turn(s) without a tool call (possible self-chat loop).`;
+          }
+        }
         const elapsedSinceLastContinue = Date.now() - activeGoalAfterMessages.lastContinueAt;
+        const continuationDelay = continuationDelayMs(activeGoalAfterMessages);
         let cooldownWaited = false;
-        if (activeGoalAfterMessages.lastContinueAt && elapsedSinceLastContinue < activeGoalAfterMessages.options.minDelayMs) {
-          const delayCompleted = await sleep(activeGoalAfterMessages.options.minDelayMs - elapsedSinceLastContinue, continueController.signal);
+        if (activeGoalAfterMessages.lastContinueAt && elapsedSinceLastContinue < continuationDelay) {
+          const delayCompleted = await sleep(continuationDelay - elapsedSinceLastContinue, continueController.signal);
           if (!delayCompleted)
             return;
           cooldownWaited = true;
@@ -21682,6 +21797,11 @@ ${completionHandback}` : "";
         const activeGoalBeforePrompt = await claimContinuationSource(sessionID, goalID, runID, compactionEpoch, messages, { refreshMessages: cooldownWaited });
         if (!activeGoalBeforePrompt)
           return;
+        if (continueController.signal.aborted) {
+          activeGoalBeforePrompt.continuationClaim = null;
+          await persist(sessionID);
+          return;
+        }
         claimedSourceAssistantMessageID = activeGoalBeforePrompt.continuationClaim?.sourceAssistantMessageID || "";
         claimedCompactionEpoch = activeGoalBeforePrompt.continuationClaim?.compactionEpoch ?? -1;
         if (claimedCompactionEpoch !== activeGoalBeforePrompt.compactionEpoch)
@@ -21705,30 +21825,26 @@ ${completionHandback}` : "";
         activeGoalBeforePrompt.turnCount += 1;
         activeGoalBeforePrompt.lastContinueAt = Date.now();
         if (!budgetWrapup) {
+          if (activeGoalBeforePrompt.pendingAuditRejection) {
+            if (!completionUnverified && !blockerUnstated) {
+              completionUnverified = true;
+              auditRejected = true;
+              completionRejection = `Previous completion was rejected by the completion audit: ${activeGoalBeforePrompt.pendingAuditRejection}. ` + "Address that feedback with real, verified work before claiming completion again.";
+            }
+            activeGoalBeforePrompt.pendingAuditRejection = "";
+          }
           if (completionUnverified) {
             activeGoalBeforePrompt.formatFailures += 1;
-            activeGoalBeforePrompt.lastStatus = completionRejection ? `Rejected a [goal:complete] against an unsatisfied action plan (${planStatusLabel(activeGoalBeforePrompt.plan)}); re-prompting on turn ${activeGoalBeforePrompt.turnCount}.` : `Rejected an unverified [goal:complete] (no [goal:evidence]); re-prompting for evidence on turn ${activeGoalBeforePrompt.turnCount}.`;
+            activeGoalBeforePrompt.lastStatus = auditRejected ? `Completion audit rejected; re-prompting with the audit feedback on turn ${activeGoalBeforePrompt.turnCount}.` : completionRejection ? `Rejected a [goal:complete] against an unsatisfied action plan (${planStatusLabel(activeGoalBeforePrompt.plan)}); re-prompting on turn ${activeGoalBeforePrompt.turnCount}.` : `Rejected an unverified [goal:complete] (no [goal:evidence]); re-prompting for evidence on turn ${activeGoalBeforePrompt.turnCount}.`;
           } else if (blockerUnstated) {
             activeGoalBeforePrompt.formatFailures += 1;
             activeGoalBeforePrompt.lastStatus = `Rejected a [goal:blocked] with no concrete blocker; re-prompting on turn ${activeGoalBeforePrompt.turnCount}.`;
           } else {
             activeGoalBeforePrompt.formatFailures = Math.max(0, activeGoalBeforePrompt.formatFailures - 1);
-            activeGoalBeforePrompt.lastStatus = turnText ? `Continuing after assistant turn ${activeGoalBeforePrompt.turnCount}.` : `Continuing after idle event ${activeGoalBeforePrompt.turnCount}.`;
+            activeGoalBeforePrompt.lastStatus = stallNudge ? `Continuing with a stall nudge after turn ${activeGoalBeforePrompt.turnCount}.` : turnText ? `Continuing after assistant turn ${activeGoalBeforePrompt.turnCount}.` : `Continuing after idle event ${activeGoalBeforePrompt.turnCount}.`;
           }
           if (activeGoalBeforePrompt.formatFailures >= activeGoalBeforePrompt.options.maxPromptFailures) {
-            activeGoalBeforePrompt.stopped = true;
-            activeGoalBeforePrompt.stopReason = "format validation failures";
-            activeGoalBeforePrompt.lastStatus = `Paused after ${activeGoalBeforePrompt.formatFailures} consecutive format-validation failure(s) (missing [goal:evidence] or concrete blocker). Run /${commandName} resume to retry.`;
-            pushHistory(activeGoalBeforePrompt, "paused", `Paused after ${activeGoalBeforePrompt.formatFailures} consecutive format-validation failure(s).`);
-            await persist(sessionID);
-            announceLifecycle(sessionID, "Goal paused — repeated completion/blocker format failures.", {
-              goal: activeGoalBeforePrompt,
-              transition: "format-failures-paused",
-              reason: activeGoalBeforePrompt.stopReason,
-              expectedState: "paused",
-              expectedStopReason: "format validation failures"
-            });
-            return;
+            pushHistory(activeGoalBeforePrompt, "warning", `${activeGoalBeforePrompt.formatFailures} consecutive format-validation failure(s); re-prompting with backoff instead of pausing.`);
           }
         }
         if (!await leaseStillHeldForPrompt(sessionID))
@@ -21744,6 +21860,7 @@ ${completionHandback}` : "";
                 completionUnverified,
                 blockerUnstated,
                 completionRejection,
+                stallNudge,
                 mirrorMode
               }), sessionID), continueToken)
             ]
@@ -21751,7 +21868,6 @@ ${completionHandback}` : "";
         } finally {
           currentRuntime().promptInFlightSessions.delete(sessionID);
         }
-        let promptFailurePausedGoal = null;
         if (response.error) {
           const activeGoalAfterPrompt = currentGoal(sessionID, goalID, runID);
           const message = `Auto-continue failed: ${response.error.name || "unknown error"}`;
@@ -21761,11 +21877,9 @@ ${completionHandback}` : "";
             activeGoalAfterPrompt.lastStatus = message;
             pushHistory(activeGoalAfterPrompt, "error", message);
             if (activeGoalAfterPrompt.promptFailures >= activeGoalAfterPrompt.options.maxPromptFailures) {
-              activeGoalAfterPrompt.stopped = true;
-              activeGoalAfterPrompt.stopReason = "auto-continue failures";
-              activeGoalAfterPrompt.lastStatus = `${message}; paused after ${activeGoalAfterPrompt.promptFailures} failure(s). Run /${commandName} resume to retry.`;
-              promptFailurePausedGoal = activeGoalAfterPrompt;
+              activeGoalAfterPrompt.lastStatus = `${message}; ${activeGoalAfterPrompt.promptFailures} consecutive failure(s), retrying on the next idle with backoff.`;
             }
+            schedulePromptRetryWake(sessionID, activeGoalAfterPrompt);
           }
           await logPluginError(client, message, response.error);
         } else {
@@ -21776,15 +21890,6 @@ ${completionHandback}` : "";
           }
         }
         await persist(sessionID);
-        if (promptFailurePausedGoal) {
-          announceLifecycle(sessionID, "Goal paused — repeated auto-continue failures.", {
-            goal: promptFailurePausedGoal,
-            transition: "prompt-failures-paused",
-            reason: promptFailurePausedGoal.stopReason,
-            expectedState: "paused",
-            expectedStopReason: "auto-continue failures"
-          });
-        }
       } catch (error51) {
         const activeGoalAfterError = currentGoal(sessionID, goalID, runID);
         if (activeGoalAfterError) {
@@ -21796,20 +21901,10 @@ ${completionHandback}` : "";
           activeGoalAfterError.lastStatus = message;
           pushHistory(activeGoalAfterError, "error", message);
           if (activeGoalAfterError.promptFailures >= activeGoalAfterError.options.maxPromptFailures) {
-            activeGoalAfterError.stopped = true;
-            activeGoalAfterError.stopReason = "auto-continue failures";
-            activeGoalAfterError.lastStatus = `${message}; paused after ${activeGoalAfterError.promptFailures} failure(s). Run /${commandName} resume to retry.`;
+            activeGoalAfterError.lastStatus = `${message}; ${activeGoalAfterError.promptFailures} consecutive failure(s), retrying on the next idle with backoff.`;
           }
+          schedulePromptRetryWake(sessionID, activeGoalAfterError);
           await persist(sessionID);
-          if (activeGoalAfterError.stopped && activeGoalAfterError.stopReason === "auto-continue failures") {
-            announceLifecycle(sessionID, "Goal paused — repeated auto-continue failures.", {
-              goal: activeGoalAfterError,
-              transition: "prompt-failures-paused",
-              reason: activeGoalAfterError.stopReason,
-              expectedState: "paused",
-              expectedStopReason: "auto-continue failures"
-            });
-          }
         }
         await logPluginError(client, "Auto-continue failed", error51);
       } finally {
@@ -21836,6 +21931,8 @@ ${completionHandback}` : "";
       const systemBlocks = Array.isArray(output.system) ? [...output.system] : [];
       if (systemBlocks.some((block) => systemBlockContainsGoal(block, blockID)))
         return;
+      const deferringAgent = !commandGuarded && goal && !goal.stopped ? await restrictedAgentFor(input.sessionID) : "";
+      const deferringLabel = deferringAgent ? isPlanAgent(deferringAgent) ? "Plan" : deferringAgent : "";
       const goalBlock = commandGuarded ? [
         `<opencode_goal_plugin id="${blockID}">`,
         "<goal_state>control-command</goal_state>",
@@ -21851,13 +21948,20 @@ ${completionHandback}` : "";
         `To continue, the user can run /${commandName} resume or explicitly ask you to call goal_resume before doing any goal work.`,
         "</opencode_goal_plugin>"
       ].join(`
+`) : deferringLabel ? [
+        `<opencode_goal_plugin id="${goal.goalId}">`,
+        "<goal_state>deferred</goal_state>",
+        `A goal is active for this session, but the ${deferringLabel} agent is planning-only, so goal work is deferred. Do not do goal work, modify files for it, or call completion or blocker tools during this turn; plan only.`,
+        "The goal starts automatically once an executing agent is active and the session goes idle.",
+        "</opencode_goal_plugin>"
+      ].join(`
 `) : [
         `<opencode_goal_plugin id="${goal.goalId}">`,
         buildGoalBlock(goal),
         ...buildPlanSystemLines(goal, { mirrorMode }),
         "Keep working until the goal is fully satisfied.",
         "When fully satisfied, put a `[goal:evidence]` line summarizing what you verified immediately before `[goal:complete]`. A `[goal:complete]` without evidence is rejected.",
-        "If user input is required, explain the concrete blocker in the line immediately before `[goal:blocked]`. A `[goal:blocked]` without a concrete blocker is rejected.",
+        `If you are hard-blocked, explain the concrete blocker in the line immediately before \`[goal:blocked]\`. A \`[goal:blocked]\` without a concrete blocker is rejected. ${GOAL_BLOCK_DETERRENCE}`,
         "</opencode_goal_plugin>"
       ].join(`
 `);
@@ -22134,6 +22238,9 @@ var testInternals = {
   normalizePersistenceOptions,
   sessionPathsFor,
   userInterventionDetected,
+  isHostSyntheticUserMessage,
+  providerErrorBackoffMs,
+  continuationSnapshot,
   outputTokensForMessage,
   parseGoalArguments,
   buildGoalState,
