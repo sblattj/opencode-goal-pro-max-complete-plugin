@@ -39,8 +39,8 @@ human-readable denial through its normal model-rendered command turn. Since
 `idleLeaseReleaseMs` (3 s by default). Idle means no active or queued goal,
 command turn, continuation, prompt, load, or hook/tool call is in flight for it.
 An explicit goal command or tool may then acquire the shard. The same is true
-once the owner exits. Recovered active goals load paused and require an
-explicit resume. Distinct sessions always run concurrently. Forking creates a
+once the owner exits. Recovered active goals load with a recovery note and keep
+running; a restart is not a stop. Distinct sessions always run concurrently. Forking creates a
 distinct session shard and remains the supported way to run two goals at once
 from the same conversation.
 
@@ -97,7 +97,8 @@ OpenCode into synthetic Read/MCP text and file parts before `chat.message`. The
 plugin correlates that host-resolved shape to the exact one-shot command and
 generated message/session before treating it as plugin-owned. Each retained
 file must yield at least one resolved companion part; a host-reported read error
-pauses the goal without reclassifying the command as human intervention.
+is recorded without reclassifying the command as a human message, and the goal
+keeps running.
 
 OpenCode 1.17.15 and 1.18.10 do not invoke
 `experimental.chat.system.transform`. Control-command correctness therefore

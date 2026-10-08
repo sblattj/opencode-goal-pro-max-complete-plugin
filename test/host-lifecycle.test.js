@@ -716,7 +716,6 @@ test("passive goal tools reject honestly, remain per-session, and take over paus
     const canonical = [
       ["goal_status", {}, "status"],
       ["goal_set", { objective: "must not replace" }, "set"],
-      ["goal_pause", {}, "pause"],
       ["goal_resume", {}, "resume"],
       ["goal_block", { blocker: "must not block" }, "block"],
       ["goal_complete", { summary: "must not complete" }, "complete"],
