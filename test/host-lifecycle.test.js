@@ -232,7 +232,7 @@ test("idle in a fork-like session cannot continue its parent's goal", async () =
   assert.equal(promptCalls.length, 0)
 })
 
-test("MessageAbortedError followed by idle does not restart autonomous work", async () => {
+test("MessageAbortedError ends the turn, not the goal: the following idle continues", async () => {
   const promptCalls = []
   const hooks = await createPlugin(
     hostClient({
@@ -257,8 +257,14 @@ test("MessageAbortedError followed by idle does not restart autonomous work", as
   })
   await idle(hooks, sessionID)
 
-  assert.equal(promptCalls.length, 0)
-  assert.match(await goalStatus(hooks, sessionID), /abort|paused|stopped/i)
+  assert.equal(promptCalls.length, 1)
+  assert.match(await goalStatus(hooks, sessionID), /State: active/)
+  assert.ok(
+    testInternals.currentGoal(sessionID).history.some(
+      (entry) => entry.type === "warning" && /abort/i.test(entry.detail),
+    ),
+    "the abort is recorded in history",
+  )
 })
 
 test("plugin continuation prompt is synthetic and carries namespaced metadata", async () => {
@@ -649,7 +655,7 @@ test("legacy or incomplete leases stay passive with actionable manual recovery",
   }
 })
 
-test("passive goal tools reject honestly, remain per-session, and take over paused", async () => {
+test("passive goal tools reject honestly, remain per-session, and take over the live goal", async () => {
   const directory = await fs.mkdtemp(join(tmpdir(), "goal-plugin-passive-tools-"))
   const stateFilePath = join(directory, "state.json")
   const sessionID = "passive-tools-session"
@@ -800,7 +806,9 @@ test("passive goal tools reject honestly, remain per-session, and take over paus
     const takeover = JSON.parse(await contender.tool.goal_status.execute({}, { sessionID }))
     assert.equal(takeover.ok, true)
     assert.match(takeover.message, /durable owner objective/)
-    assert.match(takeover.message, /recovered after restart|paused|stopped/i)
+    // The previous owner's restart does not pause the goal: it is taken over live.
+    assert.equal(testInternals.currentGoal(sessionID).stopped, false)
+    assert.match(testInternals.currentGoal(sessionID).lastStatus, /still active/)
     const stateAfterTakeover = await fs.readFile(paths.stateFilePath, "utf8")
 
     await contender.event({
@@ -818,9 +826,7 @@ test("passive goal tools reject honestly, remain per-session, and take over paus
       },
     })
     assert.equal(await fs.readFile(paths.stateFilePath, "utf8"), stateAfterTakeover)
-    const resumed = JSON.parse(await contender.tool.goal_resume.execute({}, { sessionID }))
-    assert.equal(resumed.ok, true)
-    const stateAfterResume = await fs.readFile(paths.stateFilePath, "utf8")
+    const stateAfterResume = stateAfterTakeover
     assert.equal(testInternals.currentGoal(sessionID).stopped, false)
 
     await contender.event({
@@ -846,10 +852,9 @@ test("passive goal tools reject honestly, remain per-session, and take over paus
     const lifecycleLogs = logs.filter((entry) => entry.body.extra?.kind === "goal-lifecycle")
     const leaseWarnings = logs.filter((entry) => entry.body.extra?.kind !== "goal-lifecycle")
     assert.equal(leaseWarnings.length, 1)
-    assert.equal(lifecycleLogs.length, 3)
+    assert.equal(lifecycleLogs.length, 2)
     assert.match(lifecycleLogs[0].body.message, /Goal active/i)
-    assert.match(lifecycleLogs[1].body.message, /Goal recovered and paused/i)
-    assert.match(lifecycleLogs[2].body.message, /Goal resumed/i)
+    assert.match(lifecycleLogs[1].body.message, /Goal recovered after a restart and still active/i)
   } finally {
     await contender?.dispose()
     await owner?.dispose()
@@ -916,14 +921,15 @@ test("expired passive command guards require a fresh command boundary for takeov
         assert.equal(oldTurnToolResult.status, "rejected")
         assert.match(oldTurnToolResult.reason.message, /no tool calls are allowed/i)
         assert.match(takeoverCommand.parts[0].text, /durable objective for expired guard takeover/)
-        assert.match(takeoverCommand.parts[0].text, /recovered after restart|paused|stopped/i)
+        assert.match(takeoverCommand.parts[0].text, /State: active/)
+        assert.match(takeoverCommand.parts[0].text, /still active/)
       } else {
         const takeover = JSON.parse(
           await contender.tool.goal_status.execute({}, { sessionID, agent: "build" }),
         )
         assert.equal(takeover.ok, true, "pending guard expired")
         assert.match(takeover.message, /durable objective for expired guard takeover/)
-        assert.match(takeover.message, /recovered after restart|paused|stopped/i)
+        assert.match(takeover.message, /still active/)
       }
     } finally {
       Date.now = originalNow
@@ -1188,10 +1194,13 @@ test("passive Plan context survives explicit takeover and prevents auto-continue
     owner = null
     await new Promise((resolve) => setTimeout(resolve, 300))
 
-    const resumed = JSON.parse(
-      await contender.tool.goal_resume.execute({}, { sessionID, agent: "Plan" }),
+    // The explicit takeover finds the goal still active (a restart never
+    // pauses it); the Plan context then defers it instead of continuing.
+    const takeover = JSON.parse(
+      await contender.tool.goal_status.execute({}, { sessionID, agent: "Plan" }),
     )
-    assert.equal(resumed.ok, true)
+    assert.equal(takeover.ok, true)
+    assert.equal(testInternals.currentGoal(sessionID).stopped, false)
     await idle(contender, sessionID)
 
     assert.equal(promptCalls.length, 0)
@@ -1199,7 +1208,9 @@ test("passive Plan context survives explicit takeover and prevents auto-continue
       await contender.tool.goal_status.execute({}, { sessionID, agent: "Plan" }),
     )
     assert.equal(status.ok, true)
-    assert.match(status.message, /Plan|plan agent active/i)
+    assert.match(status.message, /deferred/i)
+    assert.match(status.message, /planning-only/i)
+    assert.equal(testInternals.currentGoal(sessionID).stopped, false)
   } finally {
     await contender?.dispose()
     await owner?.dispose()

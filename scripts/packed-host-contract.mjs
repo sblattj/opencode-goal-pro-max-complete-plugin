@@ -316,14 +316,16 @@ try {
     )
     assert.equal(takeover.ok, true)
     assert.match(takeover.message, /persisted installed-artifact objective/)
-    assert.match(takeover.message, /recovered after restart|paused|stopped/i)
+    // The owner's exit does not pause the goal: the explicit takeover finds
+    // it still active, and the next idle continues it.
+    assert.match(takeover.message, /still active/)
     await contender.event({
       event: {
         type: "session.status",
         properties: { sessionID: persistentSessionID, status: { type: "idle" } },
       },
     })
-    assert.equal(passivePromptCalls.length, 0)
+    assert.equal(passivePromptCalls.length, 1)
   } finally {
     await owner.dispose()
     await contender.dispose()

@@ -110,6 +110,8 @@ const {
   totalTokensForMessage,
   goalSpendTokens,
   userInterventionDetected,
+  isHostSyntheticUserMessage,
+  continuationSnapshot,
   xdgStateFilePath,
   mirrorRowStatus,
   mirrorRowSuffix,
@@ -289,6 +291,34 @@ function pluginContinuationMessage(id = "msg-plugin", correlationID = `continuat
         metadata: {
           "opencode-goal-plugin": { kind: "continuation", id: correlationID },
         },
+      },
+    ],
+  }
+}
+
+function compactionUserMessage(id = "msg-compaction") {
+  return {
+    info: {
+      id,
+      role: "user",
+      sessionID: "session-1",
+      agent: "build",
+      model: { providerID: "ferry", modelID: "heavy" },
+      summary: { diffs: [] },
+    },
+    parts: [{ type: "compaction", auto: true, tail_start_id: "msg-tail" }],
+  }
+}
+
+function compactionContinueMessage(id = "msg-compaction-continue") {
+  return {
+    info: { id, role: "user", sessionID: "session-1", agent: "build" },
+    parts: [
+      {
+        type: "text",
+        metadata: { compaction_continue: true },
+        synthetic: true,
+        text: "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed.",
       },
     ],
   }
@@ -927,8 +957,10 @@ test("command correlation accepts only host-resolved companions from retained at
     })
 
     await hooks["chat.message"]({ sessionID, messageID, agent: "build" }, output)
-    assert.equal(currentGoal(sessionID).stopped, true)
-    assert.equal(currentGoal(sessionID).stopReason, "user intervention")
+    // Rejected as a command turn, so it is an ordinary human turn, which
+    // steers the goal instead of pausing it.
+    assert.equal(isPluginCommandMessage({ info: output.message, parts: output.parts }), false)
+    assert.equal(currentGoal(sessionID).stopped, false)
   }
 })
 
@@ -1038,8 +1070,7 @@ test("command correlation rejects missing or under-counted attachment expansions
     )
 
     await hooks["chat.message"]({ sessionID, messageID, agent: "build" }, output)
-    assert.equal(currentGoal(sessionID).stopped, true, fixture.name)
-    assert.equal(currentGoal(sessionID).stopReason, "user intervention", fixture.name)
+    assert.equal(currentGoal(sessionID).stopped, false, fixture.name)
     assert.equal(
       isPluginCommandMessage({ info: output.message, parts: output.parts }),
       false,
@@ -1092,8 +1123,9 @@ test("attachment read errors pause safely without losing command provenance", as
       },
     },
   })
-  assert.equal(currentGoal(sessionID).stopped, true)
-  assert.equal(currentGoal(sessionID).stopReason, "attachment resolution error")
+  // The attachment failure ends that turn, not the goal.
+  assert.equal(currentGoal(sessionID).stopped, false)
+  assert.equal(currentGoal(sessionID).stopReason, "")
 
   output.parts = resolveRoutedParts(
     [
@@ -1129,14 +1161,17 @@ test("attachment read errors pause safely without losing command provenance", as
       new RegExp(`control command.*${tool}.*blocked`, "i"),
     )
   }
-  assert.equal(currentGoal(sessionID).stopped, true)
-  assert.equal(currentGoal(sessionID).stopReason, "attachment resolution error")
+  assert.match(output.parts[0].text, /not paused/i)
+  assert.equal(currentGoal(sessionID).stopped, false)
+  assert.equal(currentGoal(sessionID).stopReason, "")
+  assert.match(currentGoal(sessionID).lastStatus, /continues after the cooldown/i)
   assert.equal(
     currentGoal(sessionID).history.some(
-      (entry) => entry.type === "paused" && /resolving an attached command file/i.test(entry.detail),
+      (entry) => entry.type === "warning" && /resolving an attached command file/i.test(entry.detail),
     ),
     true,
   )
+  assert.equal(currentGoal(sessionID).history.some((entry) => entry.type === "paused"), false)
 })
 
 test("attachment errors refresh an expired command correlation before the resolved error turn", async () => {
@@ -1187,7 +1222,8 @@ test("attachment errors refresh an expired command correlation before the resolv
     assert.equal(output.parts.length, 1)
     assert.match(output.parts[0].text, /^<goal_command_control>/)
     assert.doesNotMatch(output.parts[0].text, /Start working toward this goal now/)
-    assert.equal(currentGoal(sessionID).stopReason, "attachment resolution error")
+    assert.equal(currentGoal(sessionID).stopped, false)
+    assert.equal(currentGoal(sessionID).stopReason, "")
     await assert.rejects(
       () => hooks["tool.execute.before"](
         { tool: "write", sessionID, callID: "slow-attachment-error-write" },
@@ -1215,8 +1251,10 @@ test("public plugin metadata cannot forge a command or continuation turn", async
       { sessionID, messageID: forged.info.id, agent: "build" },
       { message: forged.info, parts: forged.parts },
     )
-    assert.equal(currentGoal(sessionID).stopped, true)
-    assert.equal(currentGoal(sessionID).stopReason, "user intervention")
+    // Treated as an ordinary human turn: never owned, and (since human
+    // messages steer instead of pausing) the goal keeps running.
+    assert.equal(isPluginGeneratedMessage(forged), false)
+    assert.equal(currentGoal(sessionID).stopped, false)
   }
 })
 
@@ -1235,7 +1273,16 @@ test("command correlation rejects replayed, altered, and mixed command messages"
       parts: accepted.parts,
     },
   )
-  assert.equal(currentGoal("command-replay").stopReason, "user intervention")
+  // Positive control: the genuinely routed command turn is owned.
+  assert.equal(isPluginGeneratedMessage(persistedRoutedCommand(accepted)), true)
+  assert.equal(
+    isPluginGeneratedMessage({
+      info: { id: "replayed-command", role: "user", sessionID: "command-replay" },
+      parts: accepted.parts,
+    }),
+    false,
+  )
+  assert.equal(currentGoal("command-replay").stopped, false)
 
   for (const [sessionID, mutate] of [
     ["command-altered", (parts) => { parts[0].text += " altered" }],
@@ -1257,7 +1304,8 @@ test("command correlation rejects replayed, altered, and mixed command messages"
     output.parts = resolveRoutedParts(output.parts, sessionID, messageID)
     mutate(output.parts)
     await hooks["chat.message"]({ sessionID, messageID, agent: "build" }, output)
-    assert.equal(currentGoal(sessionID).stopReason, "user intervention")
+    assert.equal(isPluginGeneratedMessage(persistedRoutedCommand(output)), false)
+    assert.equal(currentGoal(sessionID).stopped, false)
   }
 
   const sourceOutput = { parts: [textPart("status")] }
@@ -1276,7 +1324,14 @@ test("command correlation rejects replayed, altered, and mixed command messages"
       parts: sourceOutput.parts,
     },
   )
-  assert.equal(currentGoal("command-target").stopReason, "user intervention")
+  assert.equal(
+    isPluginGeneratedMessage({
+      info: { id: "cross-session-command", role: "user", sessionID: "command-target" },
+      parts: sourceOutput.parts,
+    }),
+    false,
+  )
+  assert.equal(currentGoal("command-target").stopped, false)
 })
 
 test("registerCommand:false omits the command hook entirely", async () => {
@@ -1619,9 +1674,73 @@ test("userInterventionDetected ignores plugin messages and respects ordering", (
     ),
     true,
   )
+  // Host-written compaction turns are not humans. Shapes copied from a real
+  // opencode.db: the compaction user message and the synthetic
+  // "Continue if you have next steps" message after an auto-compaction.
+  assert.equal(
+    detected(
+      [pluginContinuationMessage(), message("worked on it"), compactionUserMessage(), message("summary")],
+      goalRunning,
+    ),
+    false,
+  )
+  assert.equal(
+    detected(
+      [
+        pluginContinuationMessage(),
+        message("worked on it"),
+        compactionUserMessage(),
+        compactionContinueMessage(),
+        message("continuing"),
+      ],
+      goalRunning,
+    ),
+    false,
+  )
+  // A real human after the compaction is still recognized.
+  assert.equal(
+    detected(
+      [pluginContinuationMessage(), compactionUserMessage(), userMessage("now do Y"), message("ok")],
+      goalRunning,
+    ),
+    true,
+  )
 })
 
-test("a real user message during the loop pauses auto-continue (latest instruction wins)", async () => {
+test("isHostSyntheticUserMessage recognizes compaction turns and nothing a human wrote", () => {
+  assert.equal(isHostSyntheticUserMessage(compactionUserMessage()), true)
+  assert.equal(isHostSyntheticUserMessage(compactionContinueMessage()), true)
+  assert.equal(isHostSyntheticUserMessage(userMessage("hi")), false)
+  // A plugin-marked synthetic part is never host-synthetic (ownership decides).
+  assert.equal(isHostSyntheticUserMessage(pluginContinuationMessage()), false)
+  assert.equal(isHostSyntheticUserMessage(pluginCommandMessage()), false)
+  // A file attachment with only synthetic expansions is still a human turn.
+  assert.equal(
+    isHostSyntheticUserMessage({
+      info: { id: "msg-attach", role: "user", sessionID: "session-1" },
+      parts: [
+        { type: "text", text: "Called the Read tool", synthetic: true },
+        { type: "file", url: "file:///tmp/a.txt", mime: "text/plain" },
+      ],
+    }),
+    false,
+  )
+  assert.equal(isHostSyntheticUserMessage(message("assistant text")), false)
+  assert.equal(
+    isHostSyntheticUserMessage({ info: { id: "msg-empty", role: "user" }, parts: [] }),
+    false,
+  )
+  // continuationSnapshot does not count a compaction turn as the latest human
+  // or as the latest relevant message.
+  const snapshot = continuationSnapshot(
+    [userMessage("real", "msg-real"), message("a", undefined, "msg-a"), compactionUserMessage(), compactionContinueMessage()],
+    new Map(),
+  )
+  assert.equal(snapshot.latestRealUserMessageID, "msg-real")
+  assert.equal(snapshot.latestRelevantMessageID, "msg-a")
+})
+
+test("noInterruptOnUserMessage:false is retired: a real user message steers the loop and never pauses it", async () => {
   const calls = []
   const client = {
     app: { log: async () => {} },
@@ -1653,13 +1772,17 @@ test("a real user message during the loop pauses auto-continue (latest instructi
     },
   )
 
+  assert.equal(currentGoal("session-1").options.noInterruptOnUserMessage, true)
+  assert.equal(currentGoal("session-1").stopped, false)
+
   await hooks.event({
     event: { type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
   })
 
-  assert.equal(calls.length, 0)
-  assert.equal(currentGoal("session-1").stopped, true)
-  assert.equal(currentGoal("session-1").stopReason, "user intervention")
+  // The idle after the human's turn drives the next continuation.
+  assert.equal(calls.length, 1)
+  assert.equal(currentGoal("session-1").stopped, false)
+  assert.equal(currentGoal("session-1").stopReason, "")
 })
 
 test("noInterruptOnUserMessage:true keeps the goal running and steers the loop", async () => {
@@ -1956,9 +2079,8 @@ test("deferring for active children is visible in goal status and history", asyn
   assert.doesNotMatch(resumed.lastStatus, /deferred while a child session/i)
 })
 
-test("a real user message pauses immediately even while children are active", async () => {
-  // The chat.message hook is the first line of defence and must not be gated by
-  // the children check: a human "stop" cannot wait for subagents to finish.
+test("a real user message never pauses the goal, even while children are active", async () => {
+  // Human messages steer a running goal; /goal halt is the only human stop.
   const calls = []
   const client = {
     app: { log: async () => {} },
@@ -2000,13 +2122,16 @@ test("a real user message pauses immediately even while children are active", as
     },
   )
 
-  assert.equal(currentGoal("session-1").stopped, true)
-  assert.equal(currentGoal("session-1").stopReason, "user intervention")
+  // A human message steers; it never pauses, even with children active.
+  assert.equal(currentGoal("session-1").stopped, false)
+  assert.equal(currentGoal("session-1").stopReason, "")
 
   await hooks.event({
     event: { type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
   })
+  // Still no continuation while a child is busy, and the goal stays active.
   assert.equal(calls.length, 0)
+  assert.equal(currentGoal("session-1").stopped, false)
 })
 
 test("a deferred goal is re-driven by the child's own idle event", async () => {
@@ -3269,7 +3394,7 @@ test("different idle event IDs cannot continue the same assistant source turn tw
   assert.equal(currentGoal("session-1").continuationClaim.sourceAssistantMessageID, "msg-assistant")
 })
 
-test("a human message arriving during cooldown is re-read and pauses before promptAsync", async () => {
+test("a human message arriving during cooldown is re-read and declines the stale continuation without pausing", async () => {
   let sourceTurn = 0
   let fetchCount = 0
   let secondFetchStarted
@@ -3280,8 +3405,11 @@ test("a human message arriving during cooldown is re-read and pauses before prom
   const { calls, hooks } = await createHooks({
     messages: async () => {
       fetchCount += 1
+      // A real host returns a fresh array per fetch; the copy keeps the
+      // pre-cooldown snapshot from seeing the message pushed during cooldown.
+      const snapshot = [...recentMessages]
       if (fetchCount === 2) secondFetchStarted()
-      return { data: recentMessages }
+      return { data: snapshot }
     },
     onPromptAsync: () => {
       sourceTurn += 1
@@ -3313,9 +3441,11 @@ test("a human message arriving during cooldown is re-read and pauses before prom
   recentMessages.push(userMessage("stop and do this instead", "user-during-cooldown"))
   await idle
 
+  // The stale continuation is declined so the human's turn runs first, and the
+  // goal stays active: the next idle continues from the human's steer.
   assert.equal(calls.length, 1)
-  assert.equal(currentGoal("session-1").stopped, true)
-  assert.equal(currentGoal("session-1").stopReason, "user intervention")
+  assert.equal(currentGoal("session-1").stopped, false)
+  assert.equal(currentGoal("session-1").stopReason, "")
 })
 
 test("a busy status arriving during cooldown suppresses the stale continuation", async () => {
@@ -3384,7 +3514,7 @@ test("continuations preserve the goal-initiating agent, model, and variant", asy
   assert.equal(calls[0].body.variant, "high")
 })
 
-test("switching the active session agent to Plan pauses before continuing", async () => {
+test("switching the active session agent to Plan defers auto-continue without stopping the goal", async () => {
   const { calls, hooks } = await createHooks({ options: { minDelayMs: 1 } })
   await hooks["command.execute.before"](
     { command: "goal", sessionID: "session-1", arguments: "ship it" },
@@ -3404,11 +3534,57 @@ test("switching the active session agent to Plan pauses before continuing", asyn
   })
 
   assert.equal(calls.length, 0)
-  assert.equal(currentGoal("session-1").stopped, true)
-  assert.equal(currentGoal("session-1").stopReason, "plan agent active")
+  assert.equal(currentGoal("session-1").stopped, false)
+  assert.equal(currentGoal("session-1").stopReason, "")
+  assert.ok(currentGoal("session-1").pausedAt > 0)
+  const deferredEntries = () =>
+    currentGoal("session-1").history.filter((entry) => entry.type === "deferred").length
+  assert.equal(deferredEntries(), 1)
+  // A second idle under Plan records nothing new.
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
+  })
+  assert.equal(calls.length, 0)
+  assert.equal(deferredEntries(), 1)
+
+  // Back to an executing agent: the next idle resumes and continues.
+  await hooks.event({
+    event: {
+      type: "session.updated",
+      properties: {
+        sessionID: "session-1",
+        info: { sessionID: "session-1", agent: "build", model: { providerID: "openai", id: "gpt-5" } },
+      },
+    },
+  })
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
+  })
+  assert.equal(calls.length, 1)
+  assert.equal(currentGoal("session-1").pausedAt, 0)
+  assert.ok(
+    currentGoal("session-1").history.some(
+      (entry) => entry.type === "resumed" && /deferred goal resumed/.test(entry.detail),
+    ),
+  )
 })
 
-test("message aborts and provider errors pause before a following idle", async (t) => {
+test("time deferred behind a planning-only agent does not count against the duration budget", () => {
+  const goal = {
+    options: { maxTurns: 0, maxDurationMs: 60_000, maxTokens: 1_000_000, contextWindowTokens: 0 },
+    turnCount: 0,
+    startedAt: Date.now() - 120_000,
+    pausedAt: Date.now() - 90_000,
+    usage: {},
+    peakContextTokens: 0,
+  }
+  // 30 s of running time before the deferral: under the 60 s budget.
+  assert.equal(testInternals.stopReason(goal), null)
+  // Control: the same goal without the freeze is over budget.
+  assert.match(String(testInternals.stopReason({ ...goal, pausedAt: 0 })), /max duration reached/)
+})
+
+test("message aborts and provider errors end the turn, not the goal: the next idle continues", async (t) => {
   for (const scenario of [
     {
       name: "message.updated abort",
@@ -3423,7 +3599,7 @@ test("message aborts and provider errors pause before a following idle", async (
           },
         },
       },
-      reason: "user interrupted",
+      status: /active turn was aborted/i,
     },
     {
       name: "session.error provider failure",
@@ -3434,45 +3610,195 @@ test("message aborts and provider errors pause before a following idle", async (
           error: { name: "ProviderAuthError", data: { message: "token expired" } },
         },
       },
-      reason: "provider error",
+      status: /provider reported an error: ProviderAuthError: token expired/i,
     },
   ]) {
     await t.test(scenario.name, async () => {
-      const { calls, hooks } = await createHooks({ options: { minDelayMs: 1 } })
+      const { aborts, calls, hooks } = await createHooks({ options: { minDelayMs: 1 } })
       await hooks["command.execute.before"](
         { command: "goal", sessionID: "session-1", arguments: "ship it" },
         { parts: [] },
       )
       await hooks.event({ event: scenario.event })
+      const goal = currentGoal("session-1")
+      assert.equal(goal.stopped, false)
+      assert.equal(goal.stopReason, "")
+      assert.match(goal.lastStatus, scenario.status)
+      assert.match(goal.lastStatus, /continues after the cooldown/i)
+      assert.match(goal.lastStatus, /\/goal halt/)
+      assert.equal(goal.history.at(-1).type, "warning")
+      // A re-delivered event records nothing new.
+      const historyLength = goal.history.length
+      await hooks.event({ event: scenario.event })
+      assert.equal(currentGoal("session-1").history.length, historyLength)
       await hooks.event({
         event: { type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
       })
-      assert.equal(calls.length, 0)
-      assert.equal(currentGoal("session-1").stopped, true)
-      assert.equal(currentGoal("session-1").stopReason, scenario.reason)
+      assert.equal(calls.length, 1)
+      assert.equal(aborts.length, 0)
+      assert.equal(currentGoal("session-1").stopped, false)
     })
   }
 })
 
-test("legacy and v2 permission rejection shapes both pause the goal", async (t) => {
+test("legacy and v2 permission rejection shapes both keep the goal active", async (t) => {
   for (const properties of [
     { sessionID: "session-1", permissionID: "perm-1", response: "rejected" },
     { sessionID: "session-1", requestID: "perm-2", reply: "reject" },
   ]) {
     await t.test(properties.response ? "legacy response" : "v2 reply", async () => {
-      const { hooks } = await createHooks()
+      const { calls, hooks } = await createHooks({ options: { minDelayMs: 1 } })
       await hooks["command.execute.before"](
         { command: "goal", sessionID: "session-1", arguments: "ship it" },
         { parts: [] },
       )
       await hooks.event({ event: { type: "permission.replied", properties } })
-      assert.equal(currentGoal("session-1").stopped, true)
-      assert.equal(currentGoal("session-1").stopReason, "permission rejected")
+      assert.equal(currentGoal("session-1").stopped, false)
+      assert.equal(currentGoal("session-1").stopReason, "")
+      assert.match(currentGoal("session-1").lastStatus, /permission request was rejected/i)
+      await hooks.event({
+        event: { type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
+      })
+      assert.equal(calls.length, 1)
+      assert.equal(currentGoal("session-1").stopped, false)
     })
   }
 })
 
-test("a human message aborts an already accepted continuation", async () => {
+test("an error before any new assistant reply releases the source claim so the goal retries once", async () => {
+  // The host keeps returning the same assistant message: the error happened
+  // before the provider produced a reply. Without releasing the claim the
+  // dedupe would decline that same source forever and the goal would strand.
+  const { calls, hooks } = await createHooks({
+    options: { minDelayMs: 1, noToolCallTurnsBeforePause: 0, noProgressTurnsBeforePause: 100 },
+  })
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "ship it" },
+    { parts: [] },
+  )
+  const idle = () =>
+    hooks.event({
+      event: { type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
+    })
+  await idle()
+  assert.equal(calls.length, 1)
+  // Control: a duplicate idle for the same source is still declined.
+  await idle()
+  assert.equal(calls.length, 1)
+
+  await hooks.event({
+    event: {
+      type: "session.error",
+      properties: { sessionID: "session-1", error: { name: "APIError", data: { message: "overloaded" } } },
+    },
+  })
+  await idle()
+  assert.equal(calls.length, 2)
+  // Exactly one retry per error: the next duplicate idle is declined again.
+  await idle()
+  assert.equal(calls.length, 2)
+  assert.equal(currentGoal("session-1").stopped, false)
+})
+
+test("repeated provider errors back off with a capped schedule and never stop the goal", async (t) => {
+  assert.equal(testInternals.providerErrorBackoffMs(1), 0)
+  assert.equal(testInternals.providerErrorBackoffMs(2), 5_000)
+  assert.equal(testInternals.providerErrorBackoffMs(3), 10_000)
+  assert.equal(testInternals.providerErrorBackoffMs(4), 20_000)
+  assert.equal(testInternals.providerErrorBackoffMs(7), 160_000)
+  assert.equal(testInternals.providerErrorBackoffMs(8), 300_000)
+  assert.equal(testInternals.providerErrorBackoffMs(50), 300_000)
+
+  const originalDateNow = Date.now
+  let now = 5_000_000
+  Date.now = () => now
+  t.after(() => {
+    Date.now = originalDateNow
+  })
+  t.mock.timers.enable({ apis: ["setTimeout"] })
+  let assistantOutput = 0
+  const { calls, hooks } = await createHooks({
+    options: { minDelayMs: 1, noToolCallTurnsBeforePause: 0, noProgressTurnsBeforePause: 100 },
+  })
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "ship it" },
+    { parts: [] },
+  )
+  const idle = () =>
+    hooks.event({
+      event: { type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
+    })
+  const providerError = () =>
+    hooks.event({
+      event: {
+        type: "session.error",
+        properties: { sessionID: "session-1", error: { name: "APIError", data: { message: "overloaded" } } },
+      },
+    })
+  const settle = async () => {
+    for (let i = 0; i < 50; i += 1) await new Promise((resolve) => setImmediate(resolve))
+  }
+
+  await idle()
+  assert.equal(calls.length, 1)
+
+  // Error 1: no backoff beyond the cooldown.
+  now += 10
+  await providerError()
+  assert.doesNotMatch(currentGoal("session-1").lastStatus, /backs off/)
+  now += 10
+  await idle()
+  assert.equal(calls.length, 2)
+
+  // Error 2 in a row: a 5 s backoff. An idle inside the window is deferred.
+  now += 10
+  await providerError()
+  assert.match(currentGoal("session-1").lastStatus, /Provider error 2 in a row: the next auto-continue backs off 5s/)
+  // Re-delivery of the same failure does not extend the streak.
+  await providerError()
+  assert.match(currentGoal("session-1").lastStatus, /backs off 5s/)
+  now += 10
+  await idle()
+  assert.equal(calls.length, 2)
+  assert.equal(currentGoal("session-1").stopped, false)
+
+  // The backoff timer re-delivers the idle when it expires.
+  now += 5_000
+  t.mock.timers.tick(5_000)
+  await settle()
+  assert.equal(calls.length, 3)
+
+  // Error 3: 10 s.
+  now += 10
+  await providerError()
+  assert.match(currentGoal("session-1").lastStatus, /Provider error 3 in a row: the next auto-continue backs off 10s/)
+  now += 10
+  await idle()
+  assert.equal(calls.length, 3)
+
+  // Output from the provider ends the streak: the next idle is not deferred.
+  assistantOutput += 100
+  await hooks.event({
+    event: {
+      type: "message.updated",
+      properties: {
+        info: {
+          id: "msg-recovered",
+          role: "assistant",
+          sessionID: "session-1",
+          tokens: { input: 10, output: assistantOutput, reasoning: 0, cache: { read: 0, write: 0 } },
+        },
+      },
+    },
+  })
+  now += 10
+  await idle()
+  assert.equal(calls.length, 4)
+  assert.equal(currentGoal("session-1").stopped, false)
+  assert.equal(currentGoal("session-1").stopReason, "")
+})
+
+test("a human message never aborts an already accepted continuation", async () => {
   let resolvePrompt
   let promptStarted
   const started = new Promise((resolve) => {
@@ -3509,10 +3835,11 @@ test("a human message aborts an already accepted continuation", async () => {
   resolvePrompt()
   await idle
 
-  assert.equal(aborts.length, 1)
-  assert.equal(aborts[0].path.id, "session-1")
-  assert.equal(currentGoal("session-1").stopped, true)
-  assert.equal(currentGoal("session-1").stopReason, "user intervention")
+  // The human's message steers; the accepted continuation is not aborted and
+  // the goal stays active.
+  assert.equal(aborts.length, 0)
+  assert.equal(currentGoal("session-1").stopped, false)
+  assert.equal(currentGoal("session-1").stopReason, "")
 })
 
 test("near-zero repeated output pauses after the configured grace window", async () => {
@@ -5660,7 +5987,7 @@ test("/goal history shows lifecycle events and the latest checkpoint", async () 
   assert.match(output.parts[0].text, /auto-continue:/)
 })
 
-test("persisted running goals are recovered in paused state after restart", async () => {
+test("persisted running goals stay active after restart and continue at the next idle", async () => {
   const dir = await mkdtemp(join(tmpdir(), "goal-plugin-test-"))
   const stateFilePath = join(dir, "state.json")
   const lifecycle = []
@@ -5712,8 +6039,11 @@ test("persisted running goals are recovered in paused state after restart", asyn
       { parts: [] },
     )
     const recoveredGoal = currentGoal("session-persist")
-    assert.equal(recoveredGoal.stopped, true)
-    assert.equal(recoveredGoal.stopReason, "recovered after restart")
+    assert.equal(recoveredGoal.stopped, false, "a restart never pauses a live goal")
+    assert.equal(recoveredGoal.stopReason, "")
+    assert.match(recoveredGoal.lastStatus, /still active/)
+    assert.equal(recoveredGoal.history.at(-1).type, "recovered")
+    assert.equal(recoveredGoal.continuationClaim, null)
 
     const statusOutput = { parts: [] }
     await recoveredHooks["command.execute.before"](
@@ -5722,7 +6052,19 @@ test("persisted running goals are recovered in paused state after restart", asyn
     )
     assert.match(statusOutput.parts[0].text, /Recovered persisted goal state/)
     assert.equal(lifecycle.length, 1)
-    assert.match(lifecycle[0], /Goal recovered and paused/i)
+    assert.match(lifecycle[0], /Goal recovered after a restart and still active/i)
+
+    // The recovered goal continues at the next idle.
+    let prompts = 0
+    client.session.promptAsync = async () => {
+      prompts += 1
+      return {}
+    }
+    await recoveredHooks.event({
+      event: { type: "session.status", properties: { sessionID: "session-persist", status: { type: "idle" } } },
+    })
+    assert.equal(prompts, 1)
+    await recoveredHooks.dispose()
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
@@ -5792,7 +6134,7 @@ test("continuation source claims and initiating execution context persist before
       { parts: [] },
     )
     const recovered = currentGoal("session-durable-claim")
-    assert.equal(recovered.stopped, true)
+    assert.equal(recovered.stopped, false)
     assert.equal(recovered.continuationClaim, null)
     assert.deepEqual(recovered.executionContext, goal.executionContext)
   } finally {
@@ -7341,10 +7683,10 @@ test("normalizeOptions falls back to defaults for zero, negative, and non-numeri
   assert.equal(result.maxRecentMessages, defaults.maxRecentMessages)
 })
 
-test("normalizeOptions defaults noInterruptOnUserMessage to true and keeps it boolean", () => {
+test("normalizeOptions retires noInterruptOnUserMessage: always true, false is ignored", () => {
   assert.equal(normalizeOptions().noInterruptOnUserMessage, true)
   assert.equal(normalizeOptions({ noInterruptOnUserMessage: true }).noInterruptOnUserMessage, true)
-  assert.equal(normalizeOptions({ noInterruptOnUserMessage: false }).noInterruptOnUserMessage, false)
+  assert.equal(normalizeOptions({ noInterruptOnUserMessage: false }).noInterruptOnUserMessage, true)
   assert.equal(normalizeOptions({ noInterruptOnUserMessage: "yes" }).noInterruptOnUserMessage, true)
 })
 
@@ -7894,7 +8236,10 @@ test("lifecycle events are written to the ledger and a missing state file recove
     const recovered = currentGoal("ledger-s2")
     assert.ok(recovered)
     assert.equal(recovered.condition, "recover me")
-    assert.equal(recovered.stopped, true) // recovered goals load paused
+    // A ledger rebuild is sparse and may predate a pause, so it loads paused,
+    // unlike a snapshot recovery, which keeps a live goal active.
+    assert.equal(recovered.stopped, true)
+    assert.equal(recovered.stopReason, "recovered after restart")
     // Reconstruction persisted a fresh state file.
     const rebuilt = JSON.parse(await readFile(sessionStatePath(stateFilePath, "ledger-s2"), "utf8"))
     assert.ok(rebuilt.goals.some((g) => g.sessionID === "ledger-s2"))
@@ -10034,9 +10379,107 @@ test("a persisted resume state wins over an older blocked ledger entry", async (
 
     second = await GoalPlugin({ client }, { stateFilePath, lifecycleMessages: false })
     const status = await runGoal(second, sessionID, "status")
-    assert.match(status, /State: paused/)
+    assert.match(status, /State: active/)
     assert.doesNotMatch(status, /State: blocked|obsolete blocker/)
-    assert.equal(currentGoal(sessionID).stopReason, "recovered after restart")
+    assert.equal(currentGoal(sessionID).stopped, false)
+    assert.equal(currentGoal(sessionID).stopReason, "")
+  } finally {
+    await first?.dispose()
+    await second?.dispose()
+    setLedgerSink(null)
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("a newer ledger pause wins over a stale active snapshot on restart", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "goal-plugin-paused-ledger-xcheck-"))
+  const stateFilePath = join(dir, "state.json")
+  const sessionID = "paused-ledger-restart"
+  const ledgerFilePath = sessionLedgerPath(stateFilePath, sessionID)
+  let prompts = 0
+  const client = {
+    app: { log: async () => {} },
+    session: {
+      messages: async () => ({ data: [message("still working")] }),
+      promptAsync: async () => {
+        prompts += 1
+        return {}
+      },
+    },
+  }
+  let first
+  let second
+  try {
+    first = await GoalPlugin({ client }, { stateFilePath, lifecycleMessages: false })
+    await runGoal(first, sessionID, "ship it")
+    const staleGoal = currentGoal(sessionID)
+    const entries = await readLedgerEntries(ledgerFilePath)
+    const pausedAt = Math.max(...entries.map((entry) => Number(entry.ts) || 0), Date.now()) + 1
+    await first.dispose()
+    first = null
+
+    // The user paused, the ledger recorded it, but the state write was lost.
+    assert.equal(appendLedgerLine(ledgerFilePath, {
+      ts: pausedAt,
+      sessionID,
+      goalId: staleGoal.goalId,
+      condition: staleGoal.condition,
+      snapshot: { options: staleGoal.options, stopped: true, stopReason: "paused" },
+      type: "paused",
+      detail: "paused by user",
+    }), true)
+
+    second = await GoalPlugin({ client }, { stateFilePath, lifecycleMessages: false })
+    await runGoal(second, sessionID, "status")
+    const recovered = currentGoal(sessionID)
+    assert.equal(recovered.stopped, true, "a restart must not resurrect a user-paused goal")
+    assert.equal(recovered.stopReason, "paused")
+    await second.event({
+      event: { type: "session.status", properties: { sessionID, status: { type: "idle" } } },
+    })
+    assert.equal(prompts, 0)
+  } finally {
+    await first?.dispose()
+    await second?.dispose()
+    setLedgerSink(null)
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("restart downtime does not count against an active goal's duration budget", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "goal-plugin-downtime-"))
+  const stateFilePath = join(dir, "state.json")
+  const sessionID = "downtime-restart"
+  const client = {
+    app: { log: async () => {} },
+    session: { messages: async () => ({ data: [message("still working")] }), promptAsync: async () => ({}) },
+  }
+  let first
+  let second
+  try {
+    first = await GoalPlugin({ client }, { stateFilePath, lifecycleMessages: false })
+    await runGoal(first, sessionID, "ship it")
+    await first.dispose()
+    first = null
+
+    // Simulate an hour of downtime: every persisted clock moves back one hour.
+    const statePath = sessionStatePath(stateFilePath, sessionID)
+    const raw = JSON.parse(await readFile(statePath, "utf8"))
+    const hour = 60 * 60 * 1000
+    const goal = raw.goals.find((entry) => entry.sessionID === sessionID)
+    const runningMs = Math.max(goal.lastContinueAt || 0, goal.lastProgressAt || 0, goal.startedAt) - goal.startedAt
+    goal.startedAt -= hour
+    if (goal.lastContinueAt) goal.lastContinueAt -= hour
+    if (goal.lastProgressAt) goal.lastProgressAt -= hour
+    await writeFile(statePath, JSON.stringify(raw))
+
+    second = await GoalPlugin({ client }, { stateFilePath, lifecycleMessages: false })
+    await runGoal(second, sessionID, "status")
+    const recovered = currentGoal(sessionID)
+    assert.equal(recovered.stopped, false)
+    const elapsed = Date.now() - recovered.startedAt
+    assert.ok(elapsed < hour / 2, `the downtime hour must not count (elapsed ${elapsed} ms)`)
+    assert.ok(elapsed >= runningMs, "time the goal actually ran still counts")
   } finally {
     await first?.dispose()
     await second?.dispose()
@@ -10728,7 +11171,7 @@ test("isRestrictedAgent matches case-insensitively; isPlanAgent keeps built-in b
   assert.equal(isPlanAgent("review"), false)
 })
 
-test("a goal set while Plan is active is recorded but held, and is not told to start work", async () => {
+test("a goal set while Plan is active is recorded active but deferred, and is not told to start work", async () => {
   const { calls, hooks } = await createHooks({ options: { minDelayMs: 1 } })
   await hooks.event(planContextEvent())
 
@@ -10740,19 +11183,48 @@ test("a goal set while Plan is active is recorded but held, and is not told to s
 
   const goal = currentGoal("session-1")
   assert.equal(goal.condition, "refactor everything", "the goal must still be recorded")
-  assert.equal(goal.stopped, true, "a goal created under Plan must not be live")
-  assert.equal(goal.stopReason, "plan agent active")
+  assert.equal(goal.stopped, false, "a goal created under Plan is deferred, never stopped")
+  assert.equal(goal.stopReason, "")
+  assert.ok(goal.pausedAt > 0, "the deferred goal's clock is frozen")
+  assert.match(goal.lastStatus, /deferred/i)
+  assert.equal(goal.history.at(-1).type, "deferred")
 
   const text = output.parts.map((part) => part.text).join("\n")
   assert.ok(!text.includes("Start working toward this goal now."), "must not instruct the model to start")
   assert.match(text, /planning-only/)
   assert.match(text, /Do not begin work on it now/)
+  assert.doesNotMatch(text, /goal resume/)
 
-  // And the following idle must not continue it.
+  // The system prompt under Plan must not say "keep working".
+  const system = { system: [] }
+  await hooks["experimental.chat.system.transform"]({ sessionID: "session-1" }, system)
+  const systemText = system.system.join("\n")
+  assert.match(systemText, /<goal_state>deferred<\/goal_state>/)
+  assert.doesNotMatch(systemText, /Keep working/)
+
+  // The following idle under Plan must not continue it.
   await hooks.event({
     event: { type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
   })
-  assert.equal(calls.length, 0, "a held goal must never auto-continue")
+  assert.equal(calls.length, 0, "a deferred goal must not auto-continue under Plan")
+  assert.equal(currentGoal("session-1").stopped, false)
+
+  // Switching to an executing agent: the next idle restarts the clock and continues.
+  await hooks.event(planContextEvent("session-1", "build"))
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
+  })
+  assert.equal(calls.length, 1, "the first idle under an executing agent continues the goal")
+  assert.notEqual(
+    String(calls[0].body.agent || "").toLowerCase(),
+    "plan",
+    "the resumed continuation must not drive the session back into Plan",
+  )
+  assert.equal(currentGoal("session-1").pausedAt, 0)
+  assert.equal(currentGoal("session-1").stopped, false)
+  const resumedSystem = { system: [] }
+  await hooks["experimental.chat.system.transform"]({ sessionID: "session-1" }, resumedSystem)
+  assert.match(resumedSystem.system.join("\n"), /Keep working/)
 })
 
 test("a goal set under a normal agent still starts work as before", async () => {
@@ -10802,8 +11274,9 @@ test("restrictedAgents can name agents other than plan", async () => {
     { parts: [] },
   )
   const goal = currentGoal("session-1")
-  assert.equal(goal.stopped, true, "a configured restricted agent must hold the goal")
-  assert.equal(goal.stopReason, "review agent active")
+  assert.equal(goal.stopped, false, "a configured restricted agent defers the goal, never stops it")
+  assert.equal(goal.stopReason, "")
+  assert.match(goal.lastStatus, /the review agent is planning-only/)
 
   await hooks.event({
     event: { type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
@@ -11410,7 +11883,7 @@ test("a failing session-title update never breaks the goal loop", async () => {
   assert.ok(output.parts.length > 0, "the command must still produce output")
 })
 
-test("a goal set in Plan mode is held even when no execution context exists yet", async () => {
+test("a goal set in Plan mode is deferred even when no execution context exists yet", async () => {
   // Reproduces the live-canary failure on OpenCode 1.18: the TUI runs
   // `command.execute.before` before any chat.message/chat.params fires, so the
   // cached execution context is empty for the first command in a session. The
@@ -11438,15 +11911,15 @@ test("a goal set in Plan mode is held even when no execution context exists yet"
   )
 
   const goal = currentGoal("session-1")
-  assert.equal(goal.stopped, true, "must be held despite an empty execution context")
-  assert.equal(goal.stopReason, "plan agent active")
+  assert.equal(goal.stopped, false, "deferred, not stopped")
+  assert.ok(goal.pausedAt > 0, "must be deferred despite an empty execution context")
   const text = output.parts.map((part) => part.text).join("\n")
   assert.ok(!text.includes("Start working toward this goal now."), "must not instruct the model to start")
 
   await hooks.event({
     event: { type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
   })
-  assert.equal(calls.length, 0, "a held goal must never auto-continue")
+  assert.equal(calls.length, 0, "a deferred goal must not auto-continue under Plan")
 })
 
 test("session-agent lookup failure fails open rather than blocking every goal", async () => {

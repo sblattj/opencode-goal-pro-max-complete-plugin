@@ -279,14 +279,17 @@ test("a same-session process contender stays passive and takes over only after a
       takeover,
     )
     assert.match(takeover.parts[0].text, /hold the session/)
-    assert.match(takeover.parts[0].text, /recovered after restart|paused|stopped/i)
+    // The owner's exit does not pause the goal; the contender takes it over live.
+    assert.match(takeover.parts[0].text, /State: active/)
+    assert.match(takeover.parts[0].text, /still active/)
     await contender.event({
       event: {
         type: "session.status",
         properties: { sessionID: "session-single-writer", status: { type: "idle" } },
       },
     })
-    assert.equal(promptCalls.length, 0)
+    // Once the explicit retry owns the session, the live goal continues.
+    assert.equal(promptCalls.length, 1)
   } finally {
     if (first.child.exitCode === null) first.child.stdin.write("stop\n")
     await waitForExit(first.child)
