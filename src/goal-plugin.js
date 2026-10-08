@@ -227,8 +227,9 @@ function createRuntimeState() {
     // sessionID -> promise of an in-flight idle unload; a touch waits on it so
     // the process never contends with its own not-yet-released claim.
     sessionReleasePromises: new Map(),
-    // Sessions whose goal the load in progress flipped to "recovered after
-    // restart", so only that load announces the recovery.
+    // Sessions whose live goal the load in progress recovered (kept active
+    // from the state file, or held "recovered after restart" from the
+    // ledger), so only that load announces the recovery.
     freshRecoveries: new Set(),
     // sessionID -> number of hook/tool calls for it still running.
     sessionHookDepth: new Map(),
@@ -907,13 +908,10 @@ function looksLikePluginSessionTitle(title) {
   return SESSION_TITLE_ICONS.some((icon) => text.startsWith(`${icon} `))
 }
 
-// Stop reason for a goal held because a planning-only agent is active. The
-// built-in `plan` case keeps its established wording so persisted state and
-// existing consumers stay stable.
-function restrictedAgentStopReason(agent) {
-  return isPlanAgent(agent) ? "plan agent active" : `${String(agent).trim().toLowerCase()} agent active`
-}
-
+// Host events that end the current TURN. None of them ends the goal: the turn
+// is recorded and the goal auto-continues after the cooldown (provider errors
+// with a capped backoff). `kind` names the event for status, history and the
+// provider-error streak; only /goal halt (or a budget/completion) stops a goal.
 function terminalEvent(event) {
   const permissionReply = String(
     event?.properties?.reply ??
@@ -925,9 +923,12 @@ function terminalEvent(event) {
   if (event?.type === "permission.replied" && /^(?:reject(?:ed)?|deny|denied)$/i.test(permissionReply)) {
     return {
       sessionID: getSessionID(event),
-      stopReason: "permission rejected",
-      status: "Goal paused after a permission request was rejected.",
-      history: "Paused after OpenCode reported a rejected permission request.",
+      kind: "permission rejected",
+      eventKey: String(
+        event?.properties?.requestID ?? event?.properties?.permissionID ?? event?.data?.requestID ?? "",
+      ),
+      status: "A permission request was rejected.",
+      history: "OpenCode reported a rejected permission request; the goal continues.",
     }
   }
 
@@ -945,14 +946,24 @@ function terminalEvent(event) {
   const summary = summarizeText(`${name}${message ? `: ${message}` : ""}`, 240) || "unknown provider error"
   return {
     sessionID: getSessionID(event) || messageSessionID(messageInfoFromEvent(event)),
-    stopReason: aborted ? "user interrupted" : "provider error",
-    status: aborted
-      ? "Goal paused after user interruption."
-      : `Goal paused after a terminal provider error: ${summary}`,
+    kind: aborted ? "user interrupted" : "provider error",
+    eventKey: event?.type === "message.updated" ? messageID(messageInfoFromEvent(event)) : "",
+    status: aborted ? "The active turn was aborted." : `The provider reported an error: ${summary}`,
     history: aborted
-      ? "Paused after OpenCode reported that the active turn was aborted."
-      : `Paused after OpenCode reported a terminal provider error: ${summary}`,
+      ? "OpenCode reported that the active turn was aborted; the goal continues."
+      : `OpenCode reported a provider error; the goal continues: ${summary}`,
   }
+}
+
+// Provider-error backoff before the next auto-continue. The first error in a
+// streak waits only the normal cooldown; from the second on the wait doubles
+// from 5 s and is capped at 5 minutes. A streak never stops the goal.
+const PROVIDER_ERROR_BACKOFF_BASE_MS = 5_000
+const PROVIDER_ERROR_BACKOFF_MAX_MS = 300_000
+
+function providerErrorBackoffMs(streak) {
+  if (!Number.isFinite(streak) || streak < 2) return 0
+  return Math.min(PROVIDER_ERROR_BACKOFF_MAX_MS, PROVIDER_ERROR_BACKOFF_BASE_MS * 2 ** (streak - 2))
 }
 
 function summarizeText(text, limit = CHECKPOINT_CHAR_LIMIT) {
@@ -1316,7 +1327,9 @@ function stopReason(goal) {
   ) {
     return `max turns reached (${goal.options.maxTurns})`
   }
-  if (Date.now() - goal.startedAt >= goal.options.maxDurationMs) {
+  // Frozen time (`pausedAt`, e.g. a goal deferred behind a planning-only
+  // agent) does not count against the duration budget.
+  if ((goal.pausedAt || Date.now()) - goal.startedAt >= goal.options.maxDurationMs) {
     return `max duration reached (${formatBudgetDuration(goal.options.maxDurationMs)})`
   }
   if (goalSpendTokens(goal) >= goal.options.maxTokens) {
@@ -1777,7 +1790,10 @@ function normalizeOptions(options = {}) {
       Number.isSafeInteger(options.noToolCallTurnsBeforePause) && options.noToolCallTurnsBeforePause >= 0
         ? options.noToolCallTurnsBeforePause
         : DEFAULT_OPTIONS.noToolCallTurnsBeforePause,
-    noInterruptOnUserMessage: options.noInterruptOnUserMessage !== false,
+    // Retired: a human message always steers a running goal and never pauses
+    // it. The option is still accepted for config compatibility, but `false`
+    // is ignored.
+    noInterruptOnUserMessage: true,
     noContinueWhileChildrenActive: options.noContinueWhileChildrenActive === true,
     budgetWrapupRatio:
       Number(options.budgetWrapupRatio) > 0 && Number(options.budgetWrapupRatio) < 1
@@ -2143,7 +2159,18 @@ function serializeGoal(goal) {
   }
 }
 
-function deserializeGoal(goal) {
+// Hydrate one persisted goal. A goal that was live when its state was written
+// stays live: a restart is not a reason to stop. It resumes at the next idle
+// for its session. Two-process safety does not depend on pausing here: this
+// runs only after ensureSessionLoaded acquired the session's persistence lease
+// (a contended lease leaves the session passive and never hydrated), every
+// goal-driving prompt re-verifies that lease first, and a live goal keeps its
+// lease (sessionReleaseEligible), so only one process ever drives it.
+//
+// `recovery: "pause"` is for ledger reconstruction. The ledger is a sparse
+// event log whose last snapshot can predate a pause or a halt, so a goal
+// rebuilt from it is held for an explicit resume rather than resurrected.
+function deserializeGoal(goal, { recovery = "resume" } = {}) {
   const hydrated = {
     ...goal,
     messageIDs: new Set(goal?.messageIDs || []),
@@ -2154,17 +2181,40 @@ function deserializeGoal(goal) {
 
   if (!hydrated.stopped) {
     currentRuntime().freshRecoveries.add(hydrated.sessionID)
-    hydrated.stopped = true
-    hydrated.stopReason = "recovered after restart"
-    hydrated.lastStatus = "Recovered persisted goal state. Review the goal status and resume it when ready."
-    pushHistory(
-      hydrated,
-      "recovered",
-      "Recovered persisted goal state after plugin restart; auto-continue remains paused until you resume.",
-    )
+    if (recovery === "pause") {
+      hydrated.stopped = true
+      hydrated.stopReason = "recovered after restart"
+      hydrated.lastStatus = "Recovered goal state from the lifecycle ledger. Review the goal status and resume it when ready."
+      pushHistory(
+        hydrated,
+        "recovered",
+        "Recovered goal state from the lifecycle ledger after a missing state file; auto-continue stays paused until you resume, because the ledger can predate a pause.",
+      )
+    } else {
+      // The process was down, not the goal at work: the downtime does not
+      // count against the duration budget. A deferred goal (`pausedAt`) keeps
+      // its frozen clock and shifts when it resumes.
+      if (!hydrated.pausedAt) {
+        const lastActivityAt = Math.max(
+          toNonNegativeInteger(hydrated.startedAt),
+          toNonNegativeInteger(hydrated.lastContinueAt),
+          toNonNegativeInteger(hydrated.lastProgressAt),
+        )
+        const downtimeMs = Math.max(0, Date.now() - lastActivityAt)
+        if (lastActivityAt > 0 && downtimeMs > 0) hydrated.startedAt += downtimeMs
+      }
+      hydrated.lastStatus = "Recovered persisted goal state after a plugin restart; the goal is still active and continues at the next idle."
+      pushHistory(
+        hydrated,
+        "recovered",
+        "Recovered persisted goal state after plugin restart; the goal stays active and auto-continue resumes at the next idle.",
+      )
+    }
   }
-  // Recovered goals always require an explicit resume, which starts a fresh
-  // execution epoch and makes any pre-crash continuation claim obsolete.
+  // Any pre-crash continuation claim is obsolete. Keeping it could strand the
+  // goal (a claim persisted just before a crash whose prompt was never sent
+  // would decline its own source forever); dropping it costs at most one
+  // extra continuation from the same source.
   hydrated.continuationClaim = null
 
   return hydrated
@@ -2335,6 +2385,34 @@ async function reconcileLoadedStateWithLedger(persistenceOptions, client, onlySe
           latestLedgerState = { entry, alreadyApplied }
           latestLedgerTimestamp = timestamp
         }
+      }
+      // A live goal now stays live across a restart, so a newer ledger event
+      // that stopped it (a pause or halt whose snapshot write failed) must be
+      // overlaid too, or the restart would resurrect a goal someone stopped.
+      const laggingStop = latestLedgerState?.entry?.snapshot
+      if (
+        !latestLedgerState?.alreadyApplied &&
+        !goal.stopped &&
+        latestLedgerState?.entry?.type !== "blocked" &&
+        laggingStop?.stopped === true &&
+        typeof laggingStop.stopReason === "string" &&
+        laggingStop.stopReason &&
+        laggingStop.stopReason !== "blocked"
+      ) {
+        goal.stopped = true
+        goal.stopReason = summarizeText(laggingStop.stopReason, 160)
+        goal.lastStatus = `Recovered stopped goal state (${goal.stopReason}) from the lifecycle ledger after the saved snapshot lagged behind. Resume it explicitly to continue.`
+        goal.continuationClaim = null
+        goal.history = [
+          ...(goal.history || []),
+          makeHistoryEntry(
+            latestLedgerState.entry.type,
+            latestLedgerState.entry.detail,
+            normalizeTimestamp(latestLedgerState.entry.ts),
+          ),
+        ].slice(-MAX_HISTORY_ENTRIES)
+        pauseGoalClock(goal)
+        continue
       }
       if (
         latestLedgerState?.alreadyApplied ||
@@ -2627,7 +2705,9 @@ async function loadPersistedSessionState(persistence, client, sessionID) {
 
 // Last-resort recovery: when the main state file is absent, rebuild still-active
 // goals from the append-only ledger so a lost/rotated state file does not drop
-// in-flight goals. Recovered goals are paused (via deserializeGoal).
+// in-flight goals. Ledger-rebuilt goals are held paused (deserializeGoal with
+// `recovery: "pause"`): the ledger can predate a pause or halt. Goals loaded
+// from the state file itself stay active.
 async function reconstructFromLedger(persistenceOptions, client, onlySessionID = null) {
   const entries = await readLedgerEntries(persistenceOptions.ledgerFilePath, {
     maxBytes: persistenceOptions.ledgerMaxBytes,
@@ -2652,7 +2732,7 @@ async function reconstructFromLedger(persistenceOptions, client, onlySessionID =
     const normalized = normalizePersistedGoal(stub)
     if (normalized) {
       if (!normalized.stopped) focusCandidates.set(normalized.sessionID, normalized.goalId)
-      const hydrated = deserializeGoal(normalized)
+      const hydrated = deserializeGoal(normalized, { recovery: "pause" })
       registerSessionGoal(hydrated)
       if (stub.ordered) sessionOrdered.add(hydrated.sessionID)
     }
@@ -3705,6 +3785,9 @@ function sumTurnReasoningTokens(turnMessages) {
 function findLatestExecutionContext(messages) {
   for (const message of [...(messages || [])].reverse()) {
     if (messageRole(message) !== "user") continue
+    // A host-written compaction/continue message records whatever agent was
+    // current when the host wrote it; it is not a human's agent selection.
+    if (isHostSyntheticUserMessage(message)) continue
     const info = isPlainObject(message?.info) ? message.info : message
     const context = normalizeExecutionContext(info)
     if (context) return context
@@ -3822,15 +3905,13 @@ function continuationSnapshot(messages, ownedMessages = currentRuntime().ownedPl
   const latestAssistant = findLatestAssistantMessage(list)
   const latestRealUser = [...list]
     .reverse()
-    .find(
-      (message) =>
-        messageRole(message) === "user" && !isPluginGeneratedMessage(message, ownedMessages),
-    )
+    .find((message) => isRealUserMessage(message, ownedMessages))
   const latestRelevant = [...list]
     .reverse()
     .find((message) =>
       (messageRole(message) === "assistant" || messageRole(message) === "user") &&
       !isCompactionAssistantMessage(message) &&
+      !isHostSyntheticUserMessage(message) &&
       !isPluginGeneratedMessage(message, ownedMessages),
     )
   return {
@@ -3855,6 +3936,39 @@ function isPluginGeneratedMessage(message, ownedMessages = currentRuntime().owne
   return (
     isPluginContinuationMessage(message, ownedMessages) ||
     isPluginCommandMessage(message, ownedMessages)
+  )
+}
+
+// A user-role message the HOST wrote, not a human. OpenCode compaction stores a
+// user message whose parts include `{type: "compaction", auto, tail_start_id}`
+// (observed in a real opencode.db), and after an auto-compaction it may append
+// a user message made only of synthetic text such as `{type: "text",
+// synthetic: true, metadata: {compaction_continue: true}, text: "Continue if
+// you have next steps, ..."}`. Neither is a human steering the session. The
+// plugin's own continuation/command parts are also `synthetic: true`, so a part
+// carrying this plugin's metadata marker never qualifies here; ownership of
+// those is decided by `isPluginGeneratedMessage`. A message with any non-text
+// part (a file attachment, say) is a human turn even when its expanded text
+// parts are synthetic.
+function isHostSyntheticUserMessage(message) {
+  if (messageRole(message) !== "user") return false
+  const parts = Array.isArray(message?.parts) ? message.parts : []
+  if (parts.some((part) => part?.type === "compaction")) return true
+  if (parts.length === 0) return false
+  return parts.every(
+    (part) =>
+      part?.type === "text" &&
+      part.synthetic === true &&
+      !part?.metadata?.["opencode-goal-plugin"],
+  )
+}
+
+// A user message that came from a human: not plugin-generated, not host-written.
+function isRealUserMessage(message, ownedMessages = currentRuntime().ownedPluginMessages) {
+  return (
+    messageRole(message) === "user" &&
+    !isPluginGeneratedMessage(message, ownedMessages) &&
+    !isHostSyntheticUserMessage(message)
   )
 }
 
@@ -3953,7 +4067,7 @@ function userInterventionDetected(
     if (messageRole(list[i]) !== "user") continue
     if (isPluginContinuationMessage(list[i], ownedMessages)) {
       lastPluginContinuationIndex = i
-    } else if (!isPluginGeneratedMessage(list[i], ownedMessages)) {
+    } else if (isRealUserMessage(list[i], ownedMessages)) {
       lastRealUserIndex = i
     }
   }
@@ -6120,18 +6234,53 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
     return isRestrictedAgent(agent, restrictedAgents) ? agent : ""
   }
 
-  // Record a newly created goal as held rather than active. Mirrors the idle
-  // guard's stop reason so `/goal status` reads the same either way.
-  const holdGoalForRestrictedAgent = (goal, agent) => {
-    const label = isPlanAgent(agent) ? "Plan" : agent
-    goal.stopped = true
-    goal.stopReason = restrictedAgentStopReason(agent)
-    goal.lastStatus =
-      `Goal recorded but held: the ${label} agent is planning-only. ` +
-      `Switch to an executing agent, then run /${commandName} resume to start work.`
+  // A planning-only agent defers an active goal; it never stops it. The goal
+  // stays active with its clock frozen (`pausedAt`), auto-continue declines
+  // while the restricted agent is selected, and the first idle under an
+  // executing agent restarts the clock and continues. An active goal carries
+  // `pausedAt` only through this deferral.
+  const restrictedAgentLabel = (agent) => (isPlanAgent(agent) ? "Plan" : agent)
+  const deferredStatus = (label) =>
+    `Goal deferred: the ${label} agent is planning-only. It starts automatically when an executing agent is active and the session goes idle. Run /${commandName} halt to stop it.`
+
+  const deferGoalForRestrictedAgent = (goal, agent, { created = false } = {}) => {
+    const label = restrictedAgentLabel(agent)
+    if (goal.pausedAt && !created) return label
     pauseGoalClock(goal)
-    pushHistory(goal, "paused", `Created while the ${label} agent was active; held until an executing agent resumes it.`)
+    goal.lastStatus = deferredStatus(label)
+    pushHistory(
+      goal,
+      "deferred",
+      created
+        ? `Created while the ${label} agent was active; deferred until an executing agent goes idle.`
+        : `Deferred auto-continue while the ${label} agent was active.`,
+    )
     return label
+  }
+
+  const resumeGoalAfterRestrictedAgent = (goal) => {
+    if (!goal.pausedAt) return false
+    resumeGoalClock(goal)
+    // Continuations replay the goal's execution context. A goal created or
+    // last driven under the planning-only agent would otherwise send its next
+    // continuation with `agent: plan` and switch the session straight back.
+    // Adopt the executing agent the session is on now; failing that, drop the
+    // restricted agent so the host picks its default.
+    const current = normalizeExecutionContext(
+      currentRuntime().sessionExecutionContexts.get(goal.sessionID),
+    )
+    if (current?.agent && !isRestrictedAgent(current.agent, restrictedAgents)) {
+      goal.executionContext = current
+    } else if (
+      goal.executionContext?.agent &&
+      isRestrictedAgent(goal.executionContext.agent, restrictedAgents)
+    ) {
+      const { agent: _restricted, ...rest } = goal.executionContext
+      goal.executionContext = normalizeExecutionContext(rest)
+    }
+    goal.lastStatus = "An executing agent is active; auto-continue resumed."
+    pushHistory(goal, "resumed", "An executing agent became active; the deferred goal resumed.")
+    return true
   }
 
   // Each session owns an independent snapshot, ledger, write chain, and
@@ -6425,9 +6574,16 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         ) await persist(sessionID)
         const recoveredGoal = goalStates.get(sessionID)
         // Idle release reloads a paused-recovered goal on every later touch;
-        // only the load that actually flipped it announces the recovery.
+        // only the load that actually recovered it announces the recovery.
         const freshlyRecovered = runtime.freshRecoveries.delete(sessionID)
-        if (
+        if (freshlyRecovered && recoveredGoal && !recoveredGoal.stopped) {
+          announceLifecycle(sessionID, `Goal recovered after a restart and still active; it continues at the next idle. Run /${commandName} halt to stop it.`, {
+            goal: recoveredGoal,
+            transition: "recovered-active",
+            reason: "recovered after restart",
+            expectedState: "active",
+          })
+        } else if (
           freshlyRecovered &&
           recoveredGoal?.stopped &&
           recoveredGoal.stopReason === "recovered after restart"
@@ -6611,6 +6767,139 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       expectedStopReason: reason,
     })
     if (abortAccepted) await abortAcceptedContinuation(sessionID)
+    return true
+  }
+
+  // Provider-error streaks and their backoff timers. Transient by design: a
+  // restart starts a fresh streak, which costs at most one early retry.
+  // sessionID -> { goalId, runId, count, countedContinueAt, backoffUntil, timer, noteKey }
+  const providerErrorStreaks = new Map()
+  // sessionID -> the last interruption recorded, so a re-delivered host event
+  // (message.updated repeats, session.error plus message.updated for one
+  // failure) records one history entry, not one per delivery.
+  const interruptionNotes = new Map()
+
+  const clearProviderErrorStreak = (sessionID) => {
+    const streak = providerErrorStreaks.get(sessionID)
+    if (!streak) return false
+    if (streak.timer) clearTimeout(streak.timer)
+    providerErrorStreaks.delete(sessionID)
+    return true
+  }
+
+  // An idle that arrives inside the backoff window is deferred to a timer
+  // instead of sleeping inside the idle pass: a sleeping pass holds the
+  // per-session guard and would swallow the idle of a human turn taken in the
+  // meantime, stranding the goal. The timer re-enters through a synthesized
+  // idle, so every normal guard (identity, idle status, claim dedupe, lease
+  // fence) still applies.
+  const deferForProviderErrorBackoff = (sessionID, goal) => {
+    const streak = providerErrorStreaks.get(sessionID)
+    if (!streak || streak.goalId !== goal.goalId || streak.runId !== goal.runId) {
+      if (streak) clearProviderErrorStreak(sessionID)
+      return false
+    }
+    const remaining = streak.backoffUntil - Date.now()
+    if (remaining <= 0) return false
+    if (!streak.timer) {
+      const timer = setTimeout(
+        bindRuntime(runtime, async () => {
+          const current = providerErrorStreaks.get(sessionID)
+          if (!current || current.timer !== timer) return
+          current.timer = null
+          const liveGoal = goalStates.get(sessionID)
+          if (
+            !liveGoal ||
+            liveGoal.stopped ||
+            liveGoal.goalId !== current.goalId ||
+            liveGoal.runId !== current.runId ||
+            currentRuntime().sessionStatuses.get(sessionID) !== "idle"
+          ) {
+            return
+          }
+          await hooks.event({ event: { type: "session.idle", properties: { sessionID } } })
+        }),
+        remaining,
+      )
+      timer.unref?.()
+      streak.timer = timer
+    }
+    return true
+  }
+
+  // A host event ended the current turn (permission rejected, the turn was
+  // aborted, a provider error, an attachment that failed to resolve). The goal
+  // is NOT paused: the event is recorded and the goal auto-continues after the
+  // cooldown. Only /goal halt stops a goal on a human's say-so.
+  const noteTurnInterruption = async (sessionID, { kind, eventKey = "", status, history }) => {
+    const goal = goalStates.get(sessionID)
+    if (!goal || goal.stopped) return false
+    const noteKey = `${goal.goalId}\u0000${goal.runId}\u0000${goal.lastContinueAt}\u0000${kind}\u0000${eventKey}`
+    if (interruptionNotes.get(sessionID) === noteKey) return false
+    interruptionNotes.set(sessionID, noteKey)
+
+    let backoffNote = ""
+    if (kind === "provider error") {
+      let streak = providerErrorStreaks.get(sessionID)
+      if (!streak || streak.goalId !== goal.goalId || streak.runId !== goal.runId) {
+        clearProviderErrorStreak(sessionID)
+        streak = {
+          goalId: goal.goalId,
+          runId: goal.runId,
+          count: 0,
+          countedContinueAt: null,
+          backoffUntil: 0,
+          timer: null,
+        }
+        providerErrorStreaks.set(sessionID, streak)
+      }
+      // One continuation attempt counts once, however many error events the
+      // host delivers for it.
+      if (streak.countedContinueAt !== goal.lastContinueAt) {
+        streak.count += 1
+        streak.countedContinueAt = goal.lastContinueAt
+        const backoffMs = providerErrorBackoffMs(streak.count)
+        streak.backoffUntil = Date.now() + backoffMs
+        if (streak.timer) {
+          clearTimeout(streak.timer)
+          streak.timer = null
+        }
+        backoffNote = backoffMs > 0
+          ? ` Provider error ${streak.count} in a row: the next auto-continue backs off ${Math.round(backoffMs / 1000)}s.`
+          : ""
+      }
+    }
+
+    // Without a new assistant message (an error raised before the provider
+    // replied) the next idle would see the same source turn and the claim
+    // dedupe would decline it forever. Releasing the claim allows exactly one
+    // more continuation from that source. A pass still in flight keeps its
+    // claim; it either sends or declines on its own.
+    const runtimeState = currentRuntime()
+    if (
+      kind === "user interrupted" &&
+      activeContinues.has(sessionID) &&
+      !runtimeState.promptInFlightSessions.has(sessionID)
+    ) {
+      // The user pressed Escape while a continuation was still being prepared
+      // (reading the transcript or in its cooldown): drop that pass rather
+      // than send a prompt right after the interrupt. The pass returns on its
+      // aborted signal; releasing the guard and the claim lets the next idle
+      // continue the goal after the cooldown.
+      runtimeState.continuationControllers.get(sessionID)?.abort()
+      runtimeState.continuationControllers.delete(sessionID)
+      activeContinues.delete(sessionID)
+    }
+    if (!activeContinues.has(sessionID)) goal.continuationClaim = null
+    goal.lastStatus = `${status} The goal continues after the cooldown.${backoffNote} Run /${commandName} halt to stop it.`
+    pushHistory(goal, "warning", `${history}${backoffNote}`)
+    await persist(sessionID)
+    announceLifecycle(sessionID, `Goal continues — ${summarizeText(kind, 160)}.`, {
+      goal,
+      transition: "interrupted-continuing",
+      reason: kind,
+      expectedState: "active",
+    })
     return true
   }
 
@@ -6925,33 +7214,25 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
 
     const activeRestrictedAgent = await restrictedAgentFor(sessionID)
     if (activeRestrictedAgent) {
-      const label = isPlanAgent(activeRestrictedAgent) ? "Plan" : activeRestrictedAgent
-      await pauseActiveGoal(sessionID, {
-        stopReason: restrictedAgentStopReason(activeRestrictedAgent),
-        status: `Auto-continue paused because the active agent switched to ${label}.`,
-        history: `Paused before auto-continue because the active session agent switched to ${label}.`,
-      })
+      // Defer, never stop: the goal stays active with its clock frozen and the
+      // first idle under an executing agent continues it.
+      if (!goal.pausedAt) {
+        deferGoalForRestrictedAgent(goal, activeRestrictedAgent)
+        await persist(sessionID)
+        announceLifecycle(
+          sessionID,
+          `Goal deferred while ${restrictedAgentLabel(activeRestrictedAgent)} is active.`,
+          { goal, transition: "deferred", reason: "restricted agent active", expectedState: "active" },
+        )
+      }
       return null
     }
+    if (resumeGoalAfterRestrictedAgent(goal)) await persist(sessionID)
 
-    // Human intervention is evaluated before the active-children gate: a real
-    // user message must pause the goal immediately, not once the subagents
-    // happen to go idle.
-    const newHumanMessage =
-      refreshed.latestRealUserMessageID &&
-      refreshed.latestRealUserMessageID !== baseline.latestRealUserMessageID
-    if (
-      !goal.options.noInterruptOnUserMessage &&
-      (newHumanMessage || userInterventionDetected(messages, goal))
-    ) {
-      childDeferralNotices.delete(childDeferralKey(sessionID, goal))
-      await pauseActiveGoal(sessionID, {
-        stopReason: "user intervention",
-        status: "Auto-continue paused because a new human message arrived; the latest instruction wins.",
-        history: "Paused auto-continue after a real user message arrived; latest instruction wins.",
-      })
-      return null
-    }
+    // A human message never pauses the goal; it steers it. When one arrived
+    // during this pass, the snapshot comparison below declines the claim, so
+    // the human's own turn runs to completion and the idle that follows it
+    // drives the next continuation (after the usual cooldown).
 
     if (goal.options.noContinueWhileChildrenActive) {
       const deferralKey = childDeferralKey(sessionID, goal)
@@ -7146,7 +7427,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         if (commandTurn.attachmentError === true) {
           const commandPart = pluginMarkedTextPart(message, "command")
           commandPart.text = frameControlCommandText(
-            "Goal paused because OpenCode could not resolve an attached command file. Fix or remove the attachment, then run the goal command again or resume explicitly.",
+            `OpenCode could not resolve an attached command file, so this turn only reports that error. The goal is not paused: it continues after the cooldown without the attachment. Fix or remove the attachment and re-run the goal command to include it, or run /${commandName} halt to stop the goal.`,
           )
           // Do not route partial attachment output or failure diagnostics to
           // the model as work input. OpenCode retains this exact array too, so
@@ -7180,23 +7461,10 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         pluginMessageMatches(message, "continuation", continuationID)
       ) {
         rememberOwnedPluginMessage(message, sessionID, "continuation", continuationID)
-        return
       }
-      const text = getText(message.parts)
-      const commandPrefix = `/${commandName}`
-      if (text === commandPrefix || text.startsWith(`${commandPrefix} `)) return
-
-      const goal = goalStates.get(sessionID)
-      if (!goal || goal.stopped) return
-      // With noInterruptOnUserMessage, a human message steers the running loop
-      // instead of pausing the goal for /goal resume.
-      if (goal.options.noInterruptOnUserMessage) return
-      await pauseActiveGoal(sessionID, {
-        stopReason: "user intervention",
-        status: "Auto-continue paused because a new human message arrived; the latest instruction wins.",
-        history: "Paused immediately when a new human message arrived; latest instruction wins.",
-        abortAccepted: true,
-      })
+      // Any other turn (a human message, or a host-written compaction turn)
+      // steers the running loop; it never pauses the goal. The idle after that
+      // turn drives the next continuation.
     },
     "tool.execute.before": async (input, output) => {
       const sessionID = input?.sessionID
@@ -7892,13 +8160,13 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         `Goal created with limits: ${describeTurnLimit(goal.options.maxTurns)} auto-continues, ${formatBudgetDuration(goal.options.maxDurationMs)}, ${goal.options.maxTokens.toLocaleString()} tokens, ${goal.options.contextWindowTokens.toLocaleString()}-token context window.`,
       )
 
-      // A goal set while a planning-only agent is active is recorded but held,
-      // so the objective and its budget survive the mode switch. Without this
-      // the goal is created live and the routed command text tells the model to
-      // start working; the idle guard only catches it on the *next* idle.
+      // A goal set while a planning-only agent is active is recorded active but
+      // deferred: the routed command text must not tell the model to start
+      // working, and the goal starts on its own at the first idle under an
+      // executing agent. It is never stopped for this.
       const creationRestrictedAgent = await restrictedAgentFor(sessionID)
       if (creationRestrictedAgent) {
-        holdGoalForRestrictedAgent(goal, creationRestrictedAgent)
+        deferGoalForRestrictedAgent(goal, creationRestrictedAgent, { created: true })
       }
 
       // Replace the focused goal (cleanupGoal discards it); backgrounded goals
@@ -7913,21 +8181,19 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       focusGoal(sessionID, goal)
       await persist(sessionID)
       const heldLabel = creationRestrictedAgent
-        ? isPlanAgent(creationRestrictedAgent)
-          ? "Plan"
-          : creationRestrictedAgent
+        ? restrictedAgentLabel(creationRestrictedAgent)
         : ""
       announceLifecycle(
         sessionID,
         heldLabel
-          ? `Goal recorded but held while ${heldLabel} is active.`
+          ? `Goal recorded and deferred while ${heldLabel} is active.`
           : replacedGoal
             ? "Goal replaced and active."
             : "Goal active.",
         {
           goal,
-          transition: heldLabel ? "paused" : replacedGoal ? "replaced-active" : "active",
-          expectedState: heldLabel ? "paused" : "active",
+          transition: heldLabel ? "deferred" : replacedGoal ? "replaced-active" : "active",
+          expectedState: "active",
         },
       )
       replaceCommandOutputText(
@@ -7940,7 +8206,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
                 "",
               ]
             : []),
-          heldLabel ? `Goal recorded but held: ${goal.condition}` : `New active goal: ${goal.condition}`,
+          heldLabel ? `Goal recorded, deferred while ${heldLabel} is active: ${goal.condition}` : `New active goal: ${goal.condition}`,
           goal.successCriteria ? `Success criteria: ${goal.successCriteria}` : null,
           goal.constraints ? `Constraints / non-goals: ${goal.constraints}` : null,
           goal.mode !== "normal" ? `Mode: ${goal.mode}` : null,
@@ -7950,9 +8216,9 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           // would be the escape the plan guard exists to prevent.
           ...(heldLabel
             ? [
-                `The ${heldLabel} agent is planning-only, so this goal is not running.`,
+                `The ${heldLabel} agent is planning-only, so work on this goal is deferred.`,
                 "Do not begin work on it now. Continue planning only.",
-                `Switch to an executing agent, then run \`/${commandName} resume\` to start work.`,
+                "The goal starts automatically once an executing agent is active and the session goes idle.",
               ]
             : [
                 "Start working toward this goal now.",
@@ -8035,8 +8301,9 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         const resolvingCommandAttachments = Boolean(resolvingCommandTurn)
         // OpenCode emits session.error while resolving an unreadable retained
         // file, before it invokes chat.message with the synthetic Read-error
-        // parts. Pause safely, keep that one pending correlation, and downgrade
-        // it to a read-only control turn. chat.message then replaces the
+        // parts. Keep that one pending correlation and downgrade it to a
+        // read-only control turn (the goal itself stays active and continues
+        // after the cooldown). chat.message then replaces the
         // original work directive plus partial file diagnostics with a direct
         // error-reporting frame, so the provider cannot continue the goal from
         // a command whose required attachment did not resolve.
@@ -8052,19 +8319,19 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         if (!resolvingCommandAttachments) runtime.pendingCommandTurns.delete(terminal.sessionID)
         runtime.activeCommandTurns.delete(terminal.sessionID)
         if (passive) return
-        await pauseActiveGoal(terminal.sessionID, {
-          ...(resolvingCommandAttachments
+        await noteTurnInterruption(
+          terminal.sessionID,
+          resolvingCommandAttachments
             ? {
                 ...terminal,
-                stopReason: "attachment resolution error",
+                kind: "attachment resolution error",
                 status:
-                  "Goal paused because OpenCode reported an error while resolving an attached command file. Fix or remove the attachment, then run the goal command again or resume explicitly.",
+                  "OpenCode reported an error while resolving an attached command file; that turn reports the error instead of working.",
                 history:
-                  "Paused after OpenCode reported an error while resolving an attached command file.",
+                  "OpenCode reported an error while resolving an attached command file; the goal continues.",
               }
-            : terminal),
-          abortAccepted: true,
-        })
+            : terminal,
+        )
         return
       }
 
@@ -8255,6 +8522,8 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           runtime.suppressedCommandAssistants.get(currentMessageID) !== currentSessionID
         ) {
           goal.lastProgressAt = Date.now()
+          // The provider answered with output again: the error streak is over.
+          clearProviderErrorStreak(goal.sessionID)
           changed = true
         }
 
@@ -8370,6 +8639,9 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
 
       const goal = goalStates.get(sessionID)
       if (!goal || goal.stopped || activeContinues.has(sessionID)) return
+      // Repeated provider errors: wait out the backoff on a timer, which
+      // re-delivers this idle when it expires.
+      if (deferForProviderErrorBackoff(sessionID, goal)) return
       const goalID = goal.goalId
       const runID = goal.runId
       const compactionEpoch = goal.compactionEpoch
@@ -8394,6 +8666,9 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           !activeGoalAfterMessages ||
           activeGoalAfterMessages.compactionEpoch !== compactionEpoch
         ) return
+        // The user interrupted while this pass was reading the transcript:
+        // drop this pass (the goal stays active and continues at a later idle).
+        if (continueController.signal.aborted) return
         if (!activeGoalAfterMessages.executionContext) {
           activeGoalAfterMessages.executionContext = findLatestExecutionContext(messages)
         }
@@ -8448,20 +8723,8 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         activeGoalAfterMessages.lastAssistantText = turnText
         activeGoalAfterMessages.lastAssistantMessageID = latestAssistantID
 
-        // Latest instruction wins: if a real (non-plugin) user message arrived
-        // since the last auto-continue, stop driving the loop and defer to the
-        // human. They can /goal resume to hand control back to the plugin.
-        if (
-          !activeGoalAfterMessages.options.noInterruptOnUserMessage &&
-          userInterventionDetected(messages, activeGoalAfterMessages)
-        ) {
-          await pauseActiveGoal(sessionID, {
-            stopReason: "user intervention",
-            status: "Auto-continue paused because a new human message arrived; the latest instruction wins.",
-            history: "Paused auto-continue after a real user message arrived; latest instruction wins.",
-          })
-          return
-        }
+        // A real user message since the last auto-continue steers the goal; it
+        // does not pause it. The next continuation follows the human's turn.
 
         const sourceAssistantMessageID = latestAssistantID || "<no-assistant>"
         if (
@@ -8991,6 +9254,13 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           { refreshMessages: cooldownWaited },
         )
         if (!activeGoalBeforePrompt) return
+        if (continueController.signal.aborted) {
+          // Interrupted while the claim was being persisted: release the claim
+          // so the next idle can continue from the same source.
+          activeGoalBeforePrompt.continuationClaim = null
+          await persist(sessionID)
+          return
+        }
         claimedSourceAssistantMessageID =
           activeGoalBeforePrompt.continuationClaim?.sourceAssistantMessageID || ""
         claimedCompactionEpoch =
@@ -9207,6 +9477,15 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       const blockID = goal?.goalId || `command-${activeCommandTurn.id}`
       const systemBlocks = Array.isArray(output.system) ? [...output.system] : []
       if (systemBlocks.some((block) => systemBlockContainsGoal(block, blockID))) return
+      // An active goal is deferred, not stopped, while a planning-only agent is
+      // selected. The model must not be told to "keep working" on it then.
+      const deferringAgent =
+        !commandGuarded && goal && !goal.stopped ? await restrictedAgentFor(input.sessionID) : ""
+      const deferringLabel = deferringAgent
+        ? isPlanAgent(deferringAgent)
+          ? "Plan"
+          : deferringAgent
+        : ""
 
       // Only static content here — volatile fields (limit warnings, turn counters,
       // token counts, wall-clock values) must not appear in the system prompt.
@@ -9232,6 +9511,14 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
             "A goal exists for this session, but it is paused. Do not continue or modify work toward it, and do not call completion or blocker tools, unless the current user message explicitly asks to resume it.",
             "For status or history requests, only report the goal state; do not change files or goal state.",
             `To continue, the user can run /${commandName} resume or explicitly ask you to call goal_resume before doing any goal work.`,
+            "</opencode_goal_plugin>",
+          ].join("\n")
+        : deferringLabel
+        ? [
+            `<opencode_goal_plugin id="${goal.goalId}">`,
+            "<goal_state>deferred</goal_state>",
+            `A goal is active for this session, but the ${deferringLabel} agent is planning-only, so goal work is deferred. Do not do goal work, modify files for it, or call completion or blocker tools during this turn; plan only.`,
+            "The goal starts automatically once an executing agent is active and the session goes idle.",
             "</opencode_goal_plugin>",
           ].join("\n")
         : [
@@ -9571,6 +9858,9 @@ export const testInternals = {
   normalizePersistenceOptions,
   sessionPathsFor,
   userInterventionDetected,
+  isHostSyntheticUserMessage,
+  providerErrorBackoffMs,
+  continuationSnapshot,
   outputTokensForMessage,
   parseGoalArguments,
   buildGoalState,

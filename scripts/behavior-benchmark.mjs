@@ -206,11 +206,12 @@ results.push(await scenario("human-interruption", 15, async () => {
       },
     },
   })
+  // An interrupt ends the turn, not the goal: the next idle continues it.
   await idle(hooks, sessionID, "interruption-idle")
-  assert.equal(host.prompts.length, 0)
-  assert.match(await goalCommand(hooks, sessionID, "status"), /abort|paused|stopped/i)
+  assert.equal(host.prompts.length, 1, "an interrupted goal continues after the cooldown")
+  assert.match(await goalCommand(hooks, sessionID, "status"), /State: active/)
   await hooks.dispose()
-  return { continuationPrompts: 0, status: "paused" }
+  return { continuationPrompts: 1, status: "interrupted-continuing" }
 }))
 
 results.push(await scenario("compaction-continuity", 15, async () => {
@@ -247,12 +248,13 @@ results.push(await scenario("restart-recovery", 15, async () => {
     { persistState: true, stateFilePath, registerTools: false, registerAgents: false, minDelayMs: 1 },
   )
   const status = await goalCommand(second, sessionID, "status")
-  assert.match(status, /Recovered persisted goal state|recovered after restart/i)
+  assert.match(status, /Recovered persisted goal state/i)
+  assert.match(status, /State: active/)
   await idle(second, sessionID, "restart-idle")
-  assert.equal(host.prompts.length, 0, "recovered goals must not resume without user consent")
+  assert.equal(host.prompts.length, 1, "a recovered live goal continues at the next idle")
   const stateBytes = (await fs.stat(sessionStatePath(stateFilePath, sessionID))).size
   await second.dispose()
-  return { continuationPrompts: 0, persistedStateBytes: stateBytes, status: "recovered-paused" }
+  return { continuationPrompts: 1, persistedStateBytes: stateBytes, status: "recovered-active" }
 }))
 
 const score = results.reduce((total, result) => total + result.points, 0)

@@ -121,7 +121,12 @@ test("abort while session.messages is pending prevents continuation", async () =
   messagesResult.resolve({ data: [assistantMessage(sessionID)] })
   await pendingIdle
 
-  assert.equal(promptCalls.length, 0)
+  assert.equal(promptCalls.length, 0, "the interrupted pass must not send")
+
+  // The interrupt ends that pass, not the goal: the next idle continues from
+  // the same source, because the dropped pass released its claim.
+  await idle(hooks, sessionID, "after-abort-idle")
+  assert.equal(promptCalls.length, 1)
 })
 
 test("dispose while session.messages is pending prevents continuation", async () => {

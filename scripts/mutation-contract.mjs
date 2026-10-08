@@ -86,7 +86,7 @@ const mutants = [
     test: "test/opencode-session-api.test.js",
   },
   {
-    name: "planning-only agents hold new goals unless explicitly opted out",
+    name: "planning-only agents defer new goals unless explicitly opted out",
     file: "src/goal-plugin.js",
     from: "const allowGoalExecutionFromPlan = pluginOptions.allowGoalExecutionFromPlan === true",
     to: "const allowGoalExecutionFromPlan = true",

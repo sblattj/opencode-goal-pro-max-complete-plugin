@@ -294,8 +294,13 @@ test("re-touching a released session keeps its state and does not re-announce re
   await scenario("retouch", async ({ directory, stateFilePath, onCleanup }) => {
     const goalSession = "S-retouch-goal"
     const resultSession = "S-retouch-result"
-    // A previous process leaves an ACTIVE goal behind: the next load recovers it paused.
-    const previous = spawnProcess(stateFilePath, [{ kind: "command", sessionID: goalSession, args: "survive reloads" }], {
+    // A previous process leaves a PAUSED goal behind. (An active goal now
+    // stays active across a restart and keeps its lease, so it is never idle
+    // released; a paused one is, and reloads on every later touch.)
+    const previous = spawnProcess(stateFilePath, [
+      { kind: "command", sessionID: goalSession, args: "survive reloads" },
+      { kind: "command", sessionID: goalSession, args: "pause" },
+    ], {
       ...FAST,
       idleLeaseReleaseMs: 0,
     })
@@ -347,8 +352,8 @@ test("re-touching a released session keeps its state and does not re-announce re
         { message: `round ${round} release` },
       )
     }
-    const recoveries = host.lifecycle.filter((entry) => /recovered and paused/i.test(entry.text))
-    assert.equal(recoveries.length, 1, "the recovery is announced by the load that performed it, once")
+    const recoveries = host.lifecycle.filter((entry) => /recovered/i.test(entry.text))
+    assert.equal(recoveries.length, 0, "reloading a released paused goal announces no recovery")
 
     const status = await goalCycle(a, host, goalSession, "status")
     assert.match(status, /survive reloads/)
@@ -363,7 +368,35 @@ test("re-touching a released session keeps its state and does not re-announce re
     const persisted = JSON.parse(await readFile(shardStatePath(stateFilePath, resultSession), "utf8"))
     assert.equal(persisted.results[0].condition, "the already finished thing")
     assert.equal(persisted.archives[0].results[0].condition, "archived earlier thing")
-    assert.equal(host.lifecycle.filter((entry) => /recovered and paused/i.test(entry.text)).length, 1)
+    assert.equal(host.lifecycle.filter((entry) => /recovered/i.test(entry.text)).length, 0)
+  })
+})
+
+test("an active goal recovered after a restart stays active and keeps its lease", { timeout: 20_000 }, async () => {
+  await scenario("recovered-active-holds", async ({ directory, stateFilePath, onCleanup }) => {
+    const sessionID = "S-recovered-active"
+    const previous = spawnProcess(stateFilePath, [{ kind: "command", sessionID, args: "outlive the restart" }], {
+      ...FAST,
+      idleLeaseReleaseMs: 0,
+    })
+    await previous.ready
+    await previous.stop()
+
+    const host = makeHost()
+    const a = await makePlugin(directory, stateFilePath, host)
+    onCleanup(() => a.dispose())
+    await touch(a, sessionID)
+    await sleep(GRACE * 20)
+    // The live goal keeps the lease, so no second process can drive it.
+    assert.equal((await claimFiles(stateFilePath, sessionID)).length, 1)
+    const status = await goal(a, sessionID, "status")
+    assert.match(status, /outlive the restart/)
+    assert.match(status, /State: active/)
+    assert.equal(
+      host.lifecycle.filter((entry) => /recovered after a restart and still active/i.test(entry.text)).length,
+      1,
+      "the recovery is announced once",
+    )
   })
 })
 
