@@ -16626,3 +16626,105 @@ test("a todowrite that carried no list keeps the model's own rows instead of del
   assert.equal(Object.prototype.hasOwnProperty.call(untouched.args, "todos"), false)
   assert.deepEqual(untouched.args, { command: "ls" })
 })
+
+// v1.4.0 acceptance pair for the stop policy: compaction and human steering
+// never stop a goal; only the user's /goal halt does.
+function workTurn(id, text = "made progress") {
+  return {
+    info: { id, role: "assistant", sessionID: "session-1", tokens: { input: 1, output: 200, reasoning: 0 } },
+    parts: [textPart(text), { type: "tool", tool: "bash", state: { status: "completed" } }],
+  }
+}
+
+async function idle(hooks, id) {
+  await hooks.event({
+    event: { id, type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } },
+  })
+}
+
+test("v1.4.0: three compactions plus a human steering message leave the goal running", async () => {
+  let transcript = [workTurn("msg-a1")]
+  const { calls, hooks } = await createHooks({
+    messages: async () => ({ data: transcript }),
+    // false was the v1.1.0 default; it is now ignored.
+    options: { minDelayMs: 1, noInterruptOnUserMessage: false },
+  })
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "ship it" },
+    { parts: [] },
+  )
+  await idle(hooks, "idle-1")
+  assert.equal(calls.length, 1)
+
+  for (let i = 1; i <= 3; i += 1) {
+    transcript = [
+      ...transcript,
+      compactionUserMessage(`msg-compaction-${i}`),
+      compactionContinueMessage(`msg-compaction-continue-${i}`),
+      workTurn(`msg-after-compaction-${i}`, `summary ${i}`),
+    ]
+    await hooks.event({ event: { id: `compact-${i}`, type: "session.compacted", properties: { sessionID: "session-1" } } })
+    await idle(hooks, `idle-compact-${i}`)
+    assert.equal(currentGoal("session-1").stopped, false, `compaction ${i} must not stop the goal`)
+  }
+  const promptsAfterCompactions = calls.length
+  assert.ok(promptsAfterCompactions >= 2, "compactions keep the loop driving")
+
+  transcript = [...transcript, userMessage("also update the README", "msg-human-steer"), workTurn("msg-a-steered", "did it")]
+  await hooks["chat.message"](
+    { sessionID: "session-1", messageID: "msg-human-steer", agent: "build" },
+    { message: { id: "msg-human-steer", role: "user", sessionID: "session-1" }, parts: [textPart("also update the README")] },
+  )
+  await idle(hooks, "idle-after-human")
+
+  const goal = currentGoal("session-1")
+  assert.equal(goal.stopped, false)
+  assert.equal(goal.stopReason, "")
+  assert.ok(calls.length > promptsAfterCompactions, "the goal continues after a human steering message")
+  assert.ok(!goal.history.some((entry) => entry.type === "paused"), "nothing recorded a pause")
+})
+
+test("v1.4.0: /goal halt is what stops the goal", async () => {
+  let transcript = [workTurn("msg-h1")]
+  const { calls, hooks } = await createHooks({
+    messages: async () => ({ data: transcript }),
+    options: { minDelayMs: 1 },
+  })
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "ship it" },
+    { parts: [] },
+  )
+  await idle(hooks, "idle-h1")
+  assert.equal(calls.length, 1)
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "halt" },
+    { parts: [] },
+  )
+  const goal = currentGoal("session-1")
+  assert.equal(goal.stopped, true)
+  transcript = [...transcript, workTurn("msg-h2")]
+  await idle(hooks, "idle-h2")
+  assert.equal(calls.length, 1, "a halted goal does not auto-continue")
+})
+
+test("a failed auto-continue prompt retries on its own, with no further host idle", async () => {
+  let attempts = 0
+  const { hooks } = await createHooks({
+    promptAsync: async () => {
+      attempts += 1
+      return attempts === 1 ? { error: { name: "RateLimit" } } : {}
+    },
+    options: { minDelayMs: 1, promptRetryWakeMs: 20 },
+  })
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "ship it" },
+    { parts: [] },
+  )
+  await idle(hooks, "idle-retry-1")
+  assert.equal(attempts, 1)
+  for (let waited = 0; attempts < 2 && waited < 2000; waited += 20) {
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  }
+  assert.equal(attempts, 2, "the retry wake re-drove the continuation")
+  assert.equal(currentGoal("session-1").stopped, false)
+})
