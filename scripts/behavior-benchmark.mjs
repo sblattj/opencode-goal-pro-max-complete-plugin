@@ -182,13 +182,18 @@ results.push(await scenario("loop-circuit-breaker", 15, async () => {
   await idle(hooks, sessionID, "loop-2")
   await idle(hooks, sessionID, "loop-3")
   const status = await goalCommand(hooks, sessionID, "status")
-  assert.match(status, /no tool calls|self-chat loop/i)
-  assert.equal(host.prompts.length, 2)
+  // A self-chat loop is never paused: past the threshold the next
+  // continuation carries a re-plan nudge and the cooldown backs off.
+  assert.equal(host.prompts.length, 3)
+  const nudged = (host.prompts[2]?.body?.parts || []).map((part) => part?.text || "").join("\n")
+  assert.match(nudged, /Stalled: 2 consecutive continuation turn\(s\) without a tool call/)
+  assert.match(status, /stall nudge/i)
+  assert.doesNotMatch(status, /No active goal/)
   await hooks.dispose()
   return {
     continuationPrompts: host.prompts.length,
     continuationCharacters: promptCharacters(host.prompts),
-    status: "paused",
+    status: "nudged",
   }
 }))
 

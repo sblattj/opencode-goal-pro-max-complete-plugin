@@ -391,6 +391,11 @@ function persistedRoutedCommand(output) {
   return { info: output.message, parts: output.parts }
 }
 
+// The text of a promptAsync call, in either SDK shape.
+function promptText(input) {
+  return (input?.body?.parts || input?.parts || []).map((part) => part?.text || "").join("\n")
+}
+
 async function createHooks(overrides = {}) {
   const calls = []
   const aborts = []
@@ -2344,7 +2349,8 @@ test("a deferral does not charge the stall gates twice for one assistant turn", 
 test("an alternating defer/wake cycle cannot disarm the no-progress gate", async () => {
   // The wake pass must leave stall accounting exactly as it found it.
   // Suppressing the increment but not the reset zeroed the counter on every
-  // wake, so a stalled loop alternating defer/wake never reached the pause.
+  // wake, so a stalled loop alternating defer/wake never reached the
+  // threshold. Past the threshold the goal is nudged, never paused.
   const calls = []
   let sourceTurn = 0
   let childActive = false
@@ -2396,12 +2402,19 @@ test("an alternating defer/wake cycle cannot disarm the no-progress gate", async
     childActive = false
     currentGoal("session-1").lastContinueAt = Date.now() - 10
     await hooks.event({ event: { type: "session.idle", properties: { sessionID: "child-1" } } })
-    if (currentGoal("session-1").stopped) break
+    if (calls.some((input) => /Stalled: \d+ consecutive low-progress/.test(promptText(input)))) break
   }
 
   const finished = currentGoal("session-1")
-  assert.equal(finished.stopped, true, "a stalled loop must still reach the no-progress pause")
-  assert.equal(finished.stopReason, "no progress")
+  assert.equal(finished.stopped, false, "a stalled loop is nudged, never paused")
+  assert.ok(
+    finished.noProgressTurns >= 2,
+    `a stalled loop must still reach the no-progress threshold (got ${finished.noProgressTurns})`,
+  )
+  assert.ok(
+    calls.some((input) => /Stalled: \d+ consecutive low-progress/.test(promptText(input))),
+    "the continuation past the threshold carries the stall nudge",
+  )
 })
 
 function perSessionChildClient(calls, childrenFor, statusRef) {
@@ -3842,7 +3855,7 @@ test("a human message never aborts an already accepted continuation", async () =
   assert.equal(currentGoal("session-1").stopReason, "")
 })
 
-test("near-zero repeated output pauses after the configured grace window", async () => {
+test("near-zero repeated output past the grace window is nudged and backed off, never paused", async () => {
   let sourceTurn = 0
   const { calls, hooks } = await createHooks({
     messages: async () => ({
@@ -3876,9 +3889,17 @@ test("near-zero repeated output pauses after the configured grace window", async
     },
   })
 
-  assert.equal(calls.length, 2)
-  assert.equal(currentGoal("session-1").stopped, true)
-  assert.equal(currentGoal("session-1").stopReason, "no progress")
+  // Every idle sends a continuation: the third (past the 2-turn grace window)
+  // carries the re-plan nudge instead of the goal pausing.
+  assert.equal(calls.length, 3)
+  const goal = currentGoal("session-1")
+  assert.equal(goal.stopped, false)
+  assert.equal(goal.stopReason, "")
+  assert.equal(goal.noProgressTurns, 2)
+  assert.doesNotMatch(promptText(calls[1]), /<next_step>/)
+  assert.match(promptText(calls[2]), /<next_step>\nStalled: 2 consecutive low-progress turn\(s\)/)
+  assert.match(promptText(calls[2]), /take ONE concrete tool-using step/)
+  assert.ok(goal.history.some((entry) => /nudging the model instead of pausing/.test(entry.detail)))
 })
 
 test("messageHasToolCall detects tool/subtask parts", () => {
@@ -3893,7 +3914,7 @@ test("messageHasToolCall detects tool/subtask parts", () => {
   assert.equal(messageHasToolCall({}), false)
 })
 
-test("continuation turns with no tool calls pause after the grace window", async () => {
+test("continuation turns with no tool calls past the grace window are nudged, never paused", async () => {
   let sourceTurn = 0
   const { calls, hooks } = await createHooks({
     // High output (so the low-output check never fires) but text-only: no tools.
@@ -3915,11 +3936,14 @@ test("continuation turns with no tool calls pause after the grace window", async
     })
   }
 
-  // Two continuations were sent (turn 1 and the grace turn), then the gate paused.
-  assert.equal(calls.length, 2)
+  // Three continuations: turn 1, the grace turn, then a nudged continuation
+  // once the gate is past its threshold. The goal never pauses.
+  assert.equal(calls.length, 3)
   const goal = currentGoal("session-1")
-  assert.equal(goal.stopped, true)
-  assert.equal(goal.stopReason, "no tool calls")
+  assert.equal(goal.stopped, false)
+  assert.equal(goal.noToolCallTurns, 2)
+  assert.doesNotMatch(promptText(calls[1]), /<next_step>/)
+  assert.match(promptText(calls[2]), /Stalled: 2 consecutive continuation turn\(s\) without a tool call/)
 })
 
 test("continuation turns that use tools do not trip the no-tool-call gate", async () => {
@@ -4133,7 +4157,7 @@ test("a turn whose only assistant message is text-only still charges the no-tool
   assert.equal(goal.noToolCallTurns, 2)
 })
 
-test("consecutive multi-message prose-only turns still pause with stopReason 'no tool calls'", async () => {
+test("consecutive multi-message prose-only turns still trip the no-tool-call gate, which nudges instead of pausing", async () => {
   const { calls, goal } = await runIdleTurns(
     "turn-prose-only-multi",
     { noToolCallTurnsBeforePause: 2 },
@@ -4148,11 +4172,11 @@ test("consecutive multi-message prose-only turns still pause with stopReason 'no
       }),
     ],
   )
-  assert.equal(calls.length, 2)
-  assert.equal(goal.stopped, true)
-  assert.equal(goal.stopReason, "no tool calls")
+  assert.equal(calls.length, 3)
+  assert.equal(goal.stopped, false)
   assert.equal(goal.noToolCallTurns, 2)
-  assert.match(goal.lastStatus, /2 continuation turn\(s\) with no tool calls/)
+  assert.match(goal.lastStatus, /Continuing with a stall nudge/)
+  assert.match(promptText(calls[2]), /Stalled: 2 consecutive continuation turn\(s\) without a tool call/)
 })
 
 test("the no-tool-call gate reads the whole trailing assistant run when the host sends no parentID", async () => {
@@ -4467,6 +4491,13 @@ test("stopped goals can be resumed", async () => {
       properties: { sessionID: "session-1", status: { type: "idle" } },
     },
   })
+  // A stall never stops a goal any more; the user's own pause does.
+  assert.equal(currentGoal("session-1").stopped, false)
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "pause" },
+    { parts: [] },
+  )
+  assert.equal(currentGoal("session-1").stopped, true)
 
   const stoppedOutput = { system: [] }
   await hooks["experimental.chat.system.transform"]({ sessionID: "session-1" }, stoppedOutput)
@@ -5430,7 +5461,7 @@ test("duplicate session.compacted delivery does not open another continuation ep
   assert.equal(goal.stopped, false)
 })
 
-test("repeated compactions without work progress pause and abort the active goal", async () => {
+test("repeated compactions without work progress keep the goal active, never abort, and nudge the next continuation", async () => {
   const { aborts, calls, hooks } = await createHooks({
     options: { minDelayMs: 1, noToolCallTurnsBeforePause: 0 },
   })
@@ -5452,12 +5483,25 @@ test("repeated compactions without work progress pause and abort the active goal
 
   const goal = currentGoal(sessionID)
   assert.equal(calls.length, 1)
-  assert.equal(aborts.length, 1)
-  assert.equal(aborts[0].path.id, sessionID)
+  assert.equal(aborts.length, 0, "a compaction loop never aborts the session")
   assert.equal(goal.compactionEpoch, 2)
   assert.equal(goal.stalledCompactions, 2)
-  assert.equal(goal.stopped, true)
-  assert.equal(goal.stopReason, "stalled compaction")
+  assert.equal(goal.stopped, false)
+  assert.equal(goal.stopReason, "")
+  assert.match(goal.lastStatus, /2 compactions without a productive assistant or tool turn; continuing/)
+  assert.doesNotMatch(promptText(calls[0]), /<next_step>/)
+
+  // The post-compaction idle still drives a continuation, and it carries the
+  // stall nudge read from stalledCompactions.
+  await hooks.event({
+    event: { id: "idle-stalled-2", type: "session.status", properties: { sessionID, status: { type: "idle" } } },
+  })
+  assert.equal(calls.length, 2)
+  assert.equal(currentGoal(sessionID).stopped, false)
+  assert.match(
+    promptText(calls[1]),
+    /<next_step>\nStalled: 2 context compactions happened without a productive turn\./,
+  )
 })
 
 test("a productive tool turn resets the stalled-compaction circuit breaker", async () => {
@@ -5521,7 +5565,7 @@ test("a re-delivered identity-less compaction does not trip the circuit breaker"
   assert.equal(aborts.length, 0)
 })
 
-test("identity-less compactions separated by message activity still trip the breaker", async () => {
+test("identity-less compactions separated by message activity still trip the breaker, which nudges instead of pausing", async () => {
   const { aborts, hooks } = await createHooks({
     options: { minDelayMs: 1, noToolCallTurnsBeforePause: 0 },
   })
@@ -5555,9 +5599,9 @@ test("identity-less compactions separated by message activity still trip the bre
   await hooks.event({ event: { type: "session.compacted", properties: { sessionID } } })
   const goal = currentGoal(sessionID)
   assert.equal(goal.stalledCompactions, 2)
-  assert.equal(goal.stopped, true)
-  assert.equal(goal.stopReason, "stalled compaction")
-  assert.equal(aborts.length, 1)
+  assert.equal(goal.stopped, false)
+  assert.equal(aborts.length, 0)
+  assert.ok(goal.history.some((entry) => /nudging the next continuation instead of pausing/.test(entry.detail)))
 })
 
 test("tool parts decorating a message.updated event are not a productive-turn signal", async () => {
@@ -5682,8 +5726,11 @@ test("compaction-summary assistants are neither progress nor continuation source
   await hooks.event({
     event: { id: "compact-summary-2", type: "session.compacted", properties: { sessionID } },
   })
-  assert.equal(aborts.length, 1)
-  assert.equal(currentGoal(sessionID).stopReason, "stalled compaction")
+  // The summary was not productive work, so the breaker trips; it nudges and
+  // never aborts or pauses.
+  assert.equal(aborts.length, 0)
+  assert.equal(currentGoal(sessionID).stalledCompactions, 2)
+  assert.equal(currentGoal(sessionID).stopped, false)
 })
 
 test("compaction after claim persistence invalidates the stale idle handler", async () => {
@@ -5757,7 +5804,7 @@ test("adjacent flags do not corrupt each other and still surface missing values"
   assert.deepEqual(parsed.errors, ["Missing value for --max-turns"])
 })
 
-test("no-progress pause takes precedence over budget wrap-up threshold", async () => {
+test("a no-progress stall no longer pauses, so the budget wrap-up threshold still ends the run", async () => {
   let recentMessage = message("ok", { input: 1, output: 5, reasoning: 0 }, "msg-budget-initial")
   const { calls, hooks } = await createHooks({
     messages: async () => ({ data: [recentMessage] }),
@@ -5805,11 +5852,16 @@ test("no-progress pause takes precedence over budget wrap-up threshold", async (
     },
   })
 
+  // The stall brake nudges instead of pausing; the budget remains the
+  // backstop and requests its final handoff (which carries no stall nudge).
   const goal = currentGoal("session-1")
-  assert.equal(calls.length, 1)
+  assert.equal(calls.length, 2)
+  assert.equal(goal.noProgressTurns, 1)
   assert.equal(goal.stopped, true)
-  assert.equal(goal.stopReason, "no progress")
-  assert.equal(goal.budgetWrapupSent, false)
+  assert.equal(goal.stopReason, "budget wrap-up requested")
+  assert.equal(goal.budgetWrapupSent, true)
+  assert.match(promptText(calls[1]), /<budget_wrapup>/)
+  assert.doesNotMatch(promptText(calls[1]), /<next_step>/)
 })
 
 test("/goal status with no active goal returns help text", async () => {
@@ -6379,10 +6431,11 @@ test("[goal:blocked] without a concrete blocker is rejected and continues", asyn
   assert.match(calls[0].body.parts[0].text, /blocker was rejected: it was not concrete/)
 })
 
-test("repeated [goal:complete]-without-evidence re-prompts pause the goal after maxPromptFailures", async () => {
+test("repeated [goal:complete]-without-evidence keeps re-prompting past maxPromptFailures instead of pausing", async () => {
   // Regression: completionUnverified re-prompts never counted toward promptFailures,
   // so a model that consistently omits [goal:evidence] would loop until a hard limit.
-  // formatFailures counter now caps this at maxPromptFailures consecutive format failures.
+  // formatFailures counts them; past maxPromptFailures the goal keeps
+  // re-prompting with a backed-off cooldown instead of pausing.
   let sourceTurn = 0
   const { calls, hooks } = await createHooks({
     messages: async () => ({
@@ -6410,14 +6463,16 @@ test("repeated [goal:complete]-without-evidence re-prompts pause the goal after 
   assert.equal(calls.length, 1)
   assert.match(calls[0].body.parts[0].text, /<evidence_required>/)
 
-  await fireIdle() // formatFailures → 2 >= maxPromptFailures; goal paused, no extra call
-  assert.equal(goal.stopped, true)
-  assert.equal(goal.stopReason, "format validation failures")
-  assert.match(goal.lastStatus, /format-validation failure/)
-  assert.equal(calls.length, 1, "no additional promptAsync call after pause")
+  await fireIdle() // formatFailures → 2 >= maxPromptFailures; still re-prompts
+  assert.equal(goal.stopped, false)
+  assert.equal(goal.stopReason, "")
+  assert.equal(goal.formatFailures, 2)
+  assert.equal(calls.length, 2, "the evidence re-prompt is still sent past the cap")
+  assert.match(promptText(calls[1]), /<evidence_required>/)
+  assert.ok(goal.history.some((entry) => /re-prompting with backoff instead of pausing/.test(entry.detail)))
 })
 
-test("repeated [goal:blocked]-without-blocker re-prompts pause the goal after maxPromptFailures", async () => {
+test("repeated [goal:blocked]-without-blocker keeps re-prompting past maxPromptFailures instead of pausing", async () => {
   let sourceTurn = 0
   const { calls, hooks } = await createHooks({
     messages: async () => ({
@@ -6442,11 +6497,46 @@ test("repeated [goal:blocked]-without-blocker re-prompts pause the goal after ma
   assert.equal(currentGoal("session-fmt-blocked").stopped, false)
   assert.equal(calls.length, 1)
 
-  await fireIdle() // formatFailures → 2 >= maxPromptFailures; pause
+  await fireIdle() // formatFailures → 2 >= maxPromptFailures; still re-prompts
   const goal = currentGoal("session-fmt-blocked")
-  assert.equal(goal.stopped, true)
-  assert.equal(goal.stopReason, "format validation failures")
-  assert.equal(calls.length, 1)
+  assert.equal(goal.stopped, false)
+  assert.equal(goal.formatFailures, 2)
+  assert.equal(calls.length, 2)
+  assert.match(promptText(calls[1]), /Previous blocker was rejected/)
+})
+
+test("stall strikes past a threshold back the continuation cooldown off exponentially", async () => {
+  // Bucket-3 backoff: with maxPromptFailures 1, every unverified completion is
+  // one more strike past the cap, so the cooldown doubles each turn. The sleep
+  // guarantees a lower bound, so the assertion is on lastContinueAt deltas.
+  let sourceTurn = 0
+  const { calls, hooks } = await createHooks({
+    messages: async () => ({
+      data: [message("All done!\n\n[goal:complete]", undefined, `msg-backoff-${sourceTurn}`)],
+    }),
+    onPromptAsync: () => {
+      sourceTurn += 1
+    },
+    options: { minDelayMs: 40, maxPromptFailures: 1, noToolCallTurnsBeforePause: 0 },
+  })
+  const sessionID = "session-backoff"
+  await hooks["command.execute.before"]({ command: "goal", sessionID, arguments: "ship it" }, { parts: [] })
+  const stamps = []
+  for (let i = 0; i < 4; i += 1) {
+    await hooks.event({
+      event: { type: "session.status", properties: { sessionID, status: { type: "idle" } } },
+    })
+    stamps.push(currentGoal(sessionID).lastContinueAt)
+  }
+  const goal = currentGoal(sessionID)
+  assert.equal(calls.length, 4)
+  assert.equal(goal.stopped, false)
+  assert.equal(goal.formatFailures, 4)
+  // Before turn k the cooldown is 40 * 2^(formatFailures past the cap):
+  // 80 ms, 160 ms, then 320 ms.
+  assert.ok(stamps[1] - stamps[0] >= 80, `first backed-off gap ${stamps[1] - stamps[0]} ms`)
+  assert.ok(stamps[2] - stamps[1] >= 160, `second backed-off gap ${stamps[2] - stamps[1]} ms`)
+  assert.ok(stamps[3] - stamps[2] >= 320, `third backed-off gap ${stamps[3] - stamps[2]} ms`)
 })
 
 test("formatFailures resets to zero when the model produces a valid response", async () => {
@@ -6601,9 +6691,13 @@ test("promptAsync error response updates lastStatus without stopping the goal", 
   assert.equal(goal.stopped, false)
 })
 
-test("repeated promptAsync errors pause the goal", async () => {
+test("repeated promptAsync errors keep the goal active and keep retrying past maxPromptFailures", async () => {
+  let attempts = 0
   const { hooks } = await createHooks({
-    promptAsync: async () => ({ error: { name: "RateLimit" } }),
+    promptAsync: async () => {
+      attempts += 1
+      return { error: { name: "RateLimit" } }
+    },
     options: { minDelayMs: 1, maxPromptFailures: 2 },
   })
   await hooks["command.execute.before"](
@@ -6622,9 +6716,18 @@ test("repeated promptAsync errors pause the goal", async () => {
       properties: { sessionID: "session-1", status: { type: "idle" } },
     },
   })
+  await hooks.event({
+    event: {
+      type: "session.status",
+      properties: { sessionID: "session-1", status: { type: "idle" } },
+    },
+  })
   const goal = currentGoal("session-1")
-  assert.equal(goal.stopped, true)
-  assert.equal(goal.stopReason, "auto-continue failures")
+  assert.equal(goal.stopped, false)
+  assert.equal(goal.stopReason, "")
+  assert.equal(attempts, 3, "every idle past the cap still retries the continuation")
+  assert.equal(goal.promptFailures, 3)
+  assert.match(goal.lastStatus, /retrying on the next idle with backoff/)
 })
 
 test("thrown error in event handler updates lastStatus and clears activeContinues", async () => {
@@ -7252,7 +7355,7 @@ test("/goal history returns the most recent completed goal history", async () =>
   assert.match(output.parts[0].text, /completed:/)
 })
 
-test("repeated thrown event-handler errors eventually pause the goal", async () => {
+test("repeated thrown event-handler errors keep the goal active and keep retrying", async () => {
   const { hooks } = await createHooks({
     messages: async () => {
       throw new Error("network")
@@ -7277,9 +7380,18 @@ test("repeated thrown event-handler errors eventually pause the goal", async () 
     },
   })
 
+  await hooks.event({
+    event: {
+      type: "session.status",
+      properties: { sessionID: "session-thrown-failures", status: { type: "idle" } },
+    },
+  })
+
   const goal = currentGoal("session-thrown-failures")
-  assert.equal(goal.stopped, true)
-  assert.equal(goal.stopReason, "auto-continue failures")
+  assert.equal(goal.stopped, false)
+  assert.equal(goal.stopReason, "")
+  assert.equal(goal.promptFailures, 3)
+  assert.match(goal.lastStatus, /retrying on the next idle with backoff/)
 })
 
 test("missing client.app.log falls back to console.error", async () => {
@@ -8729,8 +8841,8 @@ test("an approving auditor archives the goal", async () => {
   assert.match(statusOutput.parts[0].text, /State: achieved/)
 })
 
-test("a rejecting auditor restores (pauses) the goal instead of archiving", async () => {
-  const { hooks } = await createHooks({
+test("a rejecting auditor keeps the goal active and re-prompts with the audit feedback", async () => {
+  const { calls, hooks } = await createHooks({
     messages: async () => ({
       data: [message("All done!\n[goal:evidence] suite green\n[goal:complete]")],
     }),
@@ -8746,9 +8858,14 @@ test("a rejecting auditor restores (pauses) the goal instead of archiving", asyn
 
   const goal = currentGoal("audit-no")
   assert.ok(goal) // not archived
-  assert.equal(goal.stopped, true)
-  assert.equal(goal.stopReason, "audit rejected")
-  assert.match(goal.lastStatus, /tests still fail/)
+  assert.equal(goal.stopped, false)
+  assert.equal(goal.stopReason, "")
+  assert.match(goal.lastStatus, /audit rejected/i)
+  assert.ok(goal.history.some((entry) => /tests still fail/.test(entry.detail)))
+  assert.equal(calls.length, 1, "the same idle re-prompts with the audit feedback")
+  const text = promptText(calls[0])
+  assert.match(text, /<evidence_required>/)
+  assert.match(text, /rejected by the completion audit: tests still fail/)
 })
 
 test("an auditor that throws is treated as a rejection (fail closed)", async () => {
@@ -8773,7 +8890,9 @@ test("an auditor that throws is treated as a rejection (fail closed)", async () 
 
   const goal = currentGoal("audit-throw")
   assert.ok(goal)
-  assert.equal(goal.stopReason, "audit rejected")
+  assert.equal(goal.stopped, false)
+  assert.equal(goal.stopReason, "")
+  assert.ok(goal.history.some((entry) => entry.type === "audit-rejected"))
 })
 
 test("createChildSessionAuditor parses verdicts and fails closed without the API", async () => {
@@ -9945,8 +10064,41 @@ test("agent update_goal complete invokes the auditor before archiving", async ()
   // Goal must remain active (not archived).
   const goal = currentGoal("auditor-bypass")
   assert.ok(goal)
-  assert.equal(goal.stopped, true)
-  assert.equal(goal.stopReason, "audit rejected")
+  assert.equal(goal.stopped, false)
+  assert.equal(goal.stopReason, "")
+  assert.match(result, /stays active/)
+  assert.equal(goal.pendingAuditRejection, "not done yet")
+})
+
+test("a tool-path audit rejection is carried into the next continuation, then cleared", async () => {
+  const rejectingAuditor = async () => ({ approved: false, reason: "coverage report missing" })
+  const { calls, hooks } = await createHooks({
+    messages: async () => ({ data: [message("still working")] }),
+    options: { minDelayMs: 1 },
+  })
+  const handlers = buildAgentToolHandlers({
+    defaultGoalOptions: normalizeOptions(),
+    persist: async () => true,
+    completionAuditor: rejectingAuditor,
+  })
+  const sessionID = "session-1"
+  await hooks["command.execute.before"]({ command: "goal", sessionID, arguments: "ship it" }, { parts: [] })
+  const result = await handlers.updateGoal(sessionID, { status: "complete", evidence: "done" })
+  assert.match(result, /rejected/)
+  assert.equal(currentGoal(sessionID).stopped, false)
+  assert.equal(currentGoal(sessionID).pendingAuditRejection, "coverage report missing")
+
+  await hooks.event({
+    event: { type: "session.status", properties: { sessionID, status: { type: "idle" } } },
+  })
+  assert.equal(calls.length, 1)
+  const text = promptText(calls[0])
+  assert.match(text, /<evidence_required>/)
+  assert.match(text, /rejected by the completion audit: coverage report missing/)
+  const goal = currentGoal(sessionID)
+  assert.equal(goal.pendingAuditRejection, "")
+  assert.equal(goal.stopped, false)
+  assert.match(goal.lastStatus, /Completion audit rejected; re-prompting with the audit feedback/)
 })
 
 test("createChildSessionAuditor returns a rejected verdict on timeout", async () => {
@@ -10041,7 +10193,10 @@ test("built-in completion audit stays fail-closed when verifier ownership was no
     },
   })
   assert.equal(childCreates, 0)
-  assert.equal(currentGoal("ownership-unconfirmed").stopReason, "audit rejected")
+  const goal = currentGoal("ownership-unconfirmed")
+  assert.ok(goal, "fail-closed: the goal is not archived")
+  assert.equal(goal.stopped, false)
+  assert.ok(goal.history.some((entry) => entry.type === "audit-rejected"))
 })
 
 test("agent completion remains paused when neither state nor ledger records the terminal event", async () => {
@@ -10932,7 +11087,7 @@ test("noToolCallTurns does not increment on a turn that already triggered the no
   assert.equal(goal.noToolCallTurns, 0, "noToolCallTurns must not increment when noProgress gate fires")
 })
 
-test("formatFailures increments when stall gate fires early-return on a turn with unverified completion", async () => {
+test("formatFailures increments exactly once when the stall gate nudges a turn with unverified completion", async () => {
   // Setup: goal with noProgressTurnsBeforePause=1 and a model that emits bare [goal:complete].
   // The stall gate fires on turn 1 (noProgress=1>=1), returning early BEFORE the
   // normal formatFailures increment path. The counter must still be incremented.
@@ -10966,17 +11121,12 @@ test("formatFailures increments when stall gate fires early-return on a turn wit
   await hooks.event({
     event: { type: "session.status", properties: { sessionID: "ff-stall-s1", status: { type: "idle" } } },
   })
-  // The goal should now be stopped (stall gate fired after 1 turn).
-  // formatFailures must have been incremented despite the early return.
-  const stopped = currentGoal("ff-stall-s1")
-  // goal may be null (if cleaned up) or present but stopped
-  const finalGoal = stopped || null
-  if (finalGoal) {
-    assert.equal(finalGoal.stopped, true, "goal must be stopped by stall gate")
-    assert.ok(finalGoal.formatFailures >= 1, `formatFailures must be >= 1, got ${finalGoal.formatFailures}`)
-  }
-  // If goal is null it was already cleaned up — the test passes vacuously
-  // (the stall gate fired, which is the expected behavior).
+  // The stall gate no longer pauses: it nudges, and the unverified completion
+  // is counted once on the normal format-validation path (no double count).
+  const finalGoal = currentGoal("ff-stall-s1")
+  assert.ok(finalGoal)
+  assert.equal(finalGoal.stopped, false, "the stall gate nudges instead of pausing")
+  assert.equal(finalGoal.formatFailures, 1)
 })
 
 test("budget-wrapup writes a ledger event and persists before sending the prompt", async () => {
@@ -14933,9 +15083,9 @@ test("a turn whose only tool call was a mirror refresh does not clear the tool-f
     true,
   )
 
-  // And through the live brake: mirrorTodos defaults to "plan", so three
-  // todowrite-only turns pause on the no-tool-call gate exactly as three
-  // text-only turns do.
+  // And through the live brake: mirrorTodos defaults to "plan", so
+  // todowrite-only turns trip the no-tool-call gate (which now nudges)
+  // exactly as text-only turns do.
   let sourceTurn = 0
   const { calls, hooks } = await createHooks({
     messages: async () => ({ data: [mirrorRefreshTurnMessage(`msg-mirror-${sourceTurn}`)] }),
@@ -14954,10 +15104,11 @@ test("a turn whose only tool call was a mirror refresh does not clear the tool-f
     })
   }
 
-  assert.equal(calls.length, 2)
+  assert.equal(calls.length, 3)
   const goal = currentGoal("session-1")
-  assert.equal(goal.stopped, true)
-  assert.equal(goal.stopReason, "no tool calls")
+  assert.equal(goal.stopped, false)
+  assert.equal(goal.noToolCallTurns, 2)
+  assert.match(promptText(calls[2]), /Stalled: 2 consecutive continuation turn\(s\) without a tool call/)
 })
 
 test("todowrite still counts as work when mirroring is off", async () => {
