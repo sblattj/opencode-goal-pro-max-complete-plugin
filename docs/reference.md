@@ -285,6 +285,7 @@ Pass options when registering the plugin to change the defaults for all goals.
         "maxTokens": 100000000,
         "contextWindowTokens": 0,
         "minDelayMs": 1500,
+        "promptRetryWakeMs": 5000,
         "maxRecentMessages": 200,
         "noProgressTokenThreshold": 50,
         "noProgressTurnsBeforePause": 2,
@@ -307,6 +308,7 @@ Pass options when registering the plugin to change the defaults for all goals.
 | `noProgressTurnsBeforePause` | `2` | Grace window for low-output stalls; tokens are summed across the whole turn. Reaching it records the stall; it no longer pauses the goal (the name is historical) |
 | `noToolCallTurnsBeforePause` | `10` | Grace window for tool-free turns. Reaching it records the stall; it no longer pauses the goal. Set the **plugin option** to `0` to disable the detector for legitimate writing/research workflows; `--no-tool-turns 0` is rejected as invalid |
 | `warnTurnsRemaining` / `warnDurationMsRemaining` / `warnTokensRemaining` | `3` / `600000` / `25000` | Thresholds for the "limits are near" warning. `warnTokensRemaining` is applied to both token ceilings. Under the shipped defaults the **turn** warning is silent, because an unlimited budget has nothing to run out of; the context warning is silent while no context ceiling is known |
+| `promptRetryWakeMs` | `5000` | A failed auto-continue prompt starts no turn, so no host idle follows it. After this many milliseconds (or the backed-off cooldown, if longer) the plugin retries on its own; failures never pause the goal |
 | `noInterruptOnUserMessage` | `true` | **Deprecated; accepted but ignored.** A human message always steers the next continuation and never pauses the goal. `false` no longer pauses with `user intervention`. Stop a goal with `/goal halt` (resumable) or `/goal clear` |
 | `noContinueWhileChildrenActive` | `false` | When `true`, auto-continue is deferred while the session has active children (subagents, background tasks). Adds a `children` and a `status` call per idle. **Fails open** for hosts that cannot report children/status, for sessions with more concurrent children than can be tracked, and for children running goals of their own. Every deferral is reported in `/goal status` and the history, so a waiting goal is not mistaken for a hung one |
 | `commandName` | `goal` | The slash command the plugin owns; a leading slash is tolerated. Register the matching name in your OpenCode `command` config |

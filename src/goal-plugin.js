@@ -165,6 +165,7 @@ const DEFAULT_OPTIONS = {
   maxTokens: 100000000,
   contextWindowTokens: 0,
   minDelayMs: 1500,
+  promptRetryWakeMs: 5000,
   maxRecentMessages: 200,
   noProgressTokenThreshold: 50,
   noProgressTurnsBeforePause: 2,
@@ -1798,6 +1799,7 @@ function normalizeOptions(options = {}) {
         ? options.contextWindowTokens
         : DEFAULT_OPTIONS.contextWindowTokens,
     minDelayMs: toPositiveInteger(options.minDelayMs, DEFAULT_OPTIONS.minDelayMs),
+    promptRetryWakeMs: toPositiveInteger(options.promptRetryWakeMs, DEFAULT_OPTIONS.promptRetryWakeMs),
     maxRecentMessages: toPositiveInteger(
       options.maxRecentMessages,
       DEFAULT_OPTIONS.maxRecentMessages,
@@ -6804,34 +6806,39 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
     }
   }
 
-  const pauseActiveGoal = async (
-    sessionID,
-    { stopReason: reason, status, history, abortAccepted = false },
-  ) => {
-    const goal = goalStates.get(sessionID)
-    if (!goal) return false
-    if (goal.stopped && goal.stopReason === reason) return false
-    currentRuntime().continuationControllers.get(sessionID)?.abort()
-    // A goal stopping while deferred must release its watched children, or the
-    // watch outlives the goal and a later child idle re-drives a dead loop.
-    clearDeferredChildren(sessionID)
-    childDeferralNotices.delete(childDeferralKey(sessionID, goal))
-    goal.stopped = true
-    goal.stopReason = reason
-    goal.lastStatus = `${status} Run /${commandName} resume to continue.`
-    goal.continuationClaim = null
-    pushHistory(goal, "paused", history)
-    activeContinues.delete(sessionID)
-    await persist(sessionID)
-    announceLifecycle(sessionID, `Goal paused — ${summarizeText(reason, 160)}.`, {
-      goal,
-      transition: "paused",
-      reason,
-      expectedState: "paused",
-      expectedStopReason: reason,
-    })
-    if (abortAccepted) await abortAcceptedContinuation(sessionID)
-    return true
+  // A failed auto-continue prompt starts no turn, so the host sends no further
+  // idle and a goal that never pauses would sit active but stuck. Re-enter
+  // through a synthesized idle after the backed-off cooldown; every normal
+  // guard (identity, idle status, claim dedupe, lease fence) still applies.
+  // sessionID -> timer
+  const promptRetryWakes = new Map()
+
+  const schedulePromptRetryWake = (sessionID, goal) => {
+    if (promptRetryWakes.has(sessionID)) return
+    const goalId = goal.goalId
+    const runId = goal.runId
+    const delay = Math.max(continuationDelayMs(goal), goal.options.promptRetryWakeMs)
+    const timer = setTimeout(
+      bindRuntime(runtime, async () => {
+        if (promptRetryWakes.get(sessionID) !== timer) return
+        promptRetryWakes.delete(sessionID)
+        const liveGoal = goalStates.get(sessionID)
+        if (
+          !liveGoal ||
+          liveGoal.stopped ||
+          liveGoal.goalId !== goalId ||
+          liveGoal.runId !== runId ||
+          liveGoal.promptFailures <= 0 ||
+          currentRuntime().sessionStatuses.get(sessionID) !== "idle"
+        ) {
+          return
+        }
+        await hooks.event({ event: { type: "session.idle", properties: { sessionID } } })
+      }),
+      delay,
+    )
+    timer.unref?.()
+    promptRetryWakes.set(sessionID, timer)
   }
 
   // Provider-error streaks and their backoff timers. Transient by design: a
@@ -9461,6 +9468,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
             if (activeGoalAfterPrompt.promptFailures >= activeGoalAfterPrompt.options.maxPromptFailures) {
               activeGoalAfterPrompt.lastStatus = `${message}; ${activeGoalAfterPrompt.promptFailures} consecutive failure(s), retrying on the next idle with backoff.`
             }
+            schedulePromptRetryWake(sessionID, activeGoalAfterPrompt)
           }
           await logPluginError(client, message, response.error)
         } else {
@@ -9505,6 +9513,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           if (activeGoalAfterError.promptFailures >= activeGoalAfterError.options.maxPromptFailures) {
             activeGoalAfterError.lastStatus = `${message}; ${activeGoalAfterError.promptFailures} consecutive failure(s), retrying on the next idle with backoff.`
           }
+          schedulePromptRetryWake(sessionID, activeGoalAfterError)
           await persist(sessionID)
         }
         await logPluginError(client, "Auto-continue failed", error)

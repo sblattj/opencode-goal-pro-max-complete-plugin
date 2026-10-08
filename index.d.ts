@@ -330,6 +330,15 @@ export interface GoalPluginOptions {
   minDelayMs?: number
 
   /**
+   * Floor, in milliseconds, before a failed auto-continue prompt is retried
+   * without waiting for a new host idle event. A failed prompt starts no
+   * turn, so without this wake the goal would stay active but never resume.
+   * The retry still honors the backed-off cooldown when that is longer.
+   * @default 5000
+   */
+  promptRetryWakeMs?: number
+
+  /**
    * How many recent session messages to scan when looking for the latest
    * assistant turn before auto-continuing. This is the visibility window the
    * turn is reconstructed from: OpenCode writes one assistant message per LLM
