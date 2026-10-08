@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.4.0 — 2026-10-08
+
+- **Changed: a goal stops only when you stop it, when it finishes, when a budget runs out, or when the model is genuinely hard-blocked.** Every other automatic stop now records what happened and keeps going. `docs/reference.md` has a single "When a goal stops" section.
+  - **Compaction is not a human.** OpenCode writes a user-role message for each compaction (a `compaction` part, then a synthetic "Continue if you have next steps" text). The plugin counted those as human turns, so with `noInterruptOnUserMessage: false` (the default before 1.2.0) every compaction paused the goal with "user intervention". `isHostSyntheticUserMessage` now excludes them.
+  - **Your messages steer, never pause.** `noInterruptOnUserMessage` is deprecated: accepted, ignored, always on. No more "Stopped: user intervention".
+  - **Turn-ending host events end the turn, not the goal.** Permission rejections, aborted turns (Escape), provider errors and attachment-resolution errors are recorded and the goal continues after the cooldown. Repeated provider errors back off 5 s, 10 s, 20 s … up to 5 minutes.
+  - **Loop brakes nudge instead of stopping.** Stalled compactions (no longer aborting the session), low-progress turns and tool-free turns add a "Stalled:" re-plan instruction to the next continuation, and the cooldown backs off exponentially (`minDelayMs × 2^strikes`, up to 64×). Format-validation and auto-continue failures keep retrying with backoff.
+  - **New option `promptRetryWakeMs` (default `5000`).** A failed auto-continue prompt starts no turn, so no idle follows it; the plugin now retries on its own after this delay (or the backed-off cooldown, if longer).
+  - **A rejected completion audit keeps the goal active** and sends the auditor's reason with the next continuation.
+  - **Planning-only agents defer, not stop.** Under Plan the goal's clock freezes; it resumes under the next executing agent, with that agent's context.
+  - **Restart keeps a running goal running.** A goal that was active before a plugin restart continues at the next idle; downtime does not count against its duration budget. A newer pause or halt in the lifecycle ledger still wins over a stale snapshot, and a goal rebuilt from the ledger alone still loads paused.
+- **New: `/goal halt`**, the user's stop (an alias of `/goal pause`, resumable with `/goal resume`). `/goal status` suggests halt/resume/clear while a goal runs.
+- **Removed: the `goal_pause` tool** (13 tools now). `update_goal` and the canonical update path refuse `status: "paused"` with `pause_user_only`. Pausing is user-only.
+- **Changed: blocking is deterred.** `goal_block` and `[goal:blocked]` still work with a concrete blocker, but every prompt surface, tool description, the shipped skill and the docs now say that blocking stops the whole goal and is only for input that only you can give; a mid-goal message from you is steering, not a reason to block.
+- **Unchanged:** budget ceilings, `/goal pause` and `/goal clear`, completion, queued/backgrounded goals, and the two-process persistence fences (`terminal persistence failed`, `continuation claim persistence failed`).
+
 ## 1.3.0 — 2026-10-04
 
 - **Fixed: "Goal plugin is locked by another opencode process" no longer pins a session to whichever process touched it first.** Before this release, a process took a session's lease the first time any hook saw that session, even an ordinary chat message with no goal, and kept it until the process exited. A second OpenCode process opening the same session was passive for good. Now a process holds a session's lease only while it is driving it. That means an active or queued goal, a `/goal` turn, a continuation, a prompt, a session load, or a hook or tool call still running for it. After the session has been idle for **`idleLeaseReleaseMs`** (new option, default `3000`; `0` restores the old keep-until-exit behaviour), the owner persists, drops its in-memory copy, and releases the lease. Paused, stopped, and finished goals do not hold it. Goals in different sessions already ran concurrently, one shard per session. Two processes can now also hand a single session back and forth. A session with a running goal stays exclusive to its owner, and forking (`opencode --continue --fork`) remains the way to run two goals at once from one conversation.
