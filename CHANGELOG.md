@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.4.1 — 2026-10-26
+
+- **Fixed: context fullness no longer stops a goal or tells it to wrap up.** On 1.4.0 a goal with 7.2M of 100M tokens spent and 18m of 8h elapsed paused with "budget wrap-up requested" because peak context reached 80% of the model's 128,000-token window. OpenCode compacts the session on its own when context fills, so context is not a budget. The `context window reached` stop, the context branch of the 80% wrap-up, the "context token(s) remaining" warning and the `context_remaining` line in the continuation prompt are gone. Token spend (`maxTokens`) and the clock (`maxDurationMs`) keep both their 80% wrap-up and their hard stop.
+  - **A wrap-up names its budget.** The stop reason is `token budget wrap-up requested` or `time budget wrap-up requested`, and the prompt opens "Token budget limit near" or "Time budget limit near".
+  - **Status and panel show current context.** `/goal status` and the sidebar show the latest message's context, which drops on compaction, instead of a lifetime high-water mark. The status label is `Context:` and says where the window size came from: `configured (--context-window)` or `auto (host catalog: <provider>/<model>)`.
+  - **The auto-detected window prefers `limit.input`** when the model reports one, as OpenCode's own overflow check does (checked against OpenCode v1.19.4 `session/overflow.ts`).
+  - **`contextWindowTokens` and `--context-window` are display only.** Still accepted; they no longer stop or nudge anything.
+- **Security: bundled `zod` updated from 4.4.3 to 4.6.7** (GHSA-mrhx-c7xc-m3w5, high).
+
 ## 1.4.0 — 2026-10-08
 
 - **Changed: a goal stops only when you stop it, when it finishes, when a budget runs out, or when the model is genuinely hard-blocked.** Every other automatic stop now records what happened and keeps going. `docs/reference.md` has a single "When a goal stops" section.
