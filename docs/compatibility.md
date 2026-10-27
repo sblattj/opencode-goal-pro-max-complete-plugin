@@ -256,8 +256,8 @@ running goal:
    `config.providers` routes.** Each consumer is fail-soft by the plugin's own
    design: the `<existing_todos>` offer is skipped,
    `noContinueWhileChildrenActive` fails open (continuation proceeds when the
-   host cannot report children), and the auto-detected context-window ceiling
-   stays off unless `contextWindowTokens` is configured explicitly.
+   host cannot report children), and the auto-detected context window (display only)
+   stays unknown unless `contextWindowTokens` is configured explicitly.
 
 Beyond these, the standing rule for any host applies: the experimental hooks
 (`experimental.chat.system.transform`, `experimental.session.compacting`,

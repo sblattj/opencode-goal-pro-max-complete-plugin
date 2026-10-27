@@ -27,6 +27,7 @@ const {
   buildGoalBlock,
   buildLimitWarning,
   budgetWrapupNeeded,
+  budgetWrapupKind,
   currentGoal,
   defaultAuditMessenger,
   defaultLifecycleMessenger,
@@ -1498,8 +1499,8 @@ test("continue message includes budget context and completion audit", () => {
   assert.match(messageText, /<progress_budget>/)
   // Spend against the token budget...
   assert.match(messageText, /tokens_remaining: 75/)
-  // ...and peak context against the separate, explicitly set 200,000-token window.
-  assert.match(messageText, /context_remaining: 199975/)
+  // Context fullness is informational only: the model is never told a headroom.
+  assert.doesNotMatch(messageText, /context_remaining/)
   assert.match(messageText, /Completion format/)
   assert.match(
     messageText,
@@ -5864,7 +5865,7 @@ test("a no-progress stall no longer pauses, so the budget wrap-up threshold stil
   assert.equal(calls.length, 2)
   assert.equal(goal.noProgressTurns, 1)
   assert.equal(goal.stopped, true)
-  assert.equal(goal.stopReason, "budget wrap-up requested")
+  assert.equal(goal.stopReason, "token budget wrap-up requested")
   assert.equal(goal.budgetWrapupSent, true)
   assert.match(promptText(calls[1]), /<budget_wrapup>/)
   assert.doesNotMatch(promptText(calls[1]), /<next_step>/)
@@ -5957,7 +5958,7 @@ test("formatStatus includes all key fields", () => {
   // Two different quantities, two lines: cumulative spend against the token
   // budget, and the peak context against the model's window.
   assert.match(status, /Token spend: 0\/200,000/)
-  assert.match(status, /Peak context: 50,000\/200,000/)
+  assert.match(status, /Context: 50,000\/200,000/)
   assert.match(status, /Elapsed:/)
   assert.match(status, /Last progress:/)
   assert.match(status, /Recent checkpoint:/)
@@ -7756,10 +7757,8 @@ test("stopReason returns correct string for each limit type", () => {
   )
   // ...and 1,000 tokens of peak context is not it: context has its own ceiling.
   assert.equal(stopReason({ ...base, turnCount: 4, peakContextTokens: 1000 }), null)
-  assert.match(
-    stopReason({ ...base, turnCount: 4, peakContextTokens: 200_000 }),
-    /^context window reached \(200,000\)$/,
-  )
+  // Context fullness never stops a goal, however far past the window it is.
+  assert.equal(stopReason({ ...base, turnCount: 4, peakContextTokens: 200_000 }), null)
   assert.equal(stopReason({ ...base, turnCount: 4 }), null)
 
   // With NO context ceiling — the shipped default until the host names the
@@ -7767,13 +7766,9 @@ test("stopReason returns correct string for each limit type", () => {
   const autoWindow = { ...base, options: normalizeOptions({ maxTurns: 5, maxDurationMs: 60000, maxTokens: 1000 }) }
   assert.equal(autoWindow.options.contextWindowTokens, 0)
   assert.equal(stopReason({ ...autoWindow, turnCount: 4, peakContextTokens: 5_000_000 }), null)
-  // ...and the window LEARNED from the host is a real ceiling on the same goal.
-  assert.match(
-    stopReason({ ...autoWindow, turnCount: 4, peakContextTokens: 400_000, modelContextTokens: 400_000 }),
-    /^context window reached \(400,000\)$/,
-  )
+  // ...and neither does the window LEARNED from the host.
   assert.equal(
-    stopReason({ ...autoWindow, turnCount: 4, peakContextTokens: 399_999, modelContextTokens: 400_000 }),
+    stopReason({ ...autoWindow, turnCount: 4, peakContextTokens: 400_000, modelContextTokens: 400_000 }),
     null,
   )
 })
@@ -12292,9 +12287,9 @@ test("an unlimited turn budget never stops the goal and never warns about turns"
   // is what keeps a 400k- or 1m-context model from being paused at 160k.
   assert.equal(base.options.contextWindowTokens, 0)
   assert.equal(stopReason({ ...base, turnCount: 10_000, peakContextTokens: 200_000 }), null)
-  assert.match(
+  assert.equal(
     stopReason({ ...base, turnCount: 10_000, peakContextTokens: 200_000, modelContextTokens: 200_000 }),
-    /^context window reached \(200,000\)$/,
+    null,
   )
   // Control: a bounded budget still trips.
   assert.match(
@@ -12453,29 +12448,19 @@ test("the budget wrap-up is reachable under the shipped defaults on all three of
   assert.equal(budgetWrapupNeeded(goal({ spend: 79_999_999 }), now), false)
   assert.equal(budgetWrapupNeeded(goal({ spend: 80_000_000 }), now), true)
 
-  // 3. Peak CONTEXT against the model's own 200,000-token window: 160k, on the
-  // same goal and at one minute elapsed, so neither of the other two can be the
-  // cause.
-  assert.equal(budgetWrapupNeeded(goal({ elapsedMs: 60_000, peak: 159_999 }), now), false)
-  assert.equal(budgetWrapupNeeded(goal({ elapsedMs: 60_000, peak: 160_000 }), now), true)
+  // 3. Peak CONTEXT is NOT a wrap-up dimension: compaction resets it. 160k and
+  // 190k of a 200,000-token window, at one minute elapsed, fire nothing.
+  assert.equal(budgetWrapupNeeded(goal({ elapsedMs: 60_000, peak: 160_000 }), now), false)
+  assert.equal(budgetWrapupNeeded(goal({ elapsedMs: 60_000, peak: 190_000 }), now), false)
 
-  // Control, and the reason the default is AUTO rather than a constant: with no
-  // window reported, the same 160k peak is not 80 % of anything and the goal is
-  // not paused for a handoff. A fixed 200,000 default ended healthy runs on
-  // 400k- and 1m-context models at 160k, below where the host itself compacts.
+  // With no window reported nothing changes either.
   assert.equal(
     budgetWrapupNeeded({ ...goal({ elapsedMs: 60_000, peak: 160_000 }), modelContextTokens: 0 }, now),
     false,
   )
-  // ...and on the model that really is 1m wide, 160k is 16 % and nothing fires,
-  // while 800k does.
-  assert.equal(
-    budgetWrapupNeeded({ ...goal({ elapsedMs: 60_000, peak: 160_000 }), modelContextTokens: 1_000_000 }, now),
-    false,
-  )
   assert.equal(
     budgetWrapupNeeded({ ...goal({ elapsedMs: 60_000, peak: 800_000 }), modelContextTokens: 1_000_000 }, now),
-    true,
+    false,
   )
 
   // The two token dimensions do not bleed into each other: a saturated 200k
@@ -12575,6 +12560,7 @@ test("the sidebar panel renders the session title's own duration string, and nei
   // independent quantities against independent ceilings.
   goal.usage = spentUsage(147_000)
   goal.peakContextTokens = 147_000
+  goal.latestContextTokens = 147_000
   goal.turnCount = 1
   // The ctx stat renders against the window the host reported for this goal's
   // model, which is where the ceiling comes from under the shipped defaults.
@@ -12657,15 +12643,11 @@ test("the limits-are-near warning is scaled to the 8-hour window", () => {
     buildLimitWarning(goal(15 * 60_000, { usage: spentUsage(99_980_000) })),
     /20,000 budget token\(s\) remaining/,
   )
-  assert.match(
-    buildLimitWarning(goal(15 * 60_000, { peakContextTokens: 185_000 })),
-    /15,000 context token\(s\) remaining/,
-  )
-  // With no window reported there is no headroom to run out of, so the context
-  // warning cannot fire at all — including on the same 185,000-token peak.
-  assert.doesNotMatch(
+  // Context headroom is never warned about: compaction resets it.
+  assert.equal(buildLimitWarning(goal(15 * 60_000, { peakContextTokens: 185_000 })), "")
+  assert.equal(
     buildLimitWarning(goal(15 * 60_000, { peakContextTokens: 185_000, modelContextTokens: 0 })),
-    /context token\(s\) remaining/,
+    "",
   )
 })
 
@@ -12754,7 +12736,7 @@ test("the token brake, the wrap-up handoff and the warning all fire on cumulativ
   assert.match(buildContinueMessage(goal(90_000)), /^tokens_remaining: 10000$/m)
 })
 
-test("the context guard fires on peak context at its own thresholds, and never on spend", () => {
+test("peak context fires no guard at any threshold, and spend never counts as context", () => {
   const options = normalizeOptions({ contextWindowTokens: 100_000, warnTokensRemaining: 10_000 })
   const now = Date.now()
   const goal = ({ peak = 0, spend = 0 } = {}) => ({
@@ -12766,13 +12748,12 @@ test("the context guard fires on peak context at its own thresholds, and never o
     options,
   })
 
-  assert.equal(budgetWrapupNeeded(goal({ peak: 79_999 }), now), false)
-  assert.equal(budgetWrapupNeeded(goal({ peak: 80_000 }), now), true)
-  assert.equal(buildLimitWarning(goal({ peak: 89_999 })), "")
-  assert.match(buildLimitWarning(goal({ peak: 90_000 })), /10,000 context token\(s\) remaining/)
-  assert.equal(stopReason(goal({ peak: 99_999 })), null)
-  assert.equal(stopReason(goal({ peak: 100_000 })), "context window reached (100,000)")
-  assert.match(buildContinueMessage(goal({ peak: 90_000 })), /^context_remaining: 10000$/m)
+  for (const peak of [79_999, 80_000, 90_000, 99_999, 100_000, 500_000]) {
+    assert.equal(budgetWrapupNeeded(goal({ peak }), now), false, `wrap-up at peak ${peak}`)
+    assert.equal(buildLimitWarning(goal({ peak })), "", `warning at peak ${peak}`)
+    assert.equal(stopReason(goal({ peak })), null, `stop at peak ${peak}`)
+    assert.doesNotMatch(buildContinueMessage(goal({ peak })), /context_remaining/)
+  }
 
   // Control, varying ONE factor: 79,000,000 tokens of spend — 790× this context
   // window — trips no context threshold, because it is a different quantity.
@@ -12828,7 +12809,7 @@ test("the session title and the sidebar render spend against the token budget, w
     lastStatus: "working",
   })
   assert.match(status, /Token spend: 2,400,000\/100,000,000/)
-  assert.match(status, /Peak context: 147,000\/200,000/)
+  assert.match(status, /Context: 147,000\/200,000/)
 
   // With no window reported the ctx stat is dropped entirely rather than
   // rendered against a ceiling of zero, and the status names the peak with an
@@ -12843,7 +12824,7 @@ test("the session title and the sidebar render spend against the token budget, w
   ])
   assert.match(
     formatStatus({ ...noWindow, lastProgressAt: now - 1000, noProgressTurns: 0, lastStatus: "working" }),
-    /Peak context: 147,000\/∞/,
+    /Context: 147,000\/∞/,
   )
 })
 
@@ -12880,15 +12861,12 @@ test("a pre-0.11.0 state record loads: totalTokens is the peak context, spend st
   assert.equal(stopReason({ ...legacy, peakContextTokens: 10_000_000 }), null)
   assert.equal(buildLimitWarning(legacy), "")
   assert.match(formatStatus(legacy), /Token spend: 0\/200,000/)
-  assert.match(formatStatus(legacy), /Peak context: 165,000\/∞/)
+  assert.match(formatStatus(legacy), /Context: 165,000\/∞/)
   // Once the host names the model's window, the same loaded record is measured
   // against it — that is the only thing that turns the ceiling back on.
-  assert.match(
-    stopReason({ ...legacy, modelContextTokens: 160_000 }),
-    /^context window reached \(160,000\)$/,
-  )
+  assert.equal(stopReason({ ...legacy, modelContextTokens: 160_000 }), null)
   assert.equal(stopReason({ ...legacy, modelContextTokens: 180_000 }), null)
-  assert.match(formatStatus({ ...legacy, modelContextTokens: 180_000 }), /Peak context: 165,000\/180,000/)
+  assert.match(formatStatus({ ...legacy, modelContextTokens: 180_000 }), /Context: 165,000\/180,000/)
   // An explicitly persisted window survives the round trip and still wins.
   assert.equal(
     normalizePersistedGoal({
@@ -13004,50 +12982,28 @@ test("--context-window accepts a plain, k, and m value and rejects garbage", () 
   ])
 })
 
-test("the continuation message reports remaining spend and remaining context separately", () => {
+test("the continuation message reports remaining spend and never a context headroom", () => {
   const goal = {
     condition: "ship it",
     startedAt: Date.now(),
     turnCount: 2,
     usage: spentUsage(30_000_000),
     peakContextTokens: 150_000,
-    // Under the shipped defaults the ceiling is the model's own window, learned
-    // from the host rather than assumed.
     modelContextTokens: 200_000,
     options: normalizeOptions(),
   }
   const text = buildContinueMessage(goal)
   assert.match(text, /^tokens_remaining: 70000000$/m)
-  assert.match(text, /^context_remaining: 50000$/m)
+  assert.doesNotMatch(text, /context_remaining/)
 
-  // Both floor at zero rather than reporting a negative headroom.
-  const over = buildContinueMessage({
-    ...goal,
-    usage: spentUsage(200_000_000),
-    peakContextTokens: 500_000,
-  })
+  // Spend floors at zero rather than reporting a negative headroom.
+  const over = buildContinueMessage({ ...goal, usage: spentUsage(200_000_000), peakContextTokens: 500_000 })
   assert.match(over, /^tokens_remaining: 0$/m)
-  assert.match(over, /^context_remaining: 0$/m)
+  assert.doesNotMatch(over, /context_remaining|NaN/)
 
-  // A goal record whose options were hand-built by an embedded host, with no
-  // contextWindowTokens key at all, still measures against the learned window
-  // rather than rendering NaN.
+  // Hand-built options with no contextWindowTokens key render the same way.
   const handBuiltOptions = { maxTurns: 0, maxTokens: 100_000_000, maxDurationMs: 60_000, warnTurnsRemaining: 3, warnTokensRemaining: 25_000, warnDurationMsRemaining: 600_000 }
-  const noCeiling = buildContinueMessage({ ...goal, options: handBuiltOptions })
-  assert.match(noCeiling, /^context_remaining: 50000$/m)
-
-  // And with no ceiling from either source the model is told the truth —
-  // "unlimited" — not a made-up headroom and not NaN.
-  const unlimited = buildContinueMessage({ ...goal, modelContextTokens: 0, options: handBuiltOptions })
-  assert.match(unlimited, /^context_remaining: unlimited$/m)
-  assert.doesNotMatch(unlimited, /NaN/)
-
-  // An explicit --context-window still overrides the model's own window, in
-  // both directions.
-  assert.match(
-    buildContinueMessage({ ...goal, options: normalizeOptions({ contextWindowTokens: 400_000 }) }),
-    /^context_remaining: 250000$/m,
-  )
+  assert.doesNotMatch(buildContinueMessage({ ...goal, options: handBuiltOptions }), /context_remaining|NaN/)
 })
 
 // ---------------------------------------------------------------------------
@@ -13413,8 +13369,8 @@ test("the context ceiling is learned from the model the goal is running on", asy
     options: goal.options,
   })
   assert.equal(budgetWrapupNeeded(at(160_000, 1_000_000), now), false)
-  assert.equal(budgetWrapupNeeded(at(160_000, 200_000), now), true)
-  assert.equal(budgetWrapupNeeded(at(800_000, 1_000_000), now), true)
+  assert.equal(budgetWrapupNeeded(at(160_000, 200_000), now), false)
+  assert.equal(budgetWrapupNeeded(at(800_000, 1_000_000), now), false)
 
   // The catalog is read once per plugin instance, not once per turn.
   await hooks.event({
@@ -16727,4 +16683,196 @@ test("a failed auto-continue prompt retries on its own, with no further host idl
   }
   assert.equal(attempts, 2, "the retry wake re-drove the continuation")
   assert.equal(currentGoal("session-1").stopped, false)
+})
+
+// ---------------------------------------------------------------------------
+// 1.4.1: context fullness is informational. Compaction resets it, so it is not
+// a budget: it never stops a goal and never nudges the model to wrap up. Token
+// spend and wall clock keep both their 80 % wrap-up and their hard stop.
+// ---------------------------------------------------------------------------
+
+test("a goal whose peak context exceeds its window keeps running", async () => {
+  const base = {
+    startedAt: Date.now(),
+    turnCount: 1,
+    usage: spentUsage(10),
+    options: normalizeOptions({ maxTurns: 0, maxTokens: 1_000_000, contextWindowTokens: 100_000 }),
+  }
+  assert.equal(stopReason({ ...base, peakContextTokens: 100_000 }), null)
+  assert.equal(stopReason({ ...base, peakContextTokens: 5_000_000 }), null)
+  assert.equal(
+    stopReason({ ...base, options: normalizeOptions({ maxTokens: 1_000_000 }), modelContextTokens: 100_000, peakContextTokens: 150_000 }),
+    null,
+  )
+
+  const { calls, hooks } = await createHooks({
+    options: { minDelayMs: 1, contextWindowTokens: 100_000, noProgressTokenThreshold: 1 },
+  })
+  const session = "session-ctx-over-window"
+  await hooks["command.execute.before"]({ command: "goal", sessionID: session, arguments: "ship it" }, { parts: [] })
+  await hooks.event({
+    event: {
+      type: "message.updated",
+      properties: {
+        info: { id: "msg-ctx-over", role: "assistant", sessionID: session, tokens: { input: 150_000, output: 100, reasoning: 0 } },
+      },
+    },
+  })
+  await hooks.event({ event: { type: "session.status", properties: { sessionID: session, status: { type: "idle" } } } })
+  const goal = currentGoal(session)
+  assert.equal(goal.peakContextTokens, 150_100)
+  assert.equal(goal.stopped, false)
+  assert.equal(calls.length, 1, "the idle auto-continues")
+  assert.doesNotMatch(promptText(calls[0]), /<budget_wrapup>/)
+})
+
+test("peak context at 90% of the window sends no wrap-up and no context warning", async () => {
+  // The user's real failure on 1.4.0: 7.2M of 100M spent, 18m of 8h elapsed,
+  // peak context 109,124 of a 128,000 window. It paused with "budget wrap-up
+  // requested".
+  const options = normalizeOptions({ maxTokens: 100_000_000, maxDurationMs: 8 * 3600_000, contextWindowTokens: 128_000 })
+  const now = Date.now()
+  const g = {
+    budgetWrapupSent: false,
+    startedAt: now - 18 * 60_000,
+    turnCount: 12,
+    peakContextTokens: 109_124,
+    usage: spentUsage(7_164_964),
+    options,
+  }
+  assert.equal(budgetWrapupNeeded(g, now), false)
+  assert.equal(stopReason(g), null)
+  assert.doesNotMatch(buildLimitWarning(g), /context/)
+  assert.doesNotMatch(buildContinueMessage(g), /context_remaining|<budget_wrapup>/)
+
+  const { calls, hooks } = await createHooks({
+    options: { minDelayMs: 1, maxTokens: 100_000_000, contextWindowTokens: 128_000, noProgressTokenThreshold: 1 },
+  })
+  const session = "session-ctx-90"
+  await hooks["command.execute.before"]({ command: "goal", sessionID: session, arguments: "ship it" }, { parts: [] })
+  await hooks.event({
+    event: {
+      type: "message.updated",
+      properties: {
+        info: { id: "msg-ctx-90", role: "assistant", sessionID: session, tokens: { input: 109_000, output: 124, reasoning: 0 } },
+      },
+    },
+  })
+  currentGoal(session).startedAt = Date.now() - 18 * 60_000
+  currentGoal(session).usage = spentUsage(7_164_964)
+  await hooks.event({ event: { type: "session.status", properties: { sessionID: session, status: { type: "idle" } } } })
+  const goal = currentGoal(session)
+  assert.equal(goal.peakContextTokens, 109_124)
+  assert.equal(calls.length, 1)
+  assert.doesNotMatch(promptText(calls[0]), /<budget_wrapup>|context token|context_remaining/)
+  assert.equal(goal.stopped, false)
+  assert.equal(goal.stopReason, "")
+})
+
+test("the displayed context follows the latest message and resets on compaction", async () => {
+  const { hooks } = await createHooks({ options: { minDelayMs: 1, contextWindowTokens: 128_000 } })
+  const session = "session-ctx-display"
+  await hooks["command.execute.before"]({ command: "goal", sessionID: session, arguments: "ship it" }, { parts: [] })
+  const send = (id, input) =>
+    hooks.event({
+      event: {
+        type: "message.updated",
+        properties: { info: { id, role: "assistant", sessionID: session, tokens: { input, output: 10, reasoning: 0 } } },
+      },
+    })
+  await send("m1", 109_000)
+  assert.match(formatStatus(currentGoal(session)), /Context: 109,010\/128,000 \(window: configured \(--context-window\)\)/)
+  // The host pruned without a compaction event: the next message is smaller.
+  await send("m2", 40_000)
+  assert.match(formatStatus(currentGoal(session)), /Context: 40,010\/128,000/)
+  assert.equal(buildSidebarMetadata(currentGoal(session)).context.used, 40_010)
+  assert.equal(currentGoal(session).peakContextTokens, 109_010, "the lifetime high-water mark is kept for history")
+  await send("m3", 100_000)
+  await hooks.event({ event: { type: "session.compacted", properties: { sessionID: session } } })
+  assert.equal(currentGoal(session).peakContextTokens, 0)
+  assert.match(formatStatus(currentGoal(session)), /Context: 0\/128,000/)
+  assert.equal(buildSidebarMetadata(currentGoal(session)).context.used, 0)
+})
+
+test("status names where the context window size came from", () => {
+  const base = { condition: "x", startedAt: Date.now(), turnCount: 0, usage: spentUsage(0), peakContextTokens: 5 }
+  assert.match(
+    formatStatus({ ...base, options: normalizeOptions({ contextWindowTokens: 300_000 }) }),
+    /window: configured \(--context-window\)/,
+  )
+  assert.match(
+    formatStatus({ ...base, options: normalizeOptions(), modelContextTokens: 128_000, modelKey: "github-copilot/claude-opus-5.5" }),
+    /Context: 5\/128,000 \(window: auto \(host catalog: github-copilot\/claude-opus-5.5; limit.input if set, else limit.context\)\)/,
+  )
+})
+
+test("a wrap-up names the budget that triggered it", () => {
+  const now = Date.now()
+  const g = (spend, elapsedMs) => ({
+    budgetWrapupSent: false,
+    startedAt: now - elapsedMs,
+    usage: spentUsage(spend),
+    peakContextTokens: 0,
+    options: normalizeOptions({ maxTokens: 100, maxDurationMs: 1000 }),
+  })
+  assert.equal(budgetWrapupKind(g(80, 0), now), "token budget")
+  assert.equal(budgetWrapupKind(g(0, 800), now), "time budget")
+  assert.equal(budgetWrapupKind(g(0, 0), now), null)
+  assert.match(buildContinueMessage(g(80, 0), { budgetWrapup: "token budget" }), /Token budget limit near/)
+  assert.match(buildContinueMessage(g(0, 800), { budgetWrapup: "time budget" }), /Time budget limit near/)
+})
+
+test("control: token spend still wraps up at 80% and stops at 100%", async () => {
+  const options = normalizeOptions({ maxTokens: 100_000, contextWindowTokens: 1_000_000 })
+  const now = Date.now()
+  const g = (spend) => ({
+    budgetWrapupSent: false,
+    startedAt: now,
+    turnCount: 0,
+    peakContextTokens: 0,
+    usage: spentUsage(spend),
+    options,
+  })
+  assert.equal(budgetWrapupNeeded(g(79_999), now), false)
+  assert.equal(budgetWrapupNeeded(g(80_000), now), true)
+  assert.equal(stopReason(g(99_999)), null)
+  assert.equal(stopReason(g(100_000)), "max tokens reached (100,000)")
+
+  const { calls, hooks } = await createHooks({
+    options: { minDelayMs: 1, maxTokens: 100, budgetWrapupRatio: 0.8, noProgressTokenThreshold: 1 },
+  })
+  const session = "session-ctx-control"
+  await hooks["command.execute.before"]({ command: "goal", sessionID: session, arguments: "ship it" }, { parts: [] })
+  await hooks.event({
+    event: {
+      type: "message.updated",
+      properties: {
+        info: { id: "msg-ctl", role: "assistant", sessionID: session, tokens: { input: 80, output: 1, reasoning: 0 } },
+      },
+    },
+  })
+  await hooks.event({ event: { type: "session.status", properties: { sessionID: session, status: { type: "idle" } } } })
+  assert.match(promptText(calls[0]), /<budget_wrapup>/)
+})
+
+test("the displayed window is limit.input when the model sets it, as OpenCode's overflow check uses it", async () => {
+  const session = "model-window-input"
+  const assistant = {
+    info: { id: "mwi-1", role: "assistant", sessionID: session, providerID: "github-copilot", modelID: "claude-x", tokens: { input: 10, output: 100, reasoning: 0 } },
+    parts: [textPart("still working")],
+  }
+  const { hooks } = await createHooks({
+    messages: async () => ({ data: [assistant] }),
+    options: { minDelayMs: 1 },
+    config: {
+      providers: async () => ({
+        data: { providers: [{ id: "github-copilot", models: { "claude-x": { limit: { context: 200_000, input: 128_000, output: 32_000 } } } }] },
+      }),
+    },
+  })
+  await hooks["command.execute.before"]({ command: "goal", sessionID: session, arguments: "ship it" }, { parts: [] })
+  await hooks.event({ event: { type: "session.status", properties: { sessionID: session, status: { type: "idle" } } } })
+  const goal = currentGoal(session)
+  assert.equal(goal.modelContextTokens, 128_000)
+  assert.equal(goal.stopped, false)
 })

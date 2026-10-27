@@ -97,7 +97,7 @@ Every flag below is a key of `GOAL_FLAG_SPECS` in `src/goal-plugin.js` (17 keys,
 | `--max-duration-ms <n>` | Duration limit, in milliseconds |
 | `--max-tokens <n>` | Cumulative token **spend** limit |
 | `--budget <n>` | Spend limit shorthand; accepts a `k`/`m` suffix (`100k`, `1.5m`) |
-| `--context-window <n>` | Ceiling for **peak context** — a different quantity from spend. Overrides the auto-detected window. Accepts `k`/`m` |
+| `--context-window <n>` | The context window size shown in the status (informational: it never stops a goal or nudges the model). Overrides the auto-detected window. Accepts `k`/`m` |
 | `--cooldown-ms <n>` | Minimum delay between continues |
 | `--no-progress-threshold <n>` | Output-token floor below which a turn counts as stalled |
 | `--no-progress-turns <n>` | Consecutive stalled low-output turns before pausing |
@@ -118,7 +118,7 @@ Every flag below is a key of `GOAL_FLAG_SPECS` in `src/goal-plugin.js` (17 keys,
 
 | Command | Effect |
 |---|---|
-| `/goal` *(bare)* or `/goal status` | Report the focused goal: `Active goal:`, an explicit `State:` line (`active`, `paused`, `blocked`), budget usage, `Token spend:`, `Peak context:`, a `Completion audit:` line, and the plan |
+| `/goal` *(bare)* or `/goal status` | Report the focused goal: `Active goal:`, an explicit `State:` line (`active`, `paused`, `blocked`), budget usage, `Token spend:`, `Context:` (with where the window size came from), a `Completion audit:` line, and the plan |
 | `/goal <objective>` | Set (replace) the focused goal |
 | `/goal add <objective>` | Background the current goal and focus a new one |
 | `/goal list` | Numbered live goals plus the per-session archive of achieved goals, each with its state |
@@ -212,7 +212,7 @@ A goal runs until **you** stop it, it finishes, it runs out of budget, or the mo
 |---|---|---|
 | You run `/goal halt` or `/goal pause` | `paused` | `/goal resume` |
 | You run `/goal clear` (or `stop`, `off`, `reset`, `none`, `cancel`) | the goal is discarded | set a new one |
-| A budget limit: the 80% wrap-up, or a 100% turn, clock, spend, or context ceiling | `budget wrap-up requested`, `max turns reached (n)`, `max duration reached (…)`, `max tokens reached (…)`, `context window reached (…)` | `/goal resume` (fresh budget window) |
+| A budget limit: the 80% wrap-up, or a 100% turn, clock, or spend ceiling | `token budget wrap-up requested`, `time budget wrap-up requested`, `max turns reached (n)`, `max duration reached (…)`, `max tokens reached (…)` | `/goal resume` (fresh budget window) |
 | Completion: an evidenced `[goal:complete]` or an accepted `goal_complete` | archived as achieved | — |
 | A **concrete** model block: `[goal:blocked]` after a stated blocker, or `goal_block` with one | `blocked` | address the blocker, then `/goal resume` |
 | A persistence-integrity fence: a terminal state or a continuation claim could not be written durably | `terminal persistence failed`, `continuation claim persistence failed` | fix the storage problem, then `/goal resume` |
@@ -241,18 +241,18 @@ These are the 0.11.0 defaults, every one of them a field of `DEFAULT_OPTIONS` in
 | Auto-continue turns | unlimited (`maxTurns: 0`) | `3/∞` |
 | Max duration | 8 hours (`28800000` ms) | `2m/8h` |
 | Token spend | 100,000,000 cumulative tokens | `147k/100m` |
-| Context window | the model's own window, learned from the host; **no ceiling** if the host cannot say | `147k/200k ctx`, or the stat is dropped |
+| Context window | the model's own window, learned from the host (display only); unknown if the host cannot say | `147k/200k ctx`, or the stat is dropped |
 | Min delay between continues | 1,500 ms | — |
 | No-progress detection | 2 consecutive stalled turns under 50 output tokens; recorded, the goal keeps running | — |
 | Talk-only detection | 10 consecutive tool-free continuation turns; recorded, the goal keeps running | — |
-| Wrap-up threshold | 80% of spend, context, or clock — whichever arrives first (6.4 h of 8 h) | — |
+| Wrap-up threshold | 80% of spend or clock — whichever arrives first (6.4 h of 8 h). Context fullness never triggers it | — |
 | Auto-continue failure detection | 3 consecutive prompt failures; recorded, the goal keeps running with backoff | — |
 
 **Unlimited is `0`, not `Infinity`.** These options round-trip through persisted JSON, and `JSON.stringify(Infinity)` is the literal `null` — an unlimited goal written as `Infinity` would reload indistinguishable from a missing field and be handed a bounded default.
 
-**What actually brakes a default run.** With unlimited turns and an 8-hour clock, neither the turn counter nor (usually) the spend budget is the brake, and the stall detectors do not stop the goal either. The **talk-only** detector (ten consecutive tool-free continuation turns) and the **no-progress** detector (two consecutive stalled turns under 50 output tokens) record what stalled and keep the loop going. Both judge the **whole turn** and both are **skipped for any turn that calls a tool anywhere in it**. The binding brakes are the 8-hour window, the 100,000,000-token spend budget, and the model's own context window, plus `/goal halt` whenever you want to stop.
+**What actually brakes a default run.** With unlimited turns and an 8-hour clock, neither the turn counter nor (usually) the spend budget is the brake, and the stall detectors do not stop the goal either. The **talk-only** detector (ten consecutive tool-free continuation turns) and the **no-progress** detector (two consecutive stalled turns under 50 output tokens) record what stalled and keep the loop going. Both judge the **whole turn** and both are **skipped for any turn that calls a tool anywhere in it**. The binding brakes are the 8-hour window, and the 100,000,000-token spend budget, plus `/goal halt` whenever you want to stop.
 
-**Wrap-up pauses the goal, so 80% is the real ceiling.** At `budgetWrapupRatio` of whichever of the three reachable budgets arrives first, the plugin sends one handoff prompt asking for a summary of what is done, what remains, and the next concrete step — and pauses. `/goal resume` restarts the spend and peak-context counters from zero. The 100% stop reasons (`max tokens reached`, `context window reached`, `max duration reached`) fire only when one turn crosses from below 80% straight past 100%.
+**Wrap-up pauses the goal, so 80% is the real ceiling.** At `budgetWrapupRatio` of whichever of the two reachable budgets (token spend or the clock) arrives first, the plugin sends one handoff prompt asking for a summary of what is done, what remains, and the next concrete step — and pauses. `/goal resume` restarts the spend and context counters from zero. The wrap-up names the budget that triggered it (`token budget` or `time budget`). The 100% stop reasons (`max tokens reached`, `max duration reached`) fire only when one turn crosses from below 80% straight past 100%.
 
 **The token budget is cumulative SPEND.** Every token the goal was billed for, summed over every message it produced:
 
@@ -262,9 +262,9 @@ spend = usage.input + usage.output + usage.reasoning + usage.cacheRead + usage.c
 
 Cache reads are in the sum because they are billed. The counter only grows, is deduplicated per message (a streaming update adds only its delta; a message billed before a restart is not billed again), and survives a restart because it lives in the persisted `usage` record. **Delegated work counts**: a child session has no goal of its own, so its tokens are charged up the `parentID` chain to the nearest ancestor session that holds one — nothing else about a child is inherited, including its context.
 
-**Context pressure is a separate guard on a separate number.** Peak context is the largest single-message `input + output + reasoning + cache` the goal has seen — the count OpenCode displays. It is bounded by the model and reset by a compaction, so it can never stand in for spend. `contextWindowTokens` defaults to `0` = **auto-detect**: the plugin reads `client.config.providers()` once and takes `models[<the goal's model>].limit.context`. An explicit value or `--context-window` always wins and skips the lookup. Every failure path — no `config` API, a throwing catalog, an unknown model, a model with no declared window — yields **no context ceiling at all**: `/goal status` shows `Peak context: 147,000/∞`, the continuation prompt says `context_remaining: unlimited`, and the sidebar drops the `ctx` stat rather than rendering a budget of zero. That is deliberate, because the wrap-up *pauses* — a guessed 200,000 would have ended healthy runs at a 160,000-token peak on 400k- and 1M-context models, below where the host itself compacts.
+**Context fullness is informational, never a stop.** The context shown is the latest message's `input + output + reasoning + cache` — the count OpenCode displays — and it drops when the host compacts or prunes. Compaction handles a full window, so it never stops a goal, never sends a wrap-up and never warns the model. `contextWindowTokens` (and `--context-window`) only sets the window size the status and panel show; it defaults to `0` = **auto-detect**: the plugin reads `client.config.providers()` once and takes `models[<the goal's model>].limit.context`. `/goal status` says where the number came from (`auto (host catalog: <provider>/<model>)` or `configured (--context-window)`). Every failure path yields an unknown window: `/goal status` shows `Context: 147,000/∞` and the sidebar drops the `ctx` stat.
 
-The continuation prompt reports both, as `tokens_remaining` and `context_remaining`.
+The continuation prompt reports `tokens_remaining` only; context headroom is never put in front of the model.
 
 **Judgement is per turn, not per message.** OpenCode writes a new assistant message for every LLM step of one prompt, so an ordinary working turn is several messages sharing one `parentID`: the steps that ran tools, then a separate text-only closing summary. The plugin groups every assistant message answering the same prompt (falling back to the trailing run of assistant messages on hosts that do not report a parent, and stopping at a compaction summary) and asks the question of the group: a tool call — or a subtask delegation — **anywhere** in the turn resets the counter. A turn the visibility window sliced in half charges nothing in either direction and is recorded as a `warning` in the goal's history.
 
@@ -307,7 +307,7 @@ Pass options when registering the plugin to change the defaults for all goals.
 | `maxRecentMessages` | `200` | The **visibility window**: how many recent messages are fetched to reconstruct the latest turn. A narrow window can slice off a long turn's tool-bearing head and leave only its text-only summary visible — the same false reading by another route. The host answers any limit with the same two queries, so a wider window costs rows, not round trips; omitting the limit is worse still, since the host then pages the whole session |
 | `noProgressTurnsBeforePause` | `2` | Grace window for low-output stalls; tokens are summed across the whole turn. Reaching it records the stall; it no longer pauses the goal (the name is historical) |
 | `noToolCallTurnsBeforePause` | `10` | Grace window for tool-free turns. Reaching it records the stall; it no longer pauses the goal. Set the **plugin option** to `0` to disable the detector for legitimate writing/research workflows; `--no-tool-turns 0` is rejected as invalid |
-| `warnTurnsRemaining` / `warnDurationMsRemaining` / `warnTokensRemaining` | `3` / `600000` / `25000` | Thresholds for the "limits are near" warning. `warnTokensRemaining` is applied to both token ceilings. Under the shipped defaults the **turn** warning is silent, because an unlimited budget has nothing to run out of; the context warning is silent while no context ceiling is known |
+| `warnTurnsRemaining` / `warnDurationMsRemaining` / `warnTokensRemaining` | `3` / `600000` / `25000` | Thresholds for the "limits are near" warning. `warnTokensRemaining` is applied to the token spend budget only; there is no context warning. Under the shipped defaults the **turn** warning is silent, because an unlimited budget has nothing to run out of |
 | `promptRetryWakeMs` | `5000` | A failed auto-continue prompt starts no turn, so no host idle follows it. After this many milliseconds (or the backed-off cooldown, if longer) the plugin retries on its own; failures never pause the goal |
 | `noInterruptOnUserMessage` | `true` | **Deprecated; accepted but ignored.** A human message always steers the next continuation and never pauses the goal. `false` no longer pauses with `user intervention`. Stop a goal with `/goal halt` (resumable) or `/goal clear` |
 | `noContinueWhileChildrenActive` | `false` | When `true`, auto-continue is deferred while the session has active children (subagents, background tasks). Adds a `children` and a `status` call per idle. **Fails open** for hosts that cannot report children/status, for sessions with more concurrent children than can be tracked, and for children running goals of their own. Every deferral is reported in `/goal status` and the history, so a waiting goal is not mistaken for a hung one |
@@ -433,7 +433,7 @@ That is the payload above rendered with the Todo mirror off: every action in the
 
 **While the [Todo mirror](#todo-mirror) is on, the panel shows the exceptions instead**, because the Todo section is already listing the plan: `done` actions without a passing verdict first, then `blocked`, then `in_progress`, each group in plan order, and `pending` actions are not repeated. A `done` action without a verdict carries the same ` — needs claim/evidence/verdict` suffix its mirrored row does, and the progress line gains ` · todo mirror fresh (5)`, ` · todo list stale`, or ` · mirror drift (7≠5)` when the panel's own live read of the host's list disagrees with `plan.mirror.rows`. Under the exception list `+N more` counts only the exception rows the 12-row cap dropped, and it counts them over the **published** actions — at most `SIDEBAR_METADATA_MAX_ACTIONS` — never over the whole plan, so a server-capped plan cannot promise rows the payload does not carry. A v2 payload, or `plan.mirror.state === "off"`, renders exactly as it did in 1.0.0.
 
-The `ctx` stat is **dropped entirely** when no context ceiling is known, so a panel with three stats rather than four is a goal running without one, not a broken render. State drives the colour: blocked is an error, completed a success, paused a warning. An action is green only when it is `done` **and** the payload's `verified` flag says the server's CEV gate passed (a v2 payload has no such flag and falls back to `verdict === "pass"`) — a `done` action the plan's ledger does not substantiate is exactly the unsubstantiated completion that gate exists to catch. The panel hides itself when the session has no goal.
+The `ctx` stat is **dropped entirely** when no context window is known, so a panel with three stats rather than four is a goal running without one, not a broken render. State drives the colour: blocked is an error, completed a success, paused a warning. An action is green only when it is `done` **and** the payload's `verified` flag says the server's CEV gate passed (a v2 payload has no such flag and falls back to `verdict === "pass"`) — a `done` action the plan's ledger does not substantiate is exactly the unsubstantiated completion that gate exists to catch. The panel hides itself when the session has no goal.
 
 A plugin module may export `server()` or `tui()`, never both — but one *package* may ship both, because OpenCode resolves each kind's entrypoint from `package.json` `exports`:
 

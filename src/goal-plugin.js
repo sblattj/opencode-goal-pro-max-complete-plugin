@@ -145,21 +145,18 @@ const DEFAULT_OPTIONS = {
   // the token brake, the token warning and the token half of the wrap-up
   // handoff all fire against it.
   //
-  // `contextWindowTokens` is the SEPARATE guard on context pressure, because
-  // spend and context are different quantities: `goal.peakContextTokens` is the
-  // largest single-message context the goal has seen (the `Math.max` in the
-  // token tracker), which the model bounds and which a compaction resets to
-  // zero, while spend only ever grows.
+  // `contextWindowTokens` is INFORMATIONAL: the window size the status and panel
+  // show `goal.peakContextTokens` against. It never stops a goal, never sends a
+  // wrap-up and never warns the model, because compaction resets context, so a
+  // full window is not a budget. Spend and context are different quantities:
+  // `goal.peakContextTokens` is the largest single-message context the goal has
+  // seen, which a compaction resets to zero, while spend only ever grows.
   //
-  // 0 means AUTO, and is the default. A FIXED default ceiling is a trap: at
-  // `budgetWrapupRatio` the goal is PAUSED for a handoff, so a 200,000 default
-  // ends a healthy run at 160,000 peak on a 400k- or 1m-context model — below
-  // the point where OpenCode itself would have compacted, which resets the
-  // peak. So the ceiling is the model's OWN window, read from the host
-  // (`client.config.providers()` -> `models[id].limit.context`) on the first
-  // idle of the run. Until the host reports one there is NO context ceiling,
-  // which is exactly the 0.10.x behaviour. `--context-window 400k` overrides
-  // both.
+  // 0 means AUTO, and is the default: the window is the model's OWN, read from
+  // the host (`client.config.providers()` -> `models[id].limit.context`) on the
+  // first idle of the run. Until the host reports one the status shows no
+  // window. `--context-window 400k` overrides both. The option is still
+  // accepted for backward compatibility.
   maxTurns: 0,
   maxDurationMs: 8 * 60 * 60 * 1000,
   maxTokens: 100000000,
@@ -343,8 +340,8 @@ const GOAL_FLAG_SPECS = {
     optionKey: "maxTokens",
     parse: (value, options) => toPositiveInteger(value, options.maxTokens),
   },
-  // The context-pressure ceiling, a different quantity from the spend budget.
-  // Accepts a k/m suffix like `--budget` does: `--context-window 400k`.
+  // The context window size shown in the status (informational: it never stops
+  // or nudges a goal). Accepts a k/m suffix like `--budget` does: `--context-window 400k`.
   "--context-window": { type: "tokens", optionKey: "contextWindowTokens" },
   "--cooldown-ms": {
     optionKey: "minDelayMs",
@@ -782,7 +779,8 @@ function buildSidebarTerminal(goal, state, finishedAt) {
     mirror: goal.mirror,
     turnCount: goal.turnCount,
     peakContextTokens: goal.peakContextTokens,
-    // ...and the ceiling that peak is measured against. Under the shipped
+    latestContextTokens: goal.latestContextTokens,
+    // ...and the window that peak is shown against (informational). Under the shipped
     // defaults the context window is AUTO, so the limit lives on the goal
     // rather than in its options; without carrying it the final render of a
     // finished goal would silently drop the ctx stat every earlier render had.
@@ -877,7 +875,7 @@ function buildSidebarMetadata(goal, now = Date.now(), context = {}) {
     ...(contextWindowLimit(goal) > 0
       ? {
           context: {
-            used: toNonNegativeInteger(goal.peakContextTokens),
+            used: currentContextTokens(goal),
             max: contextWindowLimit(goal),
           },
         }
@@ -1276,7 +1274,7 @@ function formatStatus(
   lines.push(
     `Auto-continues sent: ${formatTurnBudget(goal.turnCount, goal.options.maxTurns)}`,
     `Token spend: ${goalSpendTokens(goal).toLocaleString()}/${goal.options.maxTokens.toLocaleString()}`,
-    `Peak context: ${formatContextBudget(goal)}`,
+    `Context: ${formatContextBudget(goal)} (window: ${contextWindowSource(goal)})`,
     formatUsage(goal.usage),
     `Elapsed: ${elapsed}s (${formatBudgetDuration(elapsedMs)}/${formatBudgetDuration(goal.options.maxDurationMs)})`,
     `Last progress: ${lastProgress}`,
@@ -1316,7 +1314,7 @@ function formatGoalResult(result) {
     `State: ${result.state}`,
     `Auto-continues sent: ${result.turnCount}`,
     `Token spend: ${goalSpendTokens(result).toLocaleString()}`,
-    `Peak context: ${toNonNegativeInteger(result.peakContextTokens).toLocaleString()}`,
+    `Context: ${currentContextTokens(result).toLocaleString()}`,
     formatUsage(result.usage),
     `Elapsed: ${elapsed}s`,
     `Last checkpoint: ${lastCheckpoint}`,
@@ -1360,13 +1358,8 @@ function stopReason(goal) {
   if (goalSpendTokens(goal) >= goal.options.maxTokens) {
     return `max tokens reached (${goal.options.maxTokens.toLocaleString()})`
   }
-  // Context pressure is its own brake, on its own measure: spend only grows,
-  // while the peak context is bounded by the model and reset by a compaction.
-  // A ceiling of 0 is "unknown / auto" and can never be reached.
-  const contextWindow = contextWindowLimit(goal)
-  if (contextWindow > 0 && toNonNegativeInteger(goal.peakContextTokens) >= contextWindow) {
-    return `context window reached (${contextWindow.toLocaleString()})`
-  }
+  // Context fullness is deliberately NOT a stop: compaction resets it, so it is
+  // not a budget. Only turns, wall clock and token spend end a goal.
   return null
 }
 
@@ -1695,6 +1688,7 @@ function resetGoalBudget(goal) {
   goal.pausedAt = 0
   goal.turnCount = 0
   goal.peakContextTokens = 0
+  goal.latestContextTokens = 0
   goal.usage = emptyUsage()
   goal.lastContinueAt = 0
   goal.lastProgressAt = 0
@@ -2076,6 +2070,9 @@ function normalizePersistedGoal(rawGoal) {
     // guard must not fire on a number that was never measured against one: with
     // no window there is no ceiling, and the real one is relearned from the
     // host on the first idle after the upgrade.
+    latestContextTokens: toNonNegativeInteger(
+      rawGoal.latestContextTokens ?? rawGoal.peakContextTokens ?? rawGoal.totalTokens,
+    ),
     modelContextTokens: toNonNegativeInteger(rawGoal.modelContextTokens),
     modelKey:
       typeof rawGoal.modelKey === "string" && rawGoal.modelKey.length <= MAX_GOAL_META_LENGTH
@@ -2166,6 +2163,9 @@ function normalizePersistedResult(rawResult) {
     turnCount: toNonNegativeInteger(rawResult.turnCount),
     peakContextTokens: toNonNegativeInteger(
       rawResult.peakContextTokens ?? rawResult.totalTokens,
+    ),
+    latestContextTokens: toNonNegativeInteger(
+      rawResult.latestContextTokens ?? rawResult.peakContextTokens ?? rawResult.totalTokens,
     ),
     usage: normalizeUsage(rawResult.usage),
     startedAt: normalizeTimestamp(rawResult.startedAt),
@@ -3045,13 +3045,17 @@ function continuationDelayMs(goal) {
   return base * 2 ** Math.min(strikes, MAX_CONTINUATION_BACKOFF_EXPONENT)
 }
 
+// `budgetWrapup` is true (generic) or the name of the limit that triggered it.
+function budgetWrapupName(budgetWrapup) {
+  const name = typeof budgetWrapup === "string" && budgetWrapup ? budgetWrapup : "budget"
+  return name.charAt(0).toUpperCase() + name.slice(1)
+}
+
 function buildLimitWarning(goal) {
   const unlimitedTurns = isUnlimitedTurnBudget(goal.options.maxTurns)
   const remainingTurns = goal.options.maxTurns - goal.turnCount
   const remainingMs = goal.options.maxDurationMs - (Date.now() - goal.startedAt)
   const remainingTokens = goal.options.maxTokens - goalSpendTokens(goal)
-  const contextWindow = contextWindowLimit(goal)
-  const remainingContext = contextWindow - toNonNegativeInteger(goal.peakContextTokens)
   const warnings = []
 
   // An unlimited turn budget has nothing to run out of, so it never warns.
@@ -3064,11 +3068,8 @@ function buildLimitWarning(goal) {
   if (remainingTokens <= goal.options.warnTokensRemaining) {
     warnings.push(`${Math.max(0, remainingTokens).toLocaleString()} budget token(s) remaining`)
   }
-  // Same headroom, measured against the context window rather than the budget.
-  // No known window means no headroom to run out of, so it never warns.
-  if (contextWindow > 0 && remainingContext <= goal.options.warnTokensRemaining) {
-    warnings.push(`${Math.max(0, remainingContext).toLocaleString()} context token(s) remaining`)
-  }
+  // Context headroom is not warned about: compaction resets it, so a nearly
+  // full window is not a limit.
 
   return warnings.length ? ` Limits are near: ${warnings.join(", ")}.` : ""
 }
@@ -3172,11 +3173,6 @@ function buildContinueMessage(
   } = {},
 ) {
   const remainingTokens = Math.max(0, goal.options.maxTokens - goalSpendTokens(goal))
-  const contextWindow = contextWindowLimit(goal)
-  const remainingContext =
-    contextWindow > 0
-      ? Math.max(0, contextWindow - toNonNegativeInteger(goal.peakContextTokens))
-      : UNLIMITED_WORD
   const remainingTurns = isUnlimitedTurnBudget(goal.options.maxTurns)
     ? UNLIMITED_WORD
     : Math.max(0, goal.options.maxTurns - goal.turnCount)
@@ -3186,7 +3182,6 @@ function buildContinueMessage(
     "<progress_budget>",
     `turns_remaining: ${remainingTurns}`,
     `tokens_remaining: ${remainingTokens}`,
-    `context_remaining: ${remainingContext}`,
     `elapsed_seconds: ${elapsedSeconds}`,
     "</progress_budget>",
   ]
@@ -3194,7 +3189,7 @@ function buildContinueMessage(
   if (budgetWrapup) {
     lines.push(
       "<budget_wrapup>",
-      "Budget limit near. Finish only a small safe step, then summarize done, remaining, and the next action; stop. Do not claim completion unless verified.",
+      `${budgetWrapupName(budgetWrapup)} limit near. Finish only a small safe step, then summarize done, remaining, and the next action; stop. Do not claim completion unless verified.`,
       "</budget_wrapup>",
     )
   } else {
@@ -3335,7 +3330,7 @@ function buildCompactionContext(goal, { mirrorMode = "off" } = {}) {
     "The summary below is reconstructed deterministically from the plugin's persisted goal record, not from chat memory.",
     buildGoalBlock(goal),
     `Goal status: ${goal.stopped ? goal.stopReason || "stopped" : "active"}.`,
-    `Auto-continues used: ${formatTurnBudget(goal.turnCount, goal.options.maxTurns)}. Token spend: ${goalSpendTokens(goal)}/${goal.options.maxTokens}. Peak context: ${formatContextBudget(goal)}. Elapsed: ${elapsedSeconds}s.`,
+    `Auto-continues used: ${formatTurnBudget(goal.turnCount, goal.options.maxTurns)}. Token spend: ${goalSpendTokens(goal)}/${goal.options.maxTokens}. Context: ${formatContextBudget(goal)}. Elapsed: ${elapsedSeconds}s.`,
     goal.lastCheckpoint ? `Latest checkpoint: ${escapeGoalText(summarizeText(goal.lastCheckpoint.summary, 200))}` : null,
     ...buildCompactionProgressSummary(goal),
     // Plan STATE only. The full plan contract and the CEV rule ride in the
@@ -3555,7 +3550,8 @@ function addUsageDelta(total, current, previous) {
 //
 // This is NOT `goal.peakContextTokens`, which is the largest single-message
 // context the goal has seen. That number is bounded by the model's window and
-// is reset by a compaction; it is guarded by `contextWindowTokens` instead.
+// is reset by a compaction; it is shown against `contextWindowTokens` in the
+// status and never stops or nudges the goal.
 function goalSpendTokens(goal) {
   const usage = normalizeUsage(goal?.usage)
   let spend = 0
@@ -3563,13 +3559,13 @@ function goalSpendTokens(goal) {
   return spend
 }
 
-// The context-pressure ceiling for a goal, in precedence order:
+// The context window SIZE shown in the status and panel (informational only:
+// it never stops a goal and never nudges the model), in precedence order:
 //   1. an explicit `contextWindowTokens` (the `--context-window` flag, the
 //      plugin option, or `goal_set`), which always wins;
 //   2. `goal.modelContextTokens` — the window the HOST reports for the model
 //      this goal is actually running on, learned on the first idle;
-//   3. 0, meaning NO context ceiling: nothing to compare against, so no
-//      context stop, no context wrap-up, no context warning and no `ctx` stat.
+//   3. 0, meaning the window is unknown: the status shows no `ctx` stat.
 // Every consumer must treat 0 as "unbounded"; a hand-built goal record from an
 // embedded host or a fixture reaches that branch too, and must render a ceiling
 // word rather than `NaN`.
@@ -3579,10 +3575,28 @@ function contextWindowLimit(goal) {
   return toNonNegativeInteger(goal?.modelContextTokens)
 }
 
+// The context the goal is running with NOW (the latest message's), which a
+// compaction or prune lowers. A record without the field (a hand-built goal, or
+// one saved before it existed) falls back to the peak.
+function currentContextTokens(goal) {
+  return toNonNegativeInteger(goal?.latestContextTokens ?? goal?.peakContextTokens)
+}
+
+// Where the window size came from, for `/goal status`.
+function contextWindowSource(goal) {
+  if (toNonNegativeInteger(goal?.options?.contextWindowTokens) > 0) {
+    return "configured (--context-window)"
+  }
+  if (toNonNegativeInteger(goal?.modelContextTokens) > 0) {
+    return `auto (host catalog: ${goal.modelKey || "unknown model"}; limit.input if set, else limit.context)`
+  }
+  return "unknown (the host reported no window)"
+}
+
 // `147,000/200,000`, or `147,000/∞` when no ceiling is known.
 function formatContextBudget(goal) {
   const limit = contextWindowLimit(goal)
-  const used = toNonNegativeInteger(goal?.peakContextTokens).toLocaleString()
+  const used = currentContextTokens(goal).toLocaleString()
   return `${used}/${limit > 0 ? limit.toLocaleString() : UNLIMITED_MARK}`
 }
 
@@ -3593,6 +3607,12 @@ function formatContextBudget(goal) {
 // `input`, so the cache fields must be counted or the context is undercounted
 // by an order of magnitude. Flattened and total-only shapes are handled by
 // `messageTokenCounts`, the same reader the spend accumulator uses.
+// The context size of one message. Like OpenCode v1.19.4's own overflow check
+// (packages/opencode/src/session/overflow.ts:31-32, `tokens.total || ...`) the
+// host-reported `total` wins when present. The component fallback ALSO adds
+// `reasoning`, which OpenCode's fallback omits (its `output` already excludes
+// reasoning, session.ts:338 getUsage); `total` is always set by the AI SDK, so
+// the two agree in practice.
 function totalTokensForMessage(message) {
   const counts = messageTokenCounts(message)
   if (counts.total > 0) return counts.total
@@ -4158,17 +4178,25 @@ function outputTokensForMessage(message) {
 
 // The early handoff: at `budgetWrapupRatio` of a budget the goal is asked to
 // land the plane while it still can. It rides every budget that can actually
-// be reached, and all three of them can:
+// be reached, and both of them can:
 //   - cumulative token SPEND against `maxTokens` (80m of the default 100m),
-//   - peak CONTEXT against `contextWindowTokens` (160k of the default 200k),
 //   - the wall clock against `maxDurationMs` (6.4 h of the default 8 h).
 // Whichever arrives first sends the one `<budget_wrapup>` prompt.
+//
+// Peak CONTEXT is deliberately NOT a dimension: compaction resets it, so a full
+// window is not a budget and never asks the model to wrap up.
 //
 // The turn budget is deliberately NOT a dimension: it is unlimited by default,
 // and when it is bounded the hard-limit path already sends a final handoff
 // prompt at the ceiling.
 function budgetWrapupNeeded(goal, now = Date.now()) {
-  if (goal.budgetWrapupSent) return false
+  return budgetWrapupKind(goal, now) !== null
+}
+
+// Which budget triggered the wrap-up: "token budget" or "time budget", so the
+// user-facing text names the limit that was actually reached.
+function budgetWrapupKind(goal, now = Date.now()) {
+  if (goal.budgetWrapupSent) return null
   const ratio = goal.options.budgetWrapupRatio
   const maxTokens = Number(goal.options.maxTokens)
   if (
@@ -4176,24 +4204,28 @@ function budgetWrapupNeeded(goal, now = Date.now()) {
     maxTokens > 0 &&
     goalSpendTokens(goal) >= Math.floor(maxTokens * ratio)
   ) {
-    return true
-  }
-  const contextWindowTokens = contextWindowLimit(goal)
-  if (
-    Number.isFinite(contextWindowTokens) &&
-    contextWindowTokens > 0 &&
-    toNonNegativeInteger(goal.peakContextTokens) >= Math.floor(contextWindowTokens * ratio)
-  ) {
-    return true
+    return "token budget"
   }
   const maxDurationMs = Number(goal.options.maxDurationMs)
   const startedAt = Number(goal.startedAt)
-  return (
+  if (
     Number.isFinite(maxDurationMs) &&
     maxDurationMs > 0 &&
     Number.isFinite(startedAt) &&
     Math.max(0, now - startedAt) >= Math.floor(maxDurationMs * ratio)
-  )
+  ) {
+    return "time budget"
+  }
+  return null
+}
+
+// The budget name for a hard-limit stop reason (`max tokens reached (...)`).
+function limitReasonBudgetName(reason) {
+  const text = String(reason || "")
+  if (text.startsWith("max tokens")) return "token budget"
+  if (text.startsWith("max duration")) return "time budget"
+  if (text.startsWith("max turns")) return "turn budget"
+  return "budget"
 }
 
 // ---------------------------------------------------------------------------
@@ -4429,9 +4461,10 @@ function buildGoalState(sessionID, condition, options, meta = {}, lastStatus = "
     startedAt: Date.now(),
     pausedAt: 0,
     peakContextTokens: 0,
+    latestContextTokens: 0,
     // The context window of the model this goal runs on, learned from the host
-    // on the first idle. 0 means "not known yet", which means no context
-    // ceiling — see contextWindowLimit.
+    // on the first idle. 0 means "not known yet": the status shows no window
+    // (informational only) — see contextWindowLimit.
     modelContextTokens: 0,
     modelKey: "",
     usage: emptyUsage(),
@@ -5233,7 +5266,7 @@ function buildAgentTools(
       description:
         "Set or replace the session goal. Call only when the user explicitly asks to set or pursue a goal. " +
         "maxTurns 0 means unlimited auto-continue turns, which is the default. maxTokens is the goal's " +
-        "cumulative token spend budget; contextWindowTokens is the separate ceiling on peak context size.",
+        "cumulative token spend budget; contextWindowTokens is the window size shown in the status (informational: context never stops or nudges the goal, compaction handles it).",
       args: {
         objective: schema.string(),
         maxTurns: schema.number().optional(),
@@ -5341,7 +5374,7 @@ function buildAgentTools(
     }),
     set_goal: toolHelper({
       description:
-        "Set a new session goal for autonomous auto-continue. ONLY call this when the user explicitly asks you to set, define, or start working toward a goal — never decide to set a goal on your own. Replaces any existing goal. maxTurns 0 means unlimited auto-continue turns, which is the default. maxTokens is the goal's cumulative token spend budget; contextWindowTokens is the separate ceiling on peak context size.",
+        "Set a new session goal for autonomous auto-continue. ONLY call this when the user explicitly asks you to set, define, or start working toward a goal — never decide to set a goal on your own. Replaces any existing goal. maxTurns 0 means unlimited auto-continue turns, which is the default. maxTokens is the goal's cumulative token spend budget; contextWindowTokens is the window size shown in the status (informational: context never stops or nudges the goal, compaction handles it).",
       args: {
         objective: schema.string(),
         maxTurns: schema.number().optional(),
@@ -7055,12 +7088,11 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
     return null
   }
 
-  // THE CONTEXT CEILING IS THE MODEL'S OWN WINDOW, NOT A GUESSED CONSTANT.
+  // THE CONTEXT WINDOW SHOWN IN THE STATUS IS THE MODEL'S OWN, NOT A GUESSED CONSTANT.
   // Read once per plugin instance from the host catalog
   // (`client.config.providers()` -> `providers[].models[id].limit.context`) and
   // cached per provider/model. Every failure path yields 0, which means "no
-  // context ceiling" — the guard stays off rather than pausing a healthy run
-  // against a number nobody verified.
+  // window" — display only; nothing stops or nudges on it.
   let providerCatalogPromise = null
   const providerCatalog = () => {
     if (!providerCatalogPromise) {
@@ -7075,7 +7107,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         } catch (error) {
           await logChildActivityProbeFailure(
             "model-catalog",
-            "Could not read the host model catalog; goals run without a context-window ceiling until one is set explicitly",
+            "Could not read the host model catalog; the status shows no context window until one is set explicitly",
             error,
           )
           return []
@@ -7093,7 +7125,13 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       (entry) => isPlainObject(entry) && entry.id === providerID,
     )
     const models = isPlainObject(provider?.models) ? provider.models : {}
-    const tokens = toNonNegativeInteger(models[modelID]?.limit?.context)
+    // OpenCode v1.19.4 compacts at `limit.input - reserved` when the model sets
+    // `limit.input`, and at `limit.context - maxOutput` otherwise
+    // (packages/opencode/src/session/overflow.ts:10 `usable`, :22 `isOverflow`).
+    // So `limit.input` is the prompt window that actually applies; GitHub
+    // Copilot models carry it (plugin/github-copilot/models.ts:119-120).
+    const limit = models[modelID]?.limit
+    const tokens = toNonNegativeInteger(limit?.input) || toNonNegativeInteger(limit?.context)
     modelContextWindows.set(key, tokens)
     while (modelContextWindows.size > MAX_TRACKED_MODEL_WINDOWS) {
       modelContextWindows.delete(modelContextWindows.keys().next().value)
@@ -8228,7 +8266,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
       pushHistory(
         goal,
         "set",
-        `Goal created with limits: ${describeTurnLimit(goal.options.maxTurns)} auto-continues, ${formatBudgetDuration(goal.options.maxDurationMs)}, ${goal.options.maxTokens.toLocaleString()} tokens, ${goal.options.contextWindowTokens.toLocaleString()}-token context window.`,
+        `Goal created with limits: ${describeTurnLimit(goal.options.maxTurns)} auto-continues, ${formatBudgetDuration(goal.options.maxDurationMs)}, ${goal.options.maxTokens.toLocaleString()} tokens.`,
       )
 
       // A goal set while a planning-only agent is active is recorded active but
@@ -8300,7 +8338,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           "",
           `Limits: ${describeTurnLimit(goal.options.maxTurns)} auto-continues, ${formatBudgetDuration(
             goal.options.maxDurationMs,
-          )}, ${goal.options.maxTokens.toLocaleString()} tokens, ${goal.options.contextWindowTokens.toLocaleString()}-token context window.`,
+          )}, ${goal.options.maxTokens.toLocaleString()} tokens.`,
         ]
           .filter((line) => line !== null)
           .join("\n"),
@@ -8452,6 +8490,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
             : ""
         goal.messageIDs = new Set()
         goal.peakContextTokens = 0
+        goal.latestContextTokens = 0
         // Compaction rewrites the context. The epoch-scoped claim lets the same
         // retained assistant source continue once in the new epoch without
         // allowing duplicate idle delivery to continue it twice.
@@ -8571,6 +8610,10 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           // Using Math.max gives the current context size, matching what
           // OpenCode displays and making the budget check intuitive.
           goal.peakContextTokens = Math.max(goal.peakContextTokens, currentTokens)
+          // The context the latest message ran with: unlike the peak it goes
+          // DOWN when the host compacts or prunes, and it is what the status
+          // and panel display.
+          goal.latestContextTokens = currentTokens
           setBoundedMessageValue(seenTokens, currentMessageID, currentTokens)
           rememberMessageID(goal, currentMessageID)
           changed = true
@@ -8760,7 +8803,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           turnMessages,
           activeGoalAfterMessages.options.maxRecentMessages,
         )
-        // The context ceiling comes from the model this goal actually runs on.
+        // The displayed context window comes from the model this goal actually runs on.
         // Cached after the first resolution, and a no-op once it is known or
         // once `contextWindowTokens` was set explicitly.
         await ensureGoalContextWindow(activeGoalAfterMessages, latestAssistant)
@@ -9115,7 +9158,10 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
                     // into the FIRST continuation actually sent (design
                     // §4.3(c)); a no-op when nothing is queued.
                     withExistingTodosOffer(
-                      buildContinueMessage(claimedGoal, { budgetWrapup: true, mirrorMode }),
+                      buildContinueMessage(claimedGoal, {
+                        budgetWrapup: limitReasonBudgetName(limitReason),
+                        mirrorMode,
+                      }),
                       sessionID,
                     ),
                     continueToken,
@@ -9344,23 +9390,24 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           activeGoalBeforePrompt.continuationClaim?.compactionEpoch ?? -1
         if (claimedCompactionEpoch !== activeGoalBeforePrompt.compactionEpoch) return
 
-        const budgetWrapup = budgetWrapupNeeded(activeGoalBeforePrompt)
+        const budgetWrapup = budgetWrapupKind(activeGoalBeforePrompt)
         if (budgetWrapup) {
+          const wrapupStopReason = `${budgetWrapup} wrap-up requested`
           activeGoalBeforePrompt.budgetWrapupSent = true
           activeGoalBeforePrompt.stopped = true
-          activeGoalBeforePrompt.stopReason = "budget wrap-up requested"
-          activeGoalBeforePrompt.lastStatus = "Budget threshold reached; requested final handoff."
+          activeGoalBeforePrompt.stopReason = wrapupStopReason
+          activeGoalBeforePrompt.lastStatus = `${budgetWrapupName(budgetWrapup)} at its wrap-up threshold; requested final handoff.`
           // Persist before sending the wrapup prompt so that a crash during
           // promptAsync doesn't cause a duplicate wrapup on resume. This mirrors
           // the hard-limit path which also persists before its promptAsync call.
-          pushHistory(activeGoalBeforePrompt, "budget-wrapup", "Budget threshold reached; sending final handoff prompt.")
+          pushHistory(activeGoalBeforePrompt, "budget-wrapup", `${budgetWrapupName(budgetWrapup)} at its wrap-up threshold; sending final handoff prompt.`)
           await persist(sessionID)
-          announceLifecycle(sessionID, "Goal paused — budget threshold reached; final handoff requested.", {
+          announceLifecycle(sessionID, `Goal paused — ${budgetWrapup} at its wrap-up threshold; final handoff requested.`, {
             goal: activeGoalBeforePrompt,
             transition: "budget-wrapup-paused",
             reason: activeGoalBeforePrompt.stopReason,
             expectedState: "paused",
-            expectedStopReason: "budget wrap-up requested",
+            expectedStopReason: wrapupStopReason,
           })
         }
 
@@ -9487,7 +9534,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
               activeGoalAfterPrompt,
               budgetWrapup ? "budget-wrapup" : "auto-continue",
               budgetWrapup
-                ? "Sent a final handoff request near a budget threshold (token spend, context window, or duration)."
+                ? `Sent a final handoff request near the ${budgetWrapup} threshold.`
                 : `Sent auto-continue prompt ${formatTurnBudget(activeGoalAfterPrompt.turnCount, activeGoalAfterPrompt.options.maxTurns)}.`,
             )
           }
@@ -9862,6 +9909,7 @@ export const testInternals = {
   buildContinueMessage,
   buildGoalBlock,
   budgetWrapupNeeded,
+  budgetWrapupKind,
   cleanupGoal,
   currentGoal,
   escapeGoalText,

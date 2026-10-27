@@ -20,7 +20,7 @@ Requires Node 18 or newer and OpenCode `>=1.17.15 <3` — both the 1.x and 2.x l
 
 - `/goal <objective>` sets or replaces the focused goal. Flags such as `--max-turns 20` or `--budget 5m` go on the first line; everything after it is objective text, kept verbatim.
 - `/goal status` reports state, budget usage and the verified action plan. `/goal list`, `/goal halt` (alias `/goal pause`), `/goal resume`, `/goal clear` cover the rest.
-- A run stops only on evidence-backed completion, a concrete blocker the model cannot get past without you, a budget limit (8 hours, 100m tokens of spend, the model's own context window), or your `/goal halt`. Messages you send mid-goal steer it and never pause it; compactions, errors, restarts and stalls are recorded and the goal keeps going. The full list is in [docs/reference.md](docs/reference.md#when-a-goal-stops).
+- A run stops only on evidence-backed completion, a concrete blocker the model cannot get past without you, a budget limit (8 hours, 100m tokens of spend; context fullness is never a stop, compaction handles it), or your `/goal halt`. Messages you send mid-goal steer it and never pause it; compactions, errors, restarts and stalls are recorded and the goal keeps going. The full list is in [docs/reference.md](docs/reference.md#when-a-goal-stops).
 
 While a goal runs, its state rides the session title on every client, and the TUI panel renders the whole plan beside it:
 

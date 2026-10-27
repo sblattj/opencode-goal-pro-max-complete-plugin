@@ -121,15 +121,16 @@ export interface GoalSidebarStatus {
    */
   tokens: { used: number; max: number }
   /**
-   * Context pressure, added in v2: `used` is the peak single-message context
-   * the goal has seen (reset to zero by a compaction) and `max` is the goal's
-   * context ceiling — an explicit `contextWindowTokens`, or the window the
-   * host reported for the model this goal runs on. Unlike
-   * {@link GoalSidebarStatus.tokens}`.used`, this number can go down.
+   * Context fullness, INFORMATIONAL only: `used` is the context the latest
+   * message ran with (it goes down after a compaction or prune) and `max` is the
+   * window size — an explicit `contextWindowTokens`, or the window the host
+   * reported for the model this goal runs on. It never stops a goal and never
+   * nudges the model. Unlike {@link GoalSidebarStatus.tokens}`.used`, this
+   * number can go down.
    *
-   * OMITTED entirely when neither ceiling is known, because `max: 0` would
+   * OMITTED entirely when neither window is known, because `max: 0` would
    * render as a budget of zero; a consumer must treat an absent `context` as
-   * "no context ceiling" and drop the stat.
+   * "window unknown" and drop the stat.
    */
   context?: { used: number; max: number }
   plan: {
@@ -192,9 +193,14 @@ export interface GoalAuditSnapshot {
    */
   peakContextTokens: number
   /**
+   * The context size of the latest message, which a compaction or prune lowers.
+   * What the status and panel display (informational only).
+   */
+  latestContextTokens?: number
+  /**
    * The context window the host reported for the model this goal is running
-   * on, or `0` when it could not say. Used as the goal's context ceiling only
-   * while {@link GoalPluginOptions.contextWindowTokens} is `0` (auto), which
+   * on, or `0` when it could not say. Used as the window size shown in the
+   * status (informational only) while {@link GoalPluginOptions.contextWindowTokens} is `0` (auto), which
    * is the default; an explicit option or `--context-window` always wins.
    */
   modelContextTokens: number
@@ -264,7 +270,7 @@ export interface GoalPluginOptions {
    * an arbitrary turn count stops a healthy long run for no reason. The
    * no-tool-call and no-progress detectors record a loop that has stopped
    * doing anything but do not stop the goal — the 8-hour window, the spend
-   * budget, the context ceiling and the user's `/goal halt` are the brakes. Overridable per-goal with
+   * budget and the user's `/goal halt` are the brakes. Overridable per-goal with
    * `--max-turns`, which also accepts `unlimited`, `none`, `inf`, `infinite`,
    * `infinity`, and `∞`.
    * @default 0
@@ -288,7 +294,7 @@ export interface GoalPluginOptions {
    * 100,000,000, a reachable ceiling for an 8-hour unattended run: the token
    * brake, the token warning, and the token dimension of the budget wrap-up
    * all fire against it.
-   * Context pressure is a different quantity with its own guard — see
+   * Context fullness is a different quantity and never stops a goal — see
    * {@link GoalPluginOptions.contextWindowTokens}.
    * Overridable per-goal with `--max-tokens` or the `--budget` shorthand
    * (accepts a `k`/`m` suffix, e.g. `100k`, `1.5m`).
@@ -297,24 +303,19 @@ export interface GoalPluginOptions {
   maxTokens?: number
 
   /**
-   * The model's context window, in tokens: the ceiling for the goal's PEAK
-   * single-message context (`input + output + reasoning + cache` on one
-   * message, kept as a high-water mark and reset by a compaction). Distinct
-   * from {@link GoalPluginOptions.maxTokens}, which bounds cumulative spend
-   * and only ever grows. At `budgetWrapupRatio` of the ceiling the goal is sent
-   * the wrap-up handoff (which PAUSES it), at `ceiling - warnTokensRemaining`
-   * it is warned, and at the ceiling it pauses with stop reason
-   * `context window reached`.
+   * The model's context window size, in tokens, INFORMATIONAL only: the status
+   * and panel show the current context against it. It never stops a goal,
+   * never sends a wrap-up and never warns the model, because compaction resets
+   * context. Distinct from {@link GoalPluginOptions.maxTokens}, which bounds
+   * cumulative spend and only ever grows. Still accepted for backward
+   * compatibility.
    *
-   * `0` — the default — means AUTO: the ceiling is the window of the model the
-   * goal is running on, read once from the host's provider catalog
+   * `0` — the default — means AUTO: the window of the model the goal is running
+   * on, read once from the host's provider catalog
    * (`client.config.providers()` → `models[id].limit.context`). Any positive
-   * value overrides that and skips the lookup. When neither is available the
-   * goal has NO context ceiling: the guard stays off rather than pausing a
-   * healthy run against a guessed number, `/goal status` renders the peak
-   * against `∞`, the continuation prompt reports
-   * `context_remaining: unlimited`, and
-   * {@link GoalSidebarStatus.context} is omitted.
+   * value overrides that and skips the lookup. `/goal status` says which of
+   * the two supplied the number. When neither is available `/goal status`
+   * renders `∞` and {@link GoalSidebarStatus.context} is omitted.
    *
    * Overridable per-goal with `--context-window` (accepts a `k`/`m` suffix,
    * e.g. `400k`, `1m`).
@@ -405,9 +406,9 @@ export interface GoalPluginOptions {
   /**
    * Fraction (between 0 and 1, exclusive) of a budget at which the plugin
    * sends a one-time "wrap up" prompt nudging the model to finish before the
-   * hard limit is hit. Applied to the three budgets that can actually be
-   * reached — cumulative token spend, peak context, and the wall clock —
-   * whichever arrives first. The turn budget is excluded: it is unlimited by
+   * hard limit is hit. Applied to the two budgets that can actually be
+   * reached — cumulative token spend and the wall clock — whichever arrives
+   * first. Context fullness is not a budget and never triggers it. The turn budget is excluded: it is unlimited by
    * default, and a bounded one already gets a final handoff at its ceiling.
    * @default 0.8
    */
@@ -430,10 +431,8 @@ export interface GoalPluginOptions {
 
   /**
    * Remaining tokens at which a limit-approaching warning is included in
-   * status output. Applied twice, to two different quantities: to the token
-   * budget (`maxTokens - spend`) and to the context window
-   * (`contextWindowTokens - peak context`), so a goal can be warned about
-   * either without setting a second threshold.
+   * status output. Applied to the token budget (`maxTokens - spend`) only;
+   * context headroom is never warned about.
    * @default 25000
    */
   warnTokensRemaining?: number

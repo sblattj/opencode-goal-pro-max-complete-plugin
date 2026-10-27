@@ -291,8 +291,8 @@ export function goalPanelModel(raw, { liveTodoCount } = {}) {
   const durationMs = budget(raw.durationMs)
   const minutes = budget(raw.minutes)
   // `tokens` is cumulative SPEND against the token budget; `context` is the
-  // peak context size against the model's window. They are different
-  // quantities and each has its own ceiling, so the panel shows both.
+  // current context size against the model's window (display only). They are
+  // different quantities, so the panel shows both.
   const tokens = budget(raw.tokens)
   const context = budget(raw.context)
 

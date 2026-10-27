@@ -31,7 +31,7 @@ The ladder is the artifact. The process that produced the current defaults is th
 - **Every fix proved with a polarity mutant.** A green suite proves nothing about a test that cannot fail. Each fix landed with a test *and* with a mutant that reverts exactly the fixed property, so the claim rests on a red/green pair. Twelve of the 80 mutants in the contract are new in 0.11.0.
 - **An independent verifier that ran the shipped bundle, not `src/`.** The final verification pass imported `dist/goal-plugin.js` — the bytes a user installs — rather than the source tree, because a bundler is a loader that can disagree with `node`.
 - **Decisions reversed by evidence.** Three of the shipped defaults are the *second* answer:
-  - A fixed 200,000-token context guard was replaced by the model's own window read from the host, because the wrap-up *pauses* the goal and a fixed ceiling would have ended healthy runs at a 160,000-token peak on 400k- and 1M-context models ([CHANGELOG 0.11.0](../CHANGELOG.md)).
+  - The context guard was removed in 1.4.1: context fullness is display-only because compaction resets it. It had been a fixed 200,000 ceiling, then the model's own window (CHANGELOG 0.11.0), and in both forms it paused healthy runs.
   - The talk-only pause moved from **2** turns to **10**, because judging a goal purely on tool calls is a blunt instrument.
   - `maxTokens` was redefined from *peak context* to *cumulative spend*, after review showed the shipped 100,000,000 could never be reached against a `Math.max` over single-message context sizes — the token brake, the token warning and the token half of the wrap-up handoff were all dead code on a default goal, and every continuation prompt was telling the model it had roughly 500× its real headroom.
 
