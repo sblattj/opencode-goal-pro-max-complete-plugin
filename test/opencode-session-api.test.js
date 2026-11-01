@@ -2,7 +2,7 @@ import assert from "node:assert/strict"
 import test from "node:test"
 import { createOpenCodeSessionApi } from "../src/opencode-session-api.js"
 
-const operations = ["messages", "promptAsync", "prompt", "update", "get", "create", "delete", "abort", "children", "status"]
+const operations = ["messages", "promptAsync", "prompt", "update", "get", "create", "delete", "abort", "children", "status", "summarize", "deleteMessage"]
 
 function recordingClient(handler) {
   const calls = []
@@ -163,4 +163,96 @@ test("children and status use the shape adapter and are replay-safe", async () =
       { path: {} },
     ],
   )
+})
+
+test("summarize sends the flat shape and the legacy shape", async () => {
+  const model = { providerID: "anthropic", modelID: "claude-x" }
+  const flat = recordingClient(() => ({ data: true }))
+  assert.equal(await createOpenCodeSessionApi(flat.client).summarize("s1", model), true)
+  assert.deepEqual(flat.calls, [{ operation: "summarize", input: { sessionID: "s1", ...model } }])
+
+  const legacy = recordingClient(() => ({ data: true }))
+  await createOpenCodeSessionApi(legacy.client, { preferredShape: "legacy" }).summarize("s1", model)
+  assert.deepEqual(legacy.calls, [
+    { operation: "summarize", input: { path: { id: "s1" }, body: model } },
+  ])
+})
+
+test("deleteMessage sends the flat shape and the legacy shape", async () => {
+  const flat = recordingClient(() => ({ data: true }))
+  assert.equal(await createOpenCodeSessionApi(flat.client).deleteMessage("s1", "m1"), true)
+  assert.deepEqual(flat.calls, [{ operation: "deleteMessage", input: { sessionID: "s1", messageID: "m1" } }])
+
+  const legacy = recordingClient(() => ({ data: true }))
+  await createOpenCodeSessionApi(legacy.client, { preferredShape: "legacy" }).deleteMessage("s1", "m1")
+  assert.deepEqual(legacy.calls, [
+    { operation: "deleteMessage", input: { path: { id: "s1", messageID: "m1" } } },
+  ])
+})
+
+test("deleteMessage falls back to the generated v1 client's transport", async () => {
+  // The shape of the v1 SDK's Session class: no deleteMessage method, a `_client`.
+  const calls = []
+  const client = {
+    session: {
+      _client: {
+        delete: async (input) => {
+          calls.push(input)
+          return { data: true }
+        },
+      },
+    },
+  }
+  assert.equal(await createOpenCodeSessionApi(client).deleteMessage("s1", "m1"), true)
+  assert.deepEqual(calls, [
+    { url: "/session/{id}/message/{messageID}", path: { id: "s1", messageID: "m1" } },
+  ])
+})
+
+test("deleteMessage throws when the host has no way to do it", async () => {
+  const api = createOpenCodeSessionApi({ session: {} })
+  await assert.rejects(api.deleteMessage("s1", "m1"), /deleteMessage is not available/)
+})
+
+test("deleteMessage throws on the SDK's resolved { error }, through either path", async () => {
+  const refusal = { error: { name: "Session.BusyError", data: { message: "session is busy" } } }
+  const method = recordingClient(() => refusal)
+  await assert.rejects(createOpenCodeSessionApi(method.client).deleteMessage("s1", "m1"), /session is busy/)
+  const transport = createOpenCodeSessionApi({ session: { _client: { delete: async () => refusal } } })
+  await assert.rejects(transport.deleteMessage("s1", "m1"), /session is busy/)
+})
+
+test("deleteMessage is never replayed after a transport or shape failure", async () => {
+  for (const preferredShape of ["flat", "legacy"]) {
+    for (const error of [
+      new TypeError("validation failed: required path or body"),
+      new TypeError("fetch failed"),
+    ]) {
+      const host = recordingClient(() => {
+        throw error
+      })
+      const api = createOpenCodeSessionApi(host.client, { preferredShape })
+      await assert.rejects(api.deleteMessage("s1", "m1"), (actual) => actual === error)
+      assert.equal(host.calls.length, 1)
+    }
+  }
+})
+
+test("summarize is never replayed after a transport or shape failure", async () => {
+  for (const preferredShape of ["flat", "legacy"]) {
+    for (const error of [
+      new TypeError("validation failed: required path or body"),
+      new TypeError("fetch failed"),
+    ]) {
+      const host = recordingClient(() => {
+        throw error
+      })
+      const api = createOpenCodeSessionApi(host.client, { preferredShape })
+      await assert.rejects(
+        api.summarize("s1", { providerID: "p", modelID: "m" }),
+        (actual) => actual === error,
+      )
+      assert.equal(host.calls.length, 1)
+    }
+  }
 })

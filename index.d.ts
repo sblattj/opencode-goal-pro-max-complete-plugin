@@ -324,6 +324,24 @@ export interface GoalPluginOptions {
   contextWindowTokens?: number
 
   /**
+   * The context size, in tokens, at which the plugin forces a compaction by
+   * asking the host to run `session.summarize`. Checked after every finished
+   * assistant step (so mid-turn) and again at idle as a backstop; the goal
+   * continues afterwards. It never pauses or stops a goal, and covers goal
+   * sessions only. It exists because the host never auto-compacts a model that
+   * reports `limit.context: 0`. After 3 failed requests it stops forcing until
+   * the next compaction; two compactions that leave the context over this
+   * value hold forcing until a step comes in below it. Independent of
+   * {@link GoalPluginOptions.contextWindowTokens}, which stays display-only.
+   *
+   * `0` turns it off. Overridable per-goal with `--compact-at` (accepts a
+   * `k`/`m` suffix, e.g. `150k`) or the `compactAtTokens` argument of
+   * `goal_set`/`set_goal`.
+   * @default 200000
+   */
+  compactAtTokens?: number
+
+  /**
    * Minimum delay, in milliseconds, enforced between consecutive
    * auto-continue prompts. Overridable per-goal with `--cooldown-ms`.
    * @default 1500

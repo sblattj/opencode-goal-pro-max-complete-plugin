@@ -109,6 +109,49 @@ export function createOpenCodeSessionApi(client, options = {}) {
     todo(sessionID) {
       return invoke("todo", { sessionID }, { path: { id: sessionID } })
     },
+    // POST /session/{id}/summarize compacts the session. Mutating: never add it
+    // to REPLAY_SAFE_OPERATIONS, a replay would compact twice. The host call
+    // stays pending until its whole agent run ends; callers must not await it.
+    summarize(sessionID, { providerID, modelID } = {}) {
+      return invoke(
+        "summarize",
+        { sessionID, providerID, modelID },
+        { path: { id: sessionID }, body: { providerID, modelID } },
+      )
+    },
+    // DELETE /session/{id}/message/{messageID}. Mutating: never add it to
+    // REPLAY_SAFE_OPERATIONS. The host refuses it while the session is busy, and
+    // the generated SDK resolves such an answer as `{ error }`, so that throws here.
+    async deleteMessage(sessionID, messageID) {
+      let response
+      if (typeof client.session.deleteMessage === "function") {
+        response = await invoke(
+          "deleteMessage",
+          { sessionID, messageID },
+          { path: { id: sessionID, messageID } },
+        )
+      } else {
+        // The generated v1 client the host hands to plugins has no method for this
+        // route. Its session object does hold the configured transport (`_client`,
+        // with the server URL, auth and directory), which is how its own methods
+        // call the route next to this one, `message`.
+        const transport = client.session._client
+        if (typeof transport?.delete !== "function") {
+          throw new TypeError("OpenCode client.session.deleteMessage is not available")
+        }
+        response = unwrapData(
+          await transport.delete({
+            url: "/session/{id}/message/{messageID}",
+            path: { id: sessionID, messageID },
+          }),
+        )
+      }
+      if (response && typeof response === "object" && response.error) {
+        const detail = response.error?.data?.message || response.error?.name || response.error?.message
+        throw new Error(`Host refused to delete message ${messageID}: ${detail || JSON.stringify(response.error)}`)
+      }
+      return response
+    },
     delete(sessionID) {
       return invoke("delete", { sessionID }, { path: { id: sessionID } })
     },

@@ -98,6 +98,7 @@ Every flag below is a key of `GOAL_FLAG_SPECS` in `src/goal-plugin.js` (17 keys,
 | `--max-tokens <n>` | Cumulative token **spend** limit |
 | `--budget <n>` | Spend limit shorthand; accepts a `k`/`m` suffix (`100k`, `1.5m`) |
 | `--context-window <n>` | The context window size shown in the status (informational: it never stops a goal or nudges the model). Overrides the auto-detected window. Accepts `k`/`m` |
+| `--compact-at <n>` | Context size at which the plugin asks the host to compact (default `200k`). `0` turns it off. Accepts `k`/`m`. See [Forced compaction](#forced-compaction) |
 | `--cooldown-ms <n>` | Minimum delay between continues |
 | `--no-progress-threshold <n>` | Output-token floor below which a turn counts as stalled |
 | `--no-progress-turns <n>` | Consecutive stalled low-output turns before pausing |
@@ -111,6 +112,8 @@ Every flag below is a key of `GOAL_FLAG_SPECS` in `src/goal-plugin.js` (17 keys,
 /goal fix tests --max-turns 20 --max-tokens 400000
 /goal fix tests --max-turns unlimited --max-minutes 480
 /goal fix tests --budget 5m --context-window 1m
+/goal fix tests --compact-at 150k
+/goal fix tests --compact-at 0
 /goal fix tests --no-progress-threshold 50 --no-progress-turns 2
 ```
 
@@ -118,7 +121,7 @@ Every flag below is a key of `GOAL_FLAG_SPECS` in `src/goal-plugin.js` (17 keys,
 
 | Command | Effect |
 |---|---|
-| `/goal` *(bare)* or `/goal status` | Report the focused goal: `Active goal:`, an explicit `State:` line (`active`, `paused`, `blocked`), budget usage, `Token spend:`, `Context:` (with where the window size came from), a `Completion audit:` line, and the plan |
+| `/goal` *(bare)* or `/goal status` | Report the focused goal: `Active goal:`, an explicit `State:` line (`active`, `paused`, `blocked`), budget usage, `Token spend:`, `Context:` (with where the window size came from), `Forced compaction:`, a `Completion audit:` line, and the plan |
 | `/goal <objective>` | Set (replace) the focused goal |
 | `/goal add <objective>` | Background the current goal and focus a new one |
 | `/goal list` | Numbered live goals plus the per-session archive of achieved goals, each with its state |
@@ -262,9 +265,23 @@ spend = usage.input + usage.output + usage.reasoning + usage.cacheRead + usage.c
 
 Cache reads are in the sum because they are billed. The counter only grows, is deduplicated per message (a streaming update adds only its delta; a message billed before a restart is not billed again), and survives a restart because it lives in the persisted `usage` record. **Delegated work counts**: a child session has no goal of its own, so its tokens are charged up the `parentID` chain to the nearest ancestor session that holds one — nothing else about a child is inherited, including its context.
 
-**Context fullness is informational, never a stop.** The context shown is the latest message's `input + output + reasoning + cache` — the count OpenCode displays — and it drops when the host compacts or prunes. Compaction handles a full window, so it never stops a goal, never sends a wrap-up and never warns the model. `contextWindowTokens` (and `--context-window`) only sets the window size the status and panel show; it defaults to `0` = **auto-detect**: the plugin reads `client.config.providers()` once and takes `models[<the goal's model>].limit.context`. `/goal status` says where the number came from (`auto (host catalog: <provider>/<model>)` or `configured (--context-window)`). Every failure path yields an unknown window: `/goal status` shows `Context: 147,000/∞` and the sidebar drops the `ctx` stat.
+**Context fullness is informational, never a stop.** (The one thing the plugin does with context size is [force a compaction](#forced-compaction); that never pauses or ends a goal either.) The context shown is the latest message's `input + output + reasoning + cache` (the count OpenCode displays), and it drops when the host compacts or prunes. Compaction handles a full window, so context never stops a goal, never sends a wrap-up and never warns the model. `contextWindowTokens` (and `--context-window`) only sets the window size the status and panel show; it defaults to `0` = **auto-detect**: the plugin reads `client.config.providers()` once and takes `models[<the goal's model>].limit.context`. `/goal status` says where the number came from (`auto (host catalog: <provider>/<model>)` or `configured (--context-window)`). Every failure path yields an unknown window: `/goal status` shows `Context: 147,000/∞` and the sidebar drops the `ctx` stat.
 
 The continuation prompt reports `tokens_remaining` only; context headroom is never put in front of the model.
+
+### Forced compaction
+
+OpenCode never auto-compacts a model that reports `limit.context: 0` (its overflow check is off when the limit is zero), so on such a model a long goal would grow its context until the provider rejects it. To cover that, the plugin forces the compaction itself. `compactAtTokens` (default `200000`; `0` = off) is the context size at which it asks the host to compact through `session.summarize`. Set it per goal with `--compact-at <n>` (`k`/`m` suffix; `0` = off) or the `compactAtTokens` argument of `goal_set`/`set_goal`; the plugin option sets the default.
+
+- It applies on every model, not only those reporting `limit.context: 0`. A model with a 1M window is also compacted at 200k unless you raise `--compact-at` or set it to `0`. A model with a smaller window usually compacts itself first.
+- It checks after every finished assistant step, so a single long turn is caught mid-turn. On a model whose own overflow check is alive (`limit.context` above 0) the crossing step is left to the host, and the plugin asks only if the next step is still over, so the two never compact twice for one crossing. When a turn ends over the threshold with no request sent, the idle check is a backstop.
+- The goal continues after the compaction. Forcing never pauses or stops a goal.
+- It covers goal sessions only. A session with no goal on a `limit.context: 0` model gets nothing from this; give that model a `limit.context` and a `limit.input` in the OpenCode config so the host compacts it.
+- A failed request does not block the goal. The plugin deletes the failed compaction message, because the host would otherwise re-run it on every later prompt, so the goal keeps working and a later step can ask again.
+- It is bounded. After 3 failed requests it stops forcing until the next compaction. If two compactions in a row leave the context over the threshold, forcing is held until a step comes in below it. A compaction the plugin requested does not count toward the stalled-compaction gate.
+- `/goal status` shows a `Forced compaction:` line (`at 200,000 tokens (--compact-at)` or `off (--compact-at 0)`).
+
+`contextWindowTokens` stays display-only and is independent of `compactAtTokens`.
 
 **Judgement is per turn, not per message.** OpenCode writes a new assistant message for every LLM step of one prompt, so an ordinary working turn is several messages sharing one `parentID`: the steps that ran tools, then a separate text-only closing summary. The plugin groups every assistant message answering the same prompt (falling back to the trailing run of assistant messages on hosts that do not report a parent, and stopping at a compaction summary) and asks the question of the group: a tool call — or a subtask delegation — **anywhere** in the turn resets the counter. A turn the visibility window sliced in half charges nothing in either direction and is recorded as a `warning` in the goal's history.
 
@@ -284,6 +301,7 @@ Pass options when registering the plugin to change the defaults for all goals.
         "maxDurationMs": 28800000,
         "maxTokens": 100000000,
         "contextWindowTokens": 0,
+        "compactAtTokens": 200000,
         "minDelayMs": 1500,
         "promptRetryWakeMs": 5000,
         "maxRecentMessages": 200,

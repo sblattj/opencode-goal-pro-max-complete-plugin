@@ -292,6 +292,18 @@ export function createV2ServiceClient(ctx = {}, options = {}) {
       // v1's POST /session/{id}/update 404s on 2.x; PATCH /session/{id} is it.
       update: (input) =>
         send("update", "PATCH", `/session/${encodeURIComponent(requireSessionID("update", input))}`, bodyFrom(input)),
+      summarize: (input) =>
+        send("summarize", "POST", `/session/${encodeURIComponent(requireSessionID("summarize", input))}/summarize`, bodyFrom(input)),
+      deleteMessage: (input) => {
+        const sessionID = requireSessionID("deleteMessage", input)
+        const messageID = input?.messageID ?? input?.path?.messageID
+        if (!messageID) throw new Error("OpenCode v2 service call requires a messageID (session.deleteMessage)")
+        return send(
+          "deleteMessage",
+          "DELETE",
+          `/session/${encodeURIComponent(sessionID)}/message/${encodeURIComponent(messageID)}`,
+        )
+      },
       delete: (input) =>
         send("delete", "DELETE", `/session/${encodeURIComponent(requireSessionID("delete", input))}`),
       // v1's POST /session/{id}/abort 404s on 2.x; /interrupt is the route.

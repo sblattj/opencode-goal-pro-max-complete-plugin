@@ -1,6 +1,17 @@
 # Changelog
 
-## 1.4.1 — 2026-10-26
+## Unreleased
+
+- **Added: forced compaction for goal sessions, on by default at 200,000 tokens.** OpenCode never auto-compacts a model that reports `limit.context: 0` (checked against OpenCode v1.19.5 `session/overflow.ts`), so a long goal on such a model grew without limit: one session reached 638,078 tokens. The plugin now asks the host to compact once a finished step crosses the threshold, and the goal keeps working afterwards.
+  - **`--compact-at <n>` and `compactAtTokens` set the threshold;** `0` turns it off. It applies on every model, so a 1M-window model also compacts at 200k unless you raise it. `/goal status` shows a `Forced compaction:` line.
+  - **Checked after every finished step,** so one long turn is caught mid-turn. The idle check is the backstop for a turn that ends over the threshold.
+  - **Never two compactions for one crossing.** On a model with a real `limit.context`, the plugin gives the host's own check one step and asks only if the next step is still over the threshold.
+  - **A failed compaction does not block the goal.** The plugin deletes the failed compaction message, because the host would otherwise re-run it on every later prompt instead of doing work.
+  - **It is bounded.** After 3 failed requests forcing stops until the next compaction. If two compactions in a row leave the context over the threshold, forcing is held until a step comes in below it.
+  - **Goal sessions only.** A session with no goal on a `limit.context: 0` model still needs a `limit.context` and `limit.input` in the OpenCode config.
+  - **Forcing never pauses or stops a goal.** Context fullness stays informational.
+- **Added: `npm run smoke:forced-compaction`,** which runs the feature against a real OpenCode host with a mock model.
+
 
 - **Fixed: context fullness no longer stops a goal or tells it to wrap up.** On 1.4.0 a goal with 7.2M of 100M tokens spent and 18m of 8h elapsed paused with "budget wrap-up requested" because peak context reached 80% of the model's 128,000-token window. OpenCode compacts the session on its own when context fills, so context is not a budget. The `context window reached` stop, the context branch of the 80% wrap-up, the "context token(s) remaining" warning and the `context_remaining` line in the continuation prompt are gone. Token spend (`maxTokens`) and the clock (`maxDurationMs`) keep both their 80% wrap-up and their hard stop.
   - **A wrap-up names its budget.** The stop reason is `token budget wrap-up requested` or `time budget wrap-up requested`, and the prompt opens "Token budget limit near" or "Time budget limit near".

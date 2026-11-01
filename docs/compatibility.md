@@ -258,6 +258,13 @@ running goal:
    `noContinueWhileChildrenActive` fails open (continuation proceeds when the
    host cannot report children), and the auto-detected context window (display only)
    stays unknown unless `contextWindowTokens` is configured explicitly.
+   Forced compaction (`compactAtTokens`) does not need the catalog: it
+   compares the latest message's context size with its own threshold and
+   asks the host to compact through `session.summarize`. It exists because
+   OpenCode never auto-compacts a model that reports `limit.context: 0`. A
+   host with no `session.summarize` skips it (logged once) and the goal
+   carries on. A non-goal session on such a model gets nothing from it and
+   needs `limit.context` plus `limit.input` in the OpenCode config.
 
 Beyond these, the standing rule for any host applies: the experimental hooks
 (`experimental.chat.system.transform`, `experimental.session.compacting`,

@@ -665,3 +665,48 @@ test("real GoalPlugin loads under a fake v2 context and registers its tools", as
 
   await dispose()
 })
+
+test("session.deleteMessage sends DELETE to the message route, from either shape", async () => {
+  const fetchMock = mockFetchRouter([
+    { method: "DELETE", path: "/api/session/ses_A/message/msg%2F1", body: { data: true } },
+  ])
+  try {
+    const { session } = injectedServiceClient()
+    // flat shape
+    assert.deepEqual(await session.deleteMessage({ sessionID: "ses_A", messageID: "msg/1" }), { data: true })
+    // legacy shape
+    await session.deleteMessage({ path: { id: "ses_A", messageID: "msg/1" } })
+    assert.equal(fetchMock.calls.length, 2)
+    for (const call of fetchMock.calls) {
+      assert.equal(call.method, "DELETE")
+      assert.equal(call.url, "http://127.0.0.1:45999/api/session/ses_A/message/msg%2F1")
+    }
+    assert.throws(() => session.deleteMessage({ messageID: "msg/1" }), /requires a sessionID/)
+    assert.throws(() => session.deleteMessage({ sessionID: "ses_A" }), /requires a messageID/)
+  } finally {
+    fetchMock.restore()
+  }
+})
+
+test("session.summarize posts the model to the v2 summarize route", async () => {
+  const fetchMock = mockFetchRouter([
+    { method: "POST", path: "/api/session/ses_A/summarize", body: { data: true } },
+  ])
+  try {
+    const { session } = injectedServiceClient()
+    const model = { providerID: "anthropic", modelID: "claude-x" }
+    // flat shape
+    assert.deepEqual(await session.summarize({ sessionID: "ses_A", ...model }), { data: true })
+    // legacy shape
+    await session.summarize({ path: { id: "ses_A" }, body: model })
+    assert.equal(fetchMock.calls.length, 2)
+    for (const call of fetchMock.calls) {
+      assert.equal(call.method, "POST")
+      assert.equal(call.url, "http://127.0.0.1:45999/api/session/ses_A/summarize")
+      assert.deepEqual(call.body, model)
+    }
+    assert.throws(() => session.summarize({ ...model }), /requires a sessionID/)
+  } finally {
+    fetchMock.restore()
+  }
+})

@@ -57,6 +57,7 @@
     "smoke:packed-manifest": "node scripts/packed-manifest-contract.mjs",
     "smoke:git-install": "node scripts/git-install-contract.mjs",
     "smoke:todo-mirror": "node scripts/smoke-todo-mirror.mjs",
+    "smoke:forced-compaction": "node scripts/smoke-forced-compaction.mjs",
     "smoke:todo-safety": "node scripts/smoke-todo-safety.mjs",
     "smoke:multi-process": "node scripts/multi-process-contract.mjs",
     "benchmark:behavior": "node scripts/behavior-benchmark.mjs",

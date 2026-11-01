@@ -50,6 +50,16 @@ function legacyHomeStateFilePath(env = process.env) {
 }
 const MAX_HISTORY_ENTRIES = 20
 const MAX_STALLED_COMPACTIONS = 2
+// Forced compaction (options.compactAtTokens). A request the host silently
+// dropped is given up on after this many finished steps in the same epoch.
+const FORCED_COMPACTION_RETRY_STEPS = 3
+// Failed requests before forcing stops until the next session.compacted.
+const FORCED_COMPACTION_MAX_FAILURES = 3
+// How long an idle pass waits on the host's message routes (cleanup), or on a
+// request still on its way out, before it carries on with the goal regardless.
+const FORCED_COMPACTION_HOST_DEADLINE_MS = 5000
+// New epochs that still start over the threshold before forcing is held.
+const FORCED_COMPACTION_MAX_STRIKES = 2
 // A stall brake (no progress, no tool calls, stalled compactions, format or
 // prompt failures) past its threshold no longer pauses the goal: it nudges the
 // model and doubles the continuation cooldown per strike past the threshold,
@@ -162,6 +172,9 @@ const DEFAULT_OPTIONS = {
   maxTokens: 100000000,
   contextWindowTokens: 0,
   minDelayMs: 1500,
+  // Context size at which the plugin forces a host compaction; 0 = never force.
+  // Independent of `contextWindowTokens`, which stays display-only.
+  compactAtTokens: 200000,
   promptRetryWakeMs: 5000,
   maxRecentMessages: 200,
   noProgressTokenThreshold: 50,
@@ -343,6 +356,8 @@ const GOAL_FLAG_SPECS = {
   // The context window size shown in the status (informational: it never stops
   // or nudges a goal). Accepts a k/m suffix like `--budget` does: `--context-window 400k`.
   "--context-window": { type: "tokens", optionKey: "contextWindowTokens" },
+  // `--compact-at 0` turns forced compaction off, so unlike the other token flags 0 is legal.
+  "--compact-at": { type: "tokens", optionKey: "compactAtTokens", allowZero: true },
   "--cooldown-ms": {
     optionKey: "minDelayMs",
     parse: (value, options) => toPositiveInteger(value, options.minDelayMs),
@@ -1275,6 +1290,7 @@ function formatStatus(
     `Auto-continues sent: ${formatTurnBudget(goal.turnCount, goal.options.maxTurns)}`,
     `Token spend: ${goalSpendTokens(goal).toLocaleString()}/${goal.options.maxTokens.toLocaleString()}`,
     `Context: ${formatContextBudget(goal)} (window: ${contextWindowSource(goal)})`,
+    `Forced compaction: ${formatCompactAt(goal)}`,
     formatUsage(goal.usage),
     `Elapsed: ${elapsed}s (${formatBudgetDuration(elapsedMs)}/${formatBudgetDuration(goal.options.maxDurationMs)})`,
     `Last progress: ${lastProgress}`,
@@ -1702,6 +1718,7 @@ function resetGoalBudget(goal) {
   goal.continuationClaim = null
   goal.compactionEpoch = 0
   goal.stalledCompactions = 0
+  goal.forcedCompaction = freshForcedCompaction()
   goal.lastCompactionEventID = ""
   goal.messageSeenSinceCompaction = true
   goal.compactionSourceAssistantMessageID = ""
@@ -1792,6 +1809,12 @@ function normalizeOptions(options = {}) {
       Number.isSafeInteger(options.contextWindowTokens) && options.contextWindowTokens >= 0
         ? options.contextWindowTokens
         : DEFAULT_OPTIONS.contextWindowTokens,
+    // 0 is kept verbatim: it means "never force a compaction". A record saved
+    // before this option existed has no key and falls back to the default.
+    compactAtTokens:
+      Number.isSafeInteger(options.compactAtTokens) && options.compactAtTokens >= 0
+        ? options.compactAtTokens
+        : DEFAULT_OPTIONS.compactAtTokens,
     minDelayMs: toPositiveInteger(options.minDelayMs, DEFAULT_OPTIONS.minDelayMs),
     promptRetryWakeMs: toPositiveInteger(options.promptRetryWakeMs, DEFAULT_OPTIONS.promptRetryWakeMs),
     maxRecentMessages: toPositiveInteger(
@@ -2099,6 +2122,10 @@ function normalizePersistedGoal(rawGoal) {
       typeof rawGoal.pendingAuditRejection === "string" ? rawGoal.pendingAuditRejection.slice(0, 400) : "",
     compactionEpoch: toNonNegativeInteger(rawGoal.compactionEpoch),
     stalledCompactions: toNonNegativeInteger(rawGoal.stalledCompactions),
+    forcedCompaction: normalizeForcedCompaction(
+      rawGoal.forcedCompaction,
+      toNonNegativeInteger(rawGoal.compactionEpoch),
+    ),
     lastCompactionEventID:
       typeof rawGoal.lastCompactionEventID === "string" &&
       rawGoal.lastCompactionEventID.length <= MAX_GOAL_META_LENGTH
@@ -2935,10 +2962,10 @@ function parseGoalArguments(args, defaults) {
       }
 
       if (flagSpec.type === "tokens") {
-        const budget = parseTokenBudget(rawValue)
+        const budget = flagSpec.allowZero && /^0+$/.test(String(rawValue).trim()) ? 0 : parseTokenBudget(rawValue)
         if (budget === null) {
           errors.push(
-            `Invalid token budget for ${flagName}: ${value} (use a positive number, optionally with a k or m suffix)`,
+            `Invalid token budget for ${flagName}: ${value} (use a positive number, ${flagSpec.allowZero ? "or 0 for off, " : ""}optionally with a k or m suffix)`,
           )
           continue
         }
@@ -3390,7 +3417,7 @@ function formatArgumentErrors(errors) {
     "Goal flags could not be parsed.",
     ...errors.map((error) => `- ${error}`),
     "",
-    "Supported flags: --max-turns, --max-minutes, --max-duration-ms, --max-tokens, --budget, --cooldown-ms, --no-progress-threshold, --no-progress-turns, --no-tool-turns, --success, --constraints, --mode, --objective.",
+    "Supported flags: --max-turns, --max-minutes, --max-duration-ms, --max-tokens, --budget, --compact-at, --cooldown-ms, --no-progress-threshold, --no-progress-turns, --no-tool-turns, --success, --constraints, --mode, --objective.",
     "You can pass them as `--flag value` or `--flag=value`. Quote multi-word values, e.g. --success \"tests pass and docs updated\".",
     "Flags are read only from the first line, or from the text before a `---` separator line. Everything after that is the goal body and is kept verbatim, so a pasted handoff containing --flags is never parsed.",
   ].join("\n")
@@ -3591,6 +3618,137 @@ function contextWindowSource(goal) {
     return `auto (host catalog: ${goal.modelKey || "unknown model"}; limit.input if set, else limit.context)`
   }
   return "unknown (the host reported no window)"
+}
+
+// Forced-compaction bookkeeping, persisted with the goal.
+// - pending: the request whose outcome is still unknown ({ id, epoch, steps,
+//   trigger: "step" | "idle", sourceAssistantMessageID }).
+// - requested: a plugin request may still land. It outlives `pending` because a
+//   request given up on can still be run by a later host loop, and that
+//   compaction is still not a stall.
+// - failures: unanswered requests since the last session.compacted.
+// - strikes/held/checkedEpoch: the ineffective-compaction guard.
+// - lastStepID: the host repeats message.updated for a finished message
+//   (step-finish, then time.completed), so one step is only ever judged once.
+// - cleanupDue: a failed request may still have its compaction message in the
+//   session; set until that cleanup has succeeded.
+// - hostGraceEpoch: compactionEpoch + 1 once a crossing step was left to the
+//   host's own overflow check, 0 when none was. A later compaction moves the
+//   epoch, which ends the grace by itself.
+function freshForcedCompaction(compactionEpoch = 0) {
+  return {
+    pending: null,
+    requested: false,
+    failures: 0,
+    strikes: 0,
+    held: false,
+    checkedEpoch: compactionEpoch,
+    lastStepID: "",
+    cleanupDue: false,
+    hostGraceEpoch: 0,
+  }
+}
+
+function normalizeForcedCompaction(raw, compactionEpoch = 0) {
+  const state = freshForcedCompaction(compactionEpoch)
+  if (!isPlainObject(raw)) return state
+  const boundedID = (value) =>
+    typeof value === "string" && value.length <= MAX_GOAL_META_LENGTH ? value : ""
+  const pending = raw.pending
+  if (
+    isPlainObject(pending) &&
+    boundedID(pending.id) &&
+    Number.isSafeInteger(pending.epoch) &&
+    pending.epoch >= 0 &&
+    (pending.trigger === "step" || pending.trigger === "idle")
+  ) {
+    state.pending = {
+      id: pending.id,
+      epoch: pending.epoch,
+      steps: toNonNegativeInteger(pending.steps),
+      trigger: pending.trigger,
+      sourceAssistantMessageID: boundedID(pending.sourceAssistantMessageID),
+    }
+  }
+  state.requested = raw.requested === true
+  state.failures = toNonNegativeInteger(raw.failures)
+  state.strikes = toNonNegativeInteger(raw.strikes)
+  state.held = raw.held === true
+  state.checkedEpoch = toNonNegativeInteger(raw.checkedEpoch, compactionEpoch)
+  state.lastStepID = boundedID(raw.lastStepID)
+  state.cleanupDue = raw.cleanupDue === true
+  state.hostGraceEpoch = toNonNegativeInteger(raw.hostGraceEpoch)
+  return state
+}
+
+function forcedCompactionState(goal) {
+  if (!isPlainObject(goal.forcedCompaction)) {
+    goal.forcedCompaction = freshForcedCompaction(toNonNegativeInteger(goal.compactionEpoch))
+  }
+  return goal.forcedCompaction
+}
+
+function forcedCompactionThreshold(goal) {
+  return toNonNegativeInteger(goal?.options?.compactAtTokens, DEFAULT_OPTIONS.compactAtTokens)
+}
+
+// May a new request be sent at all, whatever the current context size is?
+function forcedCompactionAllowed(goal) {
+  const state = forcedCompactionState(goal)
+  return (
+    forcedCompactionThreshold(goal) > 0 &&
+    !goal.stopped &&
+    !state.pending &&
+    !state.held &&
+    state.failures < FORCED_COMPACTION_MAX_FAILURES
+  )
+}
+
+// The host's ordering (message-v2.ts isAfter): creation time, then id.
+function messageIsAfter(info, other) {
+  const created = toNonNegativeInteger(info?.time?.created)
+  const otherCreated = toNonNegativeInteger(other?.time?.created)
+  if (created !== otherCreated) return created > otherCreated
+  return String(info?.id ?? "") > String(other?.id ?? "")
+}
+
+// The compaction messages a failed request left behind. The host's loop runs
+// every compaction part newer than the last finished assistant, and a failed
+// summary has no `finish`, so these would re-run instead of the goal's work on
+// every later prompt. A host compaction (`auto: true`) is the host's to manage,
+// and nothing at or before the last finished assistant is ever pending.
+function orphanedForcedCompactionMessageIDs(envelopes) {
+  let lastFinished
+  for (const { info } of envelopes) {
+    if (info?.role !== "assistant" || !info.finish) continue
+    if (!lastFinished || messageIsAfter(info, lastFinished)) lastFinished = info
+  }
+  return envelopes
+    .filter(
+      ({ info, parts }) =>
+        info?.role === "user" &&
+        typeof info.id === "string" &&
+        info.id &&
+        Array.isArray(parts) &&
+        parts.some((part) => part?.type === "compaction" && part.auto !== true) &&
+        (!lastFinished || messageIsAfter(info, lastFinished)),
+    )
+    .map(({ info }) => info.id)
+}
+
+// Settles with `promise`, or rejects at the deadline so no host call can hold up
+// the goal. A late rejection of `promise` stays handled by the race.
+function withinDeadline(promise, ms, label) {
+  let timer
+  const deadline = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms} ms`)), ms)
+  })
+  return Promise.race([promise, deadline]).finally(() => clearTimeout(timer))
+}
+
+function formatCompactAt(goal) {
+  const at = toNonNegativeInteger(goal?.options?.compactAtTokens, DEFAULT_OPTIONS.compactAtTokens)
+  return at > 0 ? `at ${at.toLocaleString()} tokens (--compact-at)` : "off (--compact-at 0)"
 }
 
 // `147,000/200,000`, or `147,000/∞` when no ceiling is known.
@@ -4485,6 +4643,7 @@ function buildGoalState(sessionID, condition, options, meta = {}, lastStatus = "
     pendingAuditRejection: "",
     compactionEpoch: 0,
     stalledCompactions: 0,
+    forcedCompaction: freshForcedCompaction(),
     lastCompactionEventID: "",
     messageSeenSinceCompaction: true,
     compactionSourceAssistantMessageID: "",
@@ -4588,6 +4747,12 @@ function buildAgentToolHandlers({
       return `Invalid maxTokens: ${args.maxTokens} — must be a positive integer.`
     if (Number.isFinite(args.contextWindowTokens) && args.contextWindowTokens <= 0)
       return `Invalid contextWindowTokens: ${args.contextWindowTokens} — must be a positive integer.`
+    if (
+      args.compactAtTokens !== undefined &&
+      args.compactAtTokens !== null &&
+      !(Number.isSafeInteger(args.compactAtTokens) && args.compactAtTokens >= 0)
+    )
+      return `Invalid compactAtTokens: ${args.compactAtTokens}: must be a non-negative integer (0 turns forced compaction off).`
     if (Number.isFinite(args.maxDurationMs) && args.maxDurationMs <= 0)
       return `Invalid maxDurationMs: ${args.maxDurationMs} — must be a positive number.`
     if (args.mode !== undefined && !GOAL_MODES.has(String(args.mode).toLowerCase()))
@@ -4599,6 +4764,7 @@ function buildAgentToolHandlers({
       ...(Number.isFinite(args.contextWindowTokens)
         ? { contextWindowTokens: args.contextWindowTokens }
         : {}),
+      ...(Number.isFinite(args.compactAtTokens) ? { compactAtTokens: args.compactAtTokens } : {}),
       ...(Number.isFinite(args.maxDurationMs) ? { maxDurationMs: args.maxDurationMs } : {}),
     })
     const meta = {
@@ -5266,12 +5432,13 @@ function buildAgentTools(
       description:
         "Set or replace the session goal. Call only when the user explicitly asks to set or pursue a goal. " +
         "maxTurns 0 means unlimited auto-continue turns, which is the default. maxTokens is the goal's " +
-        "cumulative token spend budget; contextWindowTokens is the window size shown in the status (informational: context never stops or nudges the goal, compaction handles it).",
+        "cumulative token spend budget; contextWindowTokens is the window size shown in the status (informational: context never stops or nudges the goal, compaction handles it). compactAtTokens is the context size at which the plugin forces a compaction (default 200000; 0 turns it off).",
       args: {
         objective: schema.string(),
         maxTurns: schema.number().optional(),
         maxTokens: schema.number().optional(),
         contextWindowTokens: schema.number().optional(),
+        compactAtTokens: schema.number().optional(),
         maxDurationMs: schema.number().optional(),
         successCriteria: schema.string().optional(),
         constraints: schema.string().optional(),
@@ -5374,12 +5541,13 @@ function buildAgentTools(
     }),
     set_goal: toolHelper({
       description:
-        "Set a new session goal for autonomous auto-continue. ONLY call this when the user explicitly asks you to set, define, or start working toward a goal — never decide to set a goal on your own. Replaces any existing goal. maxTurns 0 means unlimited auto-continue turns, which is the default. maxTokens is the goal's cumulative token spend budget; contextWindowTokens is the window size shown in the status (informational: context never stops or nudges the goal, compaction handles it).",
+        "Set a new session goal for autonomous auto-continue. ONLY call this when the user explicitly asks you to set, define, or start working toward a goal; never decide to set a goal on your own. Replaces any existing goal. maxTurns 0 means unlimited auto-continue turns, which is the default. maxTokens is the goal's cumulative token spend budget; contextWindowTokens is the window size shown in the status (informational: context never stops or nudges the goal, compaction handles it). compactAtTokens is the context size at which the plugin forces a compaction (default 200000; 0 turns it off).",
       args: {
         objective: schema.string(),
         maxTurns: schema.number().optional(),
         maxTokens: schema.number().optional(),
         contextWindowTokens: schema.number().optional(),
+        compactAtTokens: schema.number().optional(),
         maxDurationMs: schema.number().optional(),
         successCriteria: schema.string().optional(),
         constraints: schema.string().optional(),
@@ -7154,6 +7322,300 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
     goal.modelContextTokens = tokens
   }
 
+  // Is the host's own overflow check alive for this model? It is off at
+  // `limit.context === 0` (overflow.ts:27). Unknown reads as off, so a host whose
+  // catalog cannot be read still gets forced compaction on the crossing step.
+  const hostMayCompactModel = async (message) => {
+    try {
+      const providers = await withinDeadline(
+        providerCatalog(),
+        FORCED_COMPACTION_HOST_DEADLINE_MS,
+        "the model catalog",
+      )
+      const provider = providers.find(
+        (entry) => isPlainObject(entry) && entry.id === message.providerID,
+      )
+      const models = isPlainObject(provider?.models) ? provider.models : {}
+      return toNonNegativeInteger(models[message.modelID]?.limit?.context) > 0
+    } catch {
+      return false
+    }
+  }
+
+  const forcedCompactionLogged = new Set()
+  // Requests whose lease check and persist are still running, so their summarize
+  // has not been sent. In memory on purpose: a request read back after a restart
+  // may well have been sent.
+  const forcedCompactionSends = new Map()
+  const logForcedCompactionOnce = (goal, key, message, log = logPluginWarning) => {
+    const onceKey = `${goal.goalId}:${key}`
+    if (forcedCompactionLogged.has(onceKey)) return undefined
+    forcedCompactionLogged.add(onceKey)
+    return log(client, message)
+  }
+
+  // Counts one failed request and clears it. Never pauses: the goal keeps
+  // running and only the forcing stops once the cap is reached.
+  const recordForcedCompactionFailure = async (goal, reason) => {
+    const state = forcedCompactionState(goal)
+    state.pending = null
+    state.failures += 1
+    pushHistory(
+      goal,
+      "forced-compaction",
+      `Forced compaction did not land (${reason}); failure ${state.failures}/${FORCED_COMPACTION_MAX_FAILURES}.`,
+    )
+    if (state.failures === FORCED_COMPACTION_MAX_FAILURES) {
+      const message = `Forced compaction failed ${state.failures} times; not forcing again until the next compaction. The goal continues.`
+      pushHistory(goal, "forced-compaction", message)
+      await logPluginWarning(client, message)
+    }
+  }
+
+  // A failed request's compaction message would re-run in place of the goal's
+  // work (see orphanedForcedCompactionMessageIDs), so it goes before the goal
+  // continues. Bounded and fail-soft: on any failure the goal still continues and
+  // cleanupDue brings it back at the next idle. Only called at an idle pass: the
+  // host refuses this route while the session is busy.
+  const deleteOrphanedForcedCompactions = async (goal) => {
+    const sessionID = goal.sessionID
+    const state = forcedCompactionState(goal)
+    let expired = false
+    const cleanup = async () => {
+      if (!(await leaseStillHeldForPrompt(sessionID))) return
+      const messages = await sessionApi.messages(sessionID, {
+        limit: goal.options.maxRecentMessages,
+      })
+      // The SDK resolves an HTTP error as `{ error }`: that is no empty session.
+      if (!Array.isArray(messages)) throw new Error("the host listed no messages")
+      for (const id of orphanedForcedCompactionMessageIDs(messages)) {
+        if (expired) return
+        await sessionApi.deleteMessage(sessionID, id)
+      }
+      if (!expired) state.cleanupDue = false
+    }
+    try {
+      await withinDeadline(cleanup(), FORCED_COMPACTION_HOST_DEADLINE_MS, "the cleanup")
+    } catch (error) {
+      expired = true
+      await logForcedCompactionOnce(
+        goal,
+        "cleanup",
+        `Could not delete a failed forced compaction request: ${error?.message || error}. The goal continues; retrying at the next idle.`,
+      )
+    }
+  }
+
+  // An idle request returned without continuing, so nothing else drives the goal
+  // if the host never starts on it. A synthesized idle reaches the outcome check,
+  // which counts the failure and continues. It waits a tick so the pass that sent
+  // the request has let go of the per-session guard, and it is only sent while
+  // the request is still open and the host still reports the session as idle.
+  const wakeForOpenForcedCompaction = (sessionID, requestID, delayMs = 0) => {
+    const timer = setTimeout(
+      bindRuntime(runtime, async () => {
+        const goal = goalStates.get(sessionID)
+        if (
+          !goal ||
+          goal.stopped ||
+          forcedCompactionState(goal).pending?.id !== requestID ||
+          currentRuntime().sessionStatuses.get(sessionID) !== "idle"
+        ) {
+          return
+        }
+        try {
+          await hooks.event({ event: { type: "session.idle", properties: { sessionID } } })
+        } catch (error) {
+          await logPluginError(client, "Forced compaction wake failed", error)
+        }
+      }),
+      delayMs,
+    )
+    timer.unref?.()
+  }
+
+  // Asks the host to compact. Returns true only if the request was sent. The
+  // host's response arrives when the WHOLE run ends, so it is never awaited and
+  // never read as success: only session.compacted proves that.
+  const requestForcedCompaction = async (
+    goal,
+    assistantMessage,
+    { trigger, sourceAssistantMessageID = "" },
+  ) => {
+    const sessionID = goal.sessionID
+    if (typeof client?.session?.summarize !== "function") {
+      await logForcedCompactionOnce(
+        goal,
+        "method",
+        "Forced compaction skipped: this host has no session.summarize.",
+        logPluginDebug,
+      )
+      return false
+    }
+    const info = isPlainObject(assistantMessage?.info) ? assistantMessage.info : assistantMessage
+    const providerID = typeof info?.providerID === "string" ? info.providerID : ""
+    const modelID = typeof info?.modelID === "string" ? info.modelID : ""
+    if (!providerID || !modelID) {
+      await logForcedCompactionOnce(
+        goal,
+        "ids",
+        "Forced compaction skipped: the latest assistant message names no provider and model.",
+      )
+      return false
+    }
+
+    // Taken before the first await: a re-delivered event must see it.
+    const state = forcedCompactionState(goal)
+    const request = {
+      id: randomUUID(),
+      epoch: goal.compactionEpoch,
+      steps: 0,
+      trigger,
+      sourceAssistantMessageID,
+    }
+    const previousRequested = state.requested
+    const previousClaim = goal.continuationClaim
+    state.pending = request
+    state.requested = true
+    const rollback = () => {
+      const current = forcedCompactionState(goal)
+      if (current.pending !== request) return
+      current.pending = null
+      current.requested = previousRequested
+      if (trigger === "idle") goal.continuationClaim = previousClaim
+    }
+    const stillWanted = () =>
+      goalStates.get(sessionID) === goal &&
+      !goal.stopped &&
+      goal.compactionEpoch === request.epoch &&
+      forcedCompactionState(goal).pending === request
+
+    const sending = (async () => {
+      if (!(await leaseStillHeldForPrompt(sessionID)) || !stillWanted()) {
+        rollback()
+        return false
+      }
+      // An idle request must not leave its source claim behind, or the claim
+      // dedupe would refuse the continuation after a failed compaction.
+      if (trigger === "idle") goal.continuationClaim = null
+      pushHistory(
+        goal,
+        "forced-compaction",
+        `Forced compaction requested at ${currentContextTokens(goal).toLocaleString()} tokens (threshold ${forcedCompactionThreshold(goal).toLocaleString()}).`,
+      )
+      const persisted = await persist(sessionID)
+      if ((!persisted && persistenceOptions.persistState) || !stillWanted()) {
+        rollback()
+        return false
+      }
+
+      let call
+      try {
+        call = sessionApi.summarize(sessionID, { providerID, modelID })
+      } catch (error) {
+        forcedCompactionState(goal).requested = false
+        await recordForcedCompactionFailure(goal, error?.message || String(error))
+        await persist(sessionID)
+        await logPluginWarning(client, `Forced compaction request failed: ${error?.message || error}`)
+        return false
+      }
+      // The result never decides anything. Rejecting means nothing will land, and
+      // resolving with the request still open means the host answered without
+      // compacting (the SDK resolves an HTTP error as `{ error }`); in both the
+      // request stays open for the next idle, which counts the failure.
+      Promise.resolve(call).then(
+        () => wakeForOpenForcedCompaction(sessionID, request.id),
+        (error) => {
+          const liveGoal = goalStates.get(sessionID)
+          if (liveGoal && forcedCompactionState(liveGoal).pending?.id === request.id) {
+            forcedCompactionState(liveGoal).requested = false
+          }
+          wakeForOpenForcedCompaction(sessionID, request.id)
+          return logPluginWarning(
+            client,
+            `Forced compaction request failed: ${error?.message || error}`,
+          )
+        },
+      ).catch((error) => logPluginError(client, "Forced compaction bookkeeping failed", error))
+      // The host flips the session to busy within milliseconds of accepting the
+      // request. Still idle after this long means it never started.
+      if (trigger === "idle") {
+        wakeForOpenForcedCompaction(sessionID, request.id, goal.options.promptRetryWakeMs)
+      }
+      return true
+    })()
+    // Set before anything else can run: the async body stops at its first await.
+    forcedCompactionSends.set(request.id, sending)
+    try {
+      return await sending
+    } finally {
+      forcedCompactionSends.delete(request.id)
+    }
+  }
+
+  // Trigger A, on every finished assistant step. The host only checks for a
+  // pending compaction between steps and a single turn can cross the threshold
+  // anywhere in up to 100+ steps, so this is the primary trigger.
+  const forceCompactionOnFinishedStep = async (goal, message, messageEnvelope, currentTokens) => {
+    const threshold = forcedCompactionThreshold(goal)
+    if (
+      threshold <= 0 ||
+      goal.stopped ||
+      messageRole(message) !== "assistant" ||
+      !message.finish ||
+      // A summary carries the full pre-compaction tokens.
+      isCompactionAssistantMessage(message) ||
+      isCompactionAssistantMessage(messageEnvelope) ||
+      // A step that failed before reporting usage says nothing about the context.
+      currentTokens <= 0
+    ) {
+      return false
+    }
+    const state = forcedCompactionState(goal)
+    const stepID = messageID(message)
+    if (state.lastStepID === stepID) return false
+    state.lastStepID = stepID
+
+    if (currentTokens < threshold) {
+      state.strikes = 0
+      state.held = false
+      state.hostGraceEpoch = 0
+    } else if (state.checkedEpoch !== goal.compactionEpoch) {
+      state.strikes += 1
+      if (state.strikes >= FORCED_COMPACTION_MAX_STRIKES && !state.held) {
+        state.held = true
+        const detail = `Forced compaction is not lowering the context (${currentTokens.toLocaleString()} tokens right after compacting); holding until a step is below ${threshold.toLocaleString()}.`
+        pushHistory(goal, "forced-compaction", detail)
+        await logPluginWarning(client, detail)
+      }
+    }
+    state.checkedEpoch = goal.compactionEpoch
+
+    if (state.pending) {
+      state.pending.steps += 1
+      // The host's narrow race: a loop that already read its messages finishes
+      // an assistant newer than the compaction message, which drops the task.
+      if (state.pending.steps < FORCED_COMPACTION_RETRY_STEPS) return true
+      await recordForcedCompactionFailure(
+        goal,
+        `no compaction after ${state.pending.steps} steps`,
+      )
+    }
+    if (currentTokens >= threshold && forcedCompactionAllowed(goal)) {
+      // A step that crosses the host's threshold too would compact twice: the
+      // host starts its own compaction right after this step, and it does not
+      // dedupe against ours. So a model whose overflow check is alive gets one
+      // step to do that. If the next step is still over, the host passed.
+      const graceEpoch = goal.compactionEpoch + 1
+      if (state.hostGraceEpoch !== graceEpoch && (await hostMayCompactModel(message))) {
+        state.hostGraceEpoch = graceEpoch
+        return true
+      }
+      await requestForcedCompaction(goal, message, { trigger: "step" })
+    }
+    return true
+  }
+
   // With noContinueWhileChildrenActive, auto-continue is deferred while any
   // child session (subagent, background task) is still active, so the goal
   // loop does not prompt the orchestrator over work a child is already doing.
@@ -8482,12 +8944,25 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         }
         goal.messageSeenSinceCompaction = false
 
+        // Past the redelivery checks, so a replayed event consumes nothing.
+        const forced = forcedCompactionState(goal)
+        const pluginRequested = forced.requested
+        // An idle request gave up its claim, but the turn it was made from has
+        // been scored already, exactly like a claimed source.
+        const forcedSource =
+          forced.pending?.trigger === "idle" ? forced.pending.sourceAssistantMessageID : ""
+        forced.pending = null
+        forced.requested = false
+        forced.failures = 0
+        forced.cleanupDue = false
+
         goal.compactionEpoch += 1
-        goal.stalledCompactions += 1
+        // A compaction the plugin asked for says nothing about a stalled model.
+        if (!pluginRequested) goal.stalledCompactions += 1
         goal.compactionSourceAssistantMessageID =
           goal.continuationClaim?.runId === goal.runId
             ? goal.continuationClaim.sourceAssistantMessageID
-            : ""
+            : forcedSource
         goal.messageIDs = new Set()
         goal.peakContextTokens = 0
         goal.latestContextTokens = 0
@@ -8508,7 +8983,7 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
         // stays active, the next continuation carries a stall nudge (read from
         // stalledCompactions by buildContinueMessage) and the cooldown backs
         // off per extra stalled compaction. Budget limits remain the backstop.
-        if (goal.stalledCompactions >= MAX_STALLED_COMPACTIONS) {
+        if (!pluginRequested && goal.stalledCompactions >= MAX_STALLED_COMPACTIONS) {
           goal.lastStatus = `${goal.stalledCompactions} compactions without a productive assistant or tool turn; continuing with a stall nudge and backoff.`
           pushHistory(
             goal,
@@ -8657,6 +9132,10 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
           changed = true
         }
 
+        if (await forceCompactionOnFinishedStep(goal, message, messageEnvelope, currentTokens)) {
+          changed = true
+        }
+
         if (changed) await persist(messageSessionID(message))
         return
       }
@@ -8786,6 +9265,63 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
 
         const latestAssistant = findLatestAssistantMessage(messages)
         const latestAssistantID = messageID(latestAssistant)
+        // The outcome of a forced compaction. The host publishes session.compacted
+        // inside its compaction step, before the loop exits and the session goes
+        // idle, so an idle in the requesting epoch means none landed. A child wake
+        // can get here while this session is busy: that is no outcome at all.
+        let forcedCompactionJustFailed = false
+        const openForcedCompaction = forcedCompactionState(activeGoalAfterMessages).pending
+        const openForcedCompactionSend =
+          openForcedCompaction && forcedCompactionSends.get(openForcedCompaction.id)
+        if (
+          openForcedCompactionSend &&
+          currentRuntime().sessionStatuses.get(sessionID) === "idle"
+        ) {
+          // The turn ended while its last step's request was still on its way out:
+          // nothing was sent, so nothing failed. See how the send ends. Sent means
+          // the compaction drives the next idle, and the wake covers a host that
+          // never starts on it. Dropped, or still stuck at the deadline, means this
+          // pass continues the goal.
+          await withinDeadline(
+            openForcedCompactionSend,
+            FORCED_COMPACTION_HOST_DEADLINE_MS,
+            "the forced compaction request",
+          ).catch(() => {})
+          if (
+            forcedCompactionState(activeGoalAfterMessages).pending === openForcedCompaction &&
+            !forcedCompactionSends.has(openForcedCompaction.id)
+          ) {
+            wakeForOpenForcedCompaction(
+              sessionID,
+              openForcedCompaction.id,
+              activeGoalAfterMessages.options.promptRetryWakeMs,
+            )
+            return
+          }
+        } else if (
+          openForcedCompaction &&
+          currentRuntime().sessionStatuses.get(sessionID) === "idle"
+        ) {
+          forcedCompactionJustFailed = true
+          // The same turn the idle request already scored: this pass must not
+          // charge the stall gates for it a second time.
+          if (
+            openForcedCompaction.trigger === "idle" &&
+            openForcedCompaction.sourceAssistantMessageID === latestAssistantID
+          ) {
+            childWakeEvent = true
+          }
+          await recordForcedCompactionFailure(activeGoalAfterMessages, "session went idle")
+          forcedCompactionState(activeGoalAfterMessages).cleanupDue = true
+          await persist(sessionID)
+        }
+        if (
+          forcedCompactionState(activeGoalAfterMessages).cleanupDue &&
+          currentRuntime().sessionStatuses.get(sessionID) === "idle"
+        ) {
+          await deleteOrphanedForcedCompactions(activeGoalAfterMessages)
+          if (!forcedCompactionState(activeGoalAfterMessages).cleanupDue) await persist(sessionID)
+        }
         // Every assistant message OpenCode produced in answer to this one
         // prompt (see assistantMessagesForTurn). The stall brakes and the
         // terminal markers below judge the WHOLE turn: a turn that ran tools and
@@ -9409,6 +9945,27 @@ async function createGoalPlugin({ client, directory } = {}, pluginOptions = {}) 
             expectedState: "paused",
             expectedStopReason: wrapupStopReason,
           })
+        }
+
+        // Trigger B, the backstop for a turn that ended over the threshold with
+        // no request sent from its steps. The session goes idle again after the
+        // compaction, whichever way it ends, and that idle continues the goal. A
+        // rejected completion or blocker is not parked behind it: that feedback
+        // goes out now, and Trigger A picks the compaction up on the next step.
+        if (
+          !budgetWrapup &&
+          !forcedCompactionJustFailed &&
+          !completionUnverified &&
+          !blockerUnstated &&
+          forcedCompactionAllowed(activeGoalBeforePrompt) &&
+          currentContextTokens(activeGoalBeforePrompt) >=
+            forcedCompactionThreshold(activeGoalBeforePrompt) &&
+          (await requestForcedCompaction(activeGoalBeforePrompt, latestAssistant, {
+            trigger: "idle",
+            sourceAssistantMessageID: latestAssistantID,
+          }))
+        ) {
+          return
         }
 
         activeGoalBeforePrompt.turnCount += 1

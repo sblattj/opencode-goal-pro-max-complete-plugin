@@ -6541,9 +6541,10 @@ test("stall strikes past a threshold back the continuation cooldown off exponent
   assert.equal(goal.formatFailures, 4)
   // Before turn k the cooldown is 40 * 2^(formatFailures past the cap):
   // 80 ms, 160 ms, then 320 ms.
-  assert.ok(stamps[1] - stamps[0] >= 80, `first backed-off gap ${stamps[1] - stamps[0]} ms`)
-  assert.ok(stamps[2] - stamps[1] >= 160, `second backed-off gap ${stamps[2] - stamps[1]} ms`)
-  assert.ok(stamps[3] - stamps[2] >= 320, `third backed-off gap ${stamps[3] - stamps[2]} ms`)
+  // A timer can land a millisecond or two short of its delay against Date.now.
+  assert.ok(stamps[1] - stamps[0] >= 78, `first backed-off gap ${stamps[1] - stamps[0]} ms`)
+  assert.ok(stamps[2] - stamps[1] >= 158, `second backed-off gap ${stamps[2] - stamps[1]} ms`)
+  assert.ok(stamps[3] - stamps[2] >= 318, `third backed-off gap ${stamps[3] - stamps[2]} ms`)
 })
 
 test("formatFailures resets to zero when the model produces a valid response", async () => {
@@ -16875,4 +16876,103 @@ test("the displayed window is limit.input when the model sets it, as OpenCode's 
   const goal = currentGoal(session)
   assert.equal(goal.modelContextTokens, 128_000)
   assert.equal(goal.stopped, false)
+})
+
+test("--compact-at accepts k/m values and 0 (off), defaults to 200000, and rejects garbage", () => {
+  const parse = (text) => parseGoalArguments(text, normalizeOptions())
+  assert.equal(parse("ship it --compact-at 150k").options.compactAtTokens, 150_000)
+  assert.equal(parse("ship it --compact-at=1m").options.compactAtTokens, 1_000_000)
+  assert.equal(parse("ship it --compact-at 0").options.compactAtTokens, 0)
+  assert.deepEqual(parse("ship it --compact-at 0").errors, [])
+  assert.equal(parse("ship it").options.compactAtTokens, 200_000)
+  // It is independent of the display-only window.
+  const both = parse("ship it --compact-at 150k --context-window 400k")
+  assert.equal(both.options.compactAtTokens, 150_000)
+  assert.equal(both.options.contextWindowTokens, 400_000)
+  for (const bad of ["banana", "-5", "1.5.2"]) {
+    const result = parse(`ship it --compact-at ${bad}`)
+    assert.equal(result.errors.length, 1, bad)
+    assert.match(result.errors[0], /^Invalid token budget for --compact-at: /)
+    assert.equal(result.options.compactAtTokens, 200_000, "a bad value leaves the default")
+  }
+  // Control: every other tokens flag still rejects 0.
+  assert.deepEqual(parse("ship it --context-window 0").errors, [
+    "Invalid token budget for --context-window: 0 (use a positive number, optionally with a k or m suffix)",
+  ])
+  assert.equal(parse("ship it --budget 0").errors.length, 1)
+})
+
+test("goal_set accepts compactAtTokens 0, rejects negatives and fractions", async () => {
+  const schema = {
+    string: () => ({ optional: () => "str?" }),
+    number: () => ({ optional: () => "num?" }),
+    array: () => ({ optional: () => "array?" }),
+    object: () => "object",
+    enum: () => ({ optional: () => "enum?" }),
+  }
+  const toolHelper = (definition) => definition
+  toolHelper.schema = schema
+  const { handlers } = makeAgentHandlers()
+  const tools = buildAgentTools(toolHelper, handlers)
+  assert.equal(tools.goal_set.args.compactAtTokens, "num?")
+  assert.equal(tools.set_goal.args.compactAtTokens, "num?")
+
+  const off = { sessionID: "compact-at-off" }
+  await tools.goal_set.execute({ objective: "ship it", compactAtTokens: 0 }, off)
+  assert.equal(currentGoal(off.sessionID).options.compactAtTokens, 0)
+
+  const set = { sessionID: "compact-at-set" }
+  await tools.goal_set.execute({ objective: "ship it", compactAtTokens: 150_000 }, set)
+  assert.equal(currentGoal(set.sessionID).options.compactAtTokens, 150_000)
+
+  const dflt = { sessionID: "compact-at-default" }
+  await tools.goal_set.execute({ objective: "ship it" }, dflt)
+  assert.equal(currentGoal(dflt.sessionID).options.compactAtTokens, 200_000)
+
+  for (const bad of [-1, 1.5]) {
+    const context = { sessionID: `compact-at-bad-${bad}` }
+    const result = await tools.goal_set.execute({ objective: "ship it", compactAtTokens: bad }, context)
+    assert.match(String(result), new RegExp(`Invalid compactAtTokens: ${bad}`))
+    assert.equal(currentGoal(context.sessionID), null)
+  }
+})
+
+test("a goal persisted by v1.4.1 (no compactAtTokens key) reloads at 200000; 0 survives a reload", () => {
+  const legacyOptions = { maxTurns: 0, maxDurationMs: 60_000, maxTokens: 1_000_000, contextWindowTokens: 0 }
+  assert.equal("compactAtTokens" in legacyOptions, false)
+  const legacy = normalizePersistedGoal({
+    sessionID: "legacy-compact",
+    condition: "ship it",
+    startedAt: Date.now(),
+    options: legacyOptions,
+  })
+  assert.equal(legacy.options.compactAtTokens, 200_000)
+  // Control: an explicit 0 and an explicit value are kept verbatim.
+  const mk = (compactAtTokens) =>
+    normalizePersistedGoal({
+      sessionID: "x",
+      condition: "ship it",
+      startedAt: Date.now(),
+      options: { ...legacyOptions, compactAtTokens },
+    })
+  assert.equal(mk(0).options.compactAtTokens, 0)
+  assert.equal(mk(150_000).options.compactAtTokens, 150_000)
+  assert.equal(mk(-3).options.compactAtTokens, 200_000)
+})
+
+test("/goal status shows the forced-compaction threshold, and the off wording at 0", () => {
+  const goal = (compactAtTokens) => ({
+    condition: "ship it",
+    startedAt: Date.now() - 1000,
+    lastProgressAt: Date.now(),
+    turnCount: 1,
+    noProgressTurns: 0,
+    lastStatus: "working",
+    usage: spentUsage(10),
+    options: normalizeOptions({ compactAtTokens }),
+  })
+  assert.match(formatStatus(goal(150_000)), /Forced compaction: at 150,000 tokens \(--compact-at\)/)
+  assert.match(formatStatus(goal(undefined)), /Forced compaction: at 200,000 tokens/)
+  assert.match(formatStatus(goal(0)), /Forced compaction: off \(--compact-at 0\)/)
+  assert.doesNotMatch(formatStatus(goal(0)), /at 0 tokens/)
 })
