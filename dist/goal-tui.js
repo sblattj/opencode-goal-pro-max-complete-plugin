@@ -374,11 +374,11 @@ var goal_tui_default = {
   tui
 };
 export {
-  GOAL_PANEL_PAYLOAD_VERSION,
-  GOAL_PANEL_TITLE,
-  createGoalSidebar,
-  goal_tui_default as default,
-  formatPanelTokens,
+  tui,
   goalPanelModel,
-  tui
+  formatPanelTokens,
+  goal_tui_default as default,
+  createGoalSidebar,
+  GOAL_PANEL_TITLE,
+  GOAL_PANEL_PAYLOAD_VERSION
 };

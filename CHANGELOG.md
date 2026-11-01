@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.5.1 - 2026-11-01
+
+- **Fixed: the v1.5.0 bundles were built from a stale install.** `dist/` carried `zod` 4.4.3 instead of the lockfile's 4.6.7, which undid the 1.4.1 security update (GHSA-mrhx-c7xc-m3w5, high), and used the wrong Bun version. Rebuilt from a clean `npm ci` with the pinned Bun 1.3.14. No other change; use this instead of v1.5.0.
+
 ## 1.5.0 - 2026-11-01
 
 - **Added: forced compaction for goal sessions, on by default at 200,000 tokens.** OpenCode never auto-compacts a model that reports `limit.context: 0` (checked against OpenCode v1.19.5 `session/overflow.ts`), so a long goal on such a model grew without limit: one session reached 638,078 tokens. The plugin now asks the host to compact once a finished step crosses the threshold, and the goal keeps working afterwards.
