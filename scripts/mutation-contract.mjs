@@ -303,7 +303,7 @@ const mutants = [
     name: "bounded owner records tolerate legal short reads",
     file: "src/persistence-lease.js",
     from: "  while (bytesReadTotal < buffer.length) {",
-    to: "  if (bytesReadTotal < buffer.length) {",
+    to: "  for (let once = true; once && bytesReadTotal < buffer.length; once = false) {",
     test: "test/persistence-lease.test.js",
   },
   {
@@ -1271,9 +1271,10 @@ try {
 
   // `process.execPath` is the Bun binary this script runs under, so `bun test`
   // is the same runner the repository's own test script uses. Bun prints its
-  // "N pass" / "N fail" summary on stderr.
+  // "N pass" / "N fail" summary on stderr. --bail stops at the first failing test:
+  // without it a mutant that hangs costs the full timeout once per test in the file.
   const runTestFile = (file) =>
-    spawnSync(process.execPath, ["test", "--timeout", "30000", `./${file}`], { cwd: root, encoding: "utf8" })
+    spawnSync(process.execPath, ["test", "--bail", "--timeout", "30000", `./${file}`], { cwd: root, encoding: "utf8" })
 
   const baselineTests = [...new Set(mutants.map(({ test }) => test))]
   for (const testFile of baselineTests) {
@@ -1307,7 +1308,7 @@ try {
     // Killed means a test assertion failed, not that the command line was bad.
     assert.match(
       result.stderr,
-      /^\s*[1-9]\d* fail$/m,
+      /^\(fail\) /m,
       `${mutant.name}: non-zero exit without a failing test (usage error?)\n${result.stdout}\n${result.stderr}`,
     )
     await writeFile(path, original)

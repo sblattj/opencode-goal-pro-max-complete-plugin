@@ -11,6 +11,7 @@ Contributor-facing only; the shipped `src/` and `dist/` are unchanged (`dist/goa
 - **Packed-package contracts survive `bun run`.** Under `bun run`, `npm_execpath` is the Bun binary, so the four contracts that shell out to npm now only trust an `npm-cli.js` path and otherwise fall back to `npm` on `PATH`.
 - **Audit:** `bun audit --prod --audit-level=high` replaces `npm audit --omit=dev --audit-level=high`.
 - **Windows is not supported.** The Windows CI job is gone and the docs now say so. Windows code paths in `src/` are unchanged.
+- **Mutation contract:** a mutant only counts as killed when a test really fails, and runs stop at the first failure. One old mutant never compiled, so it tested nothing; it now does.
 
 ## 1.5.1 - 2026-11-01
 
