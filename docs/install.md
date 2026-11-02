@@ -23,6 +23,11 @@ From a clone of this repository:
 node scripts/cli.mjs install
 ```
 
+The installer needs **Node 18 or newer** (that is all `npx` requires; no Bun
+needed). The plugin itself is loaded and run by OpenCode, not by your Node.
+Contributors building from a clone use Bun 1.3.14 for dependencies and tests: see
+[CONTRIBUTING.md](../CONTRIBUTING.md).
+
 Then **restart opencode**. The installer never calls a model and makes no
 network call of its own — `npx` fetches the package, and after that everything
 is local file copying.

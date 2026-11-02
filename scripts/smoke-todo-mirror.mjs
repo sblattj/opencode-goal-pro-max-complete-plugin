@@ -5,11 +5,11 @@
 // permission check and the real SQLite write. Nothing here is faked except the
 // model, which is a mock OpenAI-compatible endpoint on localhost.
 //
-// Requires the `opencode` binary on PATH and a bundled `dist/` (`npm run bundle`)
+// Requires the `opencode` binary on PATH and a bundled `dist/` (`bun run bundle`)
 // — the installer copies `dist/`, so a stale bundle smokes the OLD code. It is
 // deliberately NOT part of `release:check`: the binary is not a dev dependency.
 //
-// Usage: npm run smoke:todo-mirror
+// Usage: bun run smoke:todo-mirror
 //
 // Arms:
 //   A  mirrorTodos default ("plan")   -> the plan is redrawn over a divergent list
@@ -377,12 +377,12 @@ async function main() {
     stat(path.join(repoRoot, "dist", "goal-plugin.js")).catch(() => null),
   ])
   if (!bundleStat) {
-    console.error("FAIL  dist/goal-plugin.js is missing; run `npm run bundle` first")
+    console.error("FAIL  dist/goal-plugin.js is missing; run `bun run bundle` first")
     process.exitCode = 1
     return
   }
   if (bundleStat.mtimeMs < sourceStat.mtimeMs) {
-    console.error("FAIL  dist/goal-plugin.js is older than src/goal-plugin.js; run `npm run bundle` first")
+    console.error("FAIL  dist/goal-plugin.js is older than src/goal-plugin.js; run `bun run bundle` first")
     process.exitCode = 1
     return
   }
@@ -391,7 +391,7 @@ async function main() {
   // v1.0.0. A bundle that cannot produce the suffix cannot mirror.
   const bundle = await readFile(path.join(repoRoot, "dist", "goal-plugin.js"), "utf8")
   if (!bundle.includes(EVIDENCE_SUFFIX)) {
-    console.error("FAIL  dist/goal-plugin.js carries no todo-mirror code; run `npm run bundle` first")
+    console.error("FAIL  dist/goal-plugin.js carries no todo-mirror code; run `bun run bundle` first")
     process.exitCode = 1
     return
   }

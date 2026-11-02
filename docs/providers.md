@@ -83,7 +83,7 @@ require any provider-specific configuration.
 ## Testing a new model
 
 No LLM call is required to verify the plugin loads correctly — run
-`npm run verify` first. To check marker compliance and hook behavior for a
+`bun run verify` first. To check marker compliance and hook behavior for a
 specific provider/model:
 
 1. Point an OpenCode config at the plugin (see

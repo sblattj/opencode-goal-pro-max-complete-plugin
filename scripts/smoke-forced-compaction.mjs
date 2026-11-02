@@ -6,11 +6,11 @@
 // rows. Nothing is faked except the model, a mock OpenAI-compatible endpoint on
 // localhost, so no real model is called and no tokens are spent.
 //
-// Requires `~/.opencode/bin/opencode` and a bundled `dist/` (`npm run bundle`):
+// Requires `~/.opencode/bin/opencode` and a bundled `dist/` (`bun run bundle`):
 // the installer copies `dist/`, so a stale bundle smokes the OLD code. Not part
 // of `release:check`: the binary is not a dev dependency.
 //
-// Usage: npm run smoke:forced-compaction
+// Usage: bun run smoke:forced-compaction
 //
 // Every model has `limit: { context: 0 }` (arm D excepted). That is the real case
 // the feature exists for: host overflow.ts `isOverflow` returns false on it, so
@@ -1031,7 +1031,7 @@ async function main() {
   // make every arm below a claim about an older build.
   const bundlePath = path.join(repoRoot, "dist", "goal-plugin.js")
   if (!existsSync(bundlePath) || !readFileSync(bundlePath, "utf8").includes("Forced compaction requested")) {
-    console.log("FAIL  dist/goal-plugin.js has no forced compaction code; run `npm run bundle` first")
+    console.log("FAIL  dist/goal-plugin.js has no forced compaction code; run `bun run bundle` first")
     process.exitCode = 1
     return
   }

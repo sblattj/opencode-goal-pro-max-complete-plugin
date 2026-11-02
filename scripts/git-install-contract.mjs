@@ -99,7 +99,7 @@ try {
       sha(committed),
       sha(fresh),
       `${target.file} is stale: it does not match a fresh bundle of ${target.source}. ` +
-        'Run "npm run bundle" and commit the result — nothing rebuilds it at install time.',
+        'Install with Bun 1.3.14 (bun install --frozen-lockfile), run "bun run bundle" and commit the result. Nothing rebuilds it at install time.',
     )
   }
 

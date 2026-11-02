@@ -7,9 +7,9 @@ artifact after all checks pass.
 ## Prepare
 
 1. Start from a clean branch based on `main`.
-2. Update the version in `package.json` and `package-lock.json` together.
+2. Update the version in `package.json` (and nothing else: `bun.lock` carries no package version).
 3. Move relevant entries from `Unreleased` into a dated changelog section.
-4. Run `npm ci` followed by `npm run release:check`.
+4. Use Bun 1.3.14 exactly. Run `bun install --frozen-lockfile` from a clean `node_modules`, then `bun run release:check`. Never build `dist/` from a stale install: v1.5.0 shipped a wrong `zod` that way.
 5. Inspect `npm pack --json` and the generated tarball before publishing.
 
 `release:check` runs the unit and coverage suites, consumer type compilation,

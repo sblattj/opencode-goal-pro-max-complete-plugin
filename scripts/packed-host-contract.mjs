@@ -20,7 +20,8 @@ const cacheDirectory = join(root, "npm-cache")
 const npmEnvironment = { ...process.env, npm_config_cache: cacheDirectory }
 
 function execNpm(args, options) {
-  if (process.env.npm_execpath) {
+  // Under `bun run`, npm_execpath is the Bun binary, not npm: only trust an npm CLI script.
+  if (/(^|[\\/])npm-cli\.js$/.test(process.env.npm_execpath ?? "")) {
     return execFileSync(process.execPath, [process.env.npm_execpath, ...args], options)
   }
   if (process.platform === "win32") {

@@ -15,11 +15,14 @@ The latest published release is the supported line. Public compatibility covers:
   single-writer protection retained per session and passive goal behavior for
   a same-session process that does not own the lease
 
-The package requires Node.js 18 or newer and OpenCode 1.17.15 or newer, covering
-both the 1.x line and the 2.x line (`engines.opencode` is `>=1.17.15 <3`; the
-OpenCode 2 caveats are documented in the section below). CI runs the complete
-unit suite on Node 18, 20, 22, and
-24. Installed-package contracts compile TypeScript consumers using both NodeNext
+The package requires Node.js 18 or newer for the `npx` install and OpenCode
+1.17.15 or newer, covering both the 1.x line and the 2.x line (`engines.opencode`
+is `>=1.17.15 <3`; the OpenCode 2 caveats are documented in the section below).
+The plugin itself runs inside OpenCode, not under your Node. CI runs the complete
+unit suite under Bun 1.3.14 (the contributor runtime), and runs the installer
+tests and the packed-package contracts on Node 18, the `engines` floor, because
+that is the `npx` path. There is no Node 20, 22 or 24 matrix on the unit suite.
+Installed-package contracts compile TypeScript consumers using both NodeNext
 and Bundler resolution and require a clean npm-tarball install to expose the
 default agent-tool surface without a separately installed OpenCode helper package.
 
@@ -122,7 +125,7 @@ hardcoded switch rather than a slot lookup — so nothing in this package can *r
 all three read the tool call's recorded `state.input.todos`, and the host records that part from the
 very `args` object `tool.execute.before` rewrites in place, so the rewrite reaches the transcript
 anyway. **Measured on OpenCode 1.18.29: the bubble shows the mirrored rows**, so scrollback, the Todo
-sidebar section and the host's own table all agree. `npm run smoke:todo-safety` re-measures this on
+sidebar section and the host's own table all agree. `bun run smoke:todo-safety` re-measures this on
 every run and prints the answer as an `F19 — verdict` line rather than asserting it, because a future
 host that snapshotted the arguments *before* the hook would flip it back — and only then would
 scrollback start keeping the model's original wording. Its control is already in the same run: with
@@ -195,8 +198,8 @@ They are documented rather than worked around, and `mirrorTodos: "off"` removes 
 
 Two smoke scripts exercise the mirror through the production plugin loader, the host's own
 `todowrite`, its permission check and its SQLite write, with nothing faked but the model:
-`npm run smoke:todo-mirror` (the plan is redrawn over a divergent list, with an `"off"` control and
-a no-goal control) and `npm run smoke:todo-safety` (every assertion is about rows *surviving* an
+`bun run smoke:todo-mirror` (the plan is redrawn over a divergent list, with an `"off"` control and
+a no-goal control) and `bun run smoke:todo-safety` (every assertion is about rows *surviving* an
 empty `todowrite` after a stop, after a completion, and in a session that never had a goal, where it
 must still clear the list). Both need the `opencode` binary on `PATH` and a freshly bundled `dist/`,
 and neither is part of `release:check`, because that binary is not a dev dependency.

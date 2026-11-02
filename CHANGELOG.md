@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+Contributor-facing only; the shipped `src/` and `dist/` are unchanged (`dist/goal-plugin.js` is byte-identical).
+
+- **Bun is the development runtime.** Tests, coverage, the mutation contract, the real-host smokes, benchmarks, `verify`, `check` and `bundle` run under Bun 1.3.14. Install with `bun install --frozen-lockfile`; `bun.lock` replaces `package-lock.json`.
+- **Still on Node, because they exercise the `npx` path:** the installer (`scripts/cli.mjs`), `type:check`, `smoke:packed-host`, `smoke:packed-tools`, `smoke:packed-manifest`, `smoke:git-install` and `pack:check`. CI has a new `Node installer (npx path)` job on Node 18 (the `engines` floor). The Node 18/20/22/24 unit-test matrix is gone.
+- **`check` no longer uses `node -c`.** `scripts/check-syntax.mjs` parses the four shipped sources with Bun's transpiler and exits 1 on a syntax error.
+- **Tests:** two tests with nested `t.test()` subtests became `describe` blocks and one test that used `t.mock.timers` now uses a small fake `setTimeout`; the assertions are unchanged. The mutation contract runs `bun test` and now also requires a real failing-test summary, so a usage error cannot count as a kill.
+- **Packed-package contracts survive `bun run`.** Under `bun run`, `npm_execpath` is the Bun binary, so the four contracts that shell out to npm now only trust an `npm-cli.js` path and otherwise fall back to `npm` on `PATH`.
+- **Audit:** `bun audit --prod --audit-level=high` replaces `npm audit --omit=dev --audit-level=high`.
+
 ## 1.5.1 - 2026-11-01
 
 - **Fixed: the v1.5.0 bundles were built from a stale install.** `dist/` carried `zod` 4.4.3 instead of the lockfile's 4.6.7, which undid the 1.4.1 security update (GHSA-mrhx-c7xc-m3w5, high), and used the wrong Bun version. Rebuilt from a clean `npm ci` with the pinned Bun 1.3.14. No other change; use this instead of v1.5.0.

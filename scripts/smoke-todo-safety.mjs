@@ -16,11 +16,11 @@
 // plus the plugin's own per-session state file under the isolated project cwd,
 // which is where `goal.mirror.nudges` lives.
 //
-// Requires the `opencode` binary on PATH and a bundled `dist/` (`npm run bundle`)
+// Requires the `opencode` binary on PATH and a bundled `dist/` (`bun run bundle`)
 // — the installer copies `dist/`, so a stale bundle smokes the OLD code. It is
 // deliberately NOT part of `release:check`: the binary is not a dev dependency.
 //
-// Usage: npm run smoke:todo-safety
+// Usage: bun run smoke:todo-safety
 //
 // Arms (all five sessions share ONE isolated host and one mock; the mock routes
 // on a token in the conversation, so no per-arm model declaration is needed):
@@ -673,18 +673,18 @@ async function main() {
     stat(path.join(repoRoot, "dist", "goal-plugin.js")).catch(() => null),
   ])
   if (!bundleStat) {
-    console.error("FAIL  dist/goal-plugin.js is missing; run `npm run bundle` first")
+    console.error("FAIL  dist/goal-plugin.js is missing; run `bun run bundle` first")
     process.exitCode = 1
     return
   }
   if (bundleStat.mtimeMs < sourceStat.mtimeMs) {
-    console.error("FAIL  dist/goal-plugin.js is older than src/goal-plugin.js; run `npm run bundle` first")
+    console.error("FAIL  dist/goal-plugin.js is older than src/goal-plugin.js; run `bun run bundle` first")
     process.exitCode = 1
     return
   }
   const bundle = await readFile(path.join(repoRoot, "dist", "goal-plugin.js"), "utf8")
   if (!bundle.includes(HANDBACK_HEAD)) {
-    console.error("FAIL  dist/goal-plugin.js carries no todo-mirror handback; run `npm run bundle` first")
+    console.error("FAIL  dist/goal-plugin.js carries no todo-mirror handback; run `bun run bundle` first")
     process.exitCode = 1
     return
   }

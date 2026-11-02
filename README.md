@@ -14,7 +14,7 @@ npx -y github:sblattj/opencode-goal-pro-max-complete-plugin install
 
 No `npx`? `sh install.sh`, or `curl -fsSL https://raw.githubusercontent.com/sblattj/opencode-goal-pro-max-complete-plugin/main/install.sh | sh`; from a clone, `node scripts/cli.mjs install`. Manual two-file install, upgrade and uninstall: [docs/install.md](docs/install.md).
 
-Requires Node 18 or newer and OpenCode `>=1.17.15 <3` — both the 1.x and 2.x lines (`engines` in `package.json`; the documented OpenCode 2 caveats are in [docs/compatibility.md](docs/compatibility.md)). Re-running the installer is safe: `--dry-run` previews it, `uninstall` reverses it, `status` reports what is currently wired.
+Requires Node 18 or newer for the `npx` install (the plugin itself runs inside OpenCode, not under your Node) and OpenCode `>=1.17.15 <3`, both the 1.x and 2.x lines (`engines` in `package.json`; the documented OpenCode 2 caveats are in [docs/compatibility.md](docs/compatibility.md)). Re-running the installer is safe: `--dry-run` previews it, `uninstall` reverses it, `status` reports what is currently wired.
 
 ## Use
 
@@ -38,11 +38,11 @@ The sidebar's Todo section is drawn from the same plan: while a plan exists, eve
 
 | Rung | Proves | Result |
 |---|---|---|
-| `npm test` | an executable spec for every documented behaviour | 660 of 660 pass |
-| `npm run test:mutation` | those tests are not vacuous | 99 of 99 critical mutants killed |
-| `npm run benchmark:behavior` | six end-to-end autonomy scenarios | 6 of 6, 0 model calls |
-| `npm run benchmark:todo-mirror` | the Todo mirror against a pre-v1.0.1 control | 0 of 8 turns diverge, 1 persistent checklist |
-| `npm run release:check` | the whole gate, in order | passes in about 2.5 to 3 minutes |
+| `bun run test` | an executable spec for every documented behaviour | 660 of 660 pass |
+| `bun run test:mutation` | those tests are not vacuous | 99 of 99 critical mutants killed |
+| `bun run benchmark:behavior` | six end-to-end autonomy scenarios | 6 of 6, 0 model calls |
+| `bun run benchmark:todo-mirror` | the Todo mirror against a pre-v1.0.1 control | 0 of 8 turns diverge, 1 persistent checklist |
+| `bun run release:check` | the whole gate, in order | passes in about 2.5 to 3 minutes |
 
 The full 14-rung ladder, the review process behind the 0.11.0 defaults, the one-session measurement that drove the turn-aggregation fix, and what none of it proves, are in [docs/verification.md](docs/verification.md).
 

@@ -580,35 +580,35 @@ If a goal does not continue:
 3. If a goal control reports that another process owns the session, wait a few seconds and retry. An idle owner releases the lease within `idleLeaseReleaseMs`, but an owner running an active goal keeps it, so halt that goal there (`/goal halt`), or fork. If it reports an older, incomplete, tampered, or unsupported lease, close and upgrade every process that could own the session first; if it persists, remove only the affected shard's adjacent `.lock` file or legacy directory **and** its `.lock.claims-v2` directory. Keep the state and ledger. Never point two copies of one session at different state paths — that creates divergent histories.
 4. Check OpenCode's structured logs for persistence, SDK-shape, prompt, or auditor errors.
 5. Confirm the project directory and the state-path precedence above. A daemon started elsewhere makes a relative path surprising.
-6. From an install, run the shipped verifier — `npx opencode-goal-pro-max-complete-plugin verify`, or `npx -y github:sblattj/opencode-goal-pro-max-complete-plugin verify` without one; both delegate to the `npm run verify` script (`scripts/verify.mjs`). A bare invocation with no subcommand prints the usage and exits 0. Use it when diagnosing registration problems. The packaging contracts (`npm run smoke`, `npm run smoke:packed-host`, and the rest of the ladder) live in a git checkout only: `package.json` `files` ships `scripts/verify.mjs` and nothing else from `scripts/`, so running them inside `node_modules` fails with `MODULE_NOT_FOUND`.
+6. From an install, run the shipped verifier: `npx opencode-goal-pro-max-complete-plugin verify`, or `npx -y github:sblattj/opencode-goal-pro-max-complete-plugin verify` without one; both delegate to the `bun run verify` script (`scripts/verify.mjs`). A bare invocation with no subcommand prints the usage and exits 0. Use it when diagnosing registration problems. The packaging contracts (`bun run smoke`, `bun run smoke:packed-host`, and the rest of the ladder) live in a git checkout only: `package.json` `files` ships `scripts/verify.mjs` and nothing else from `scripts/`, so running them inside `node_modules` fails with `MODULE_NOT_FOUND`.
 
 Do not paste `state.json`, its ledger, or verbose logs into a public issue without reviewing them: they can contain goal text, assistant checkpoints, blockers, local paths, and command evidence. Prefer the bounded status/history output. There is intentionally no broad "dump diagnostics" tool — exposing process-wide session state or persistence paths to the model would add more privacy risk than troubleshooting value.
 
 ## Development
 
 ```sh
-npm test                     # 660 unit tests
-npm run test:coverage        # tests with coverage
-npm run type:check           # compile installed-package consumers (NodeNext + Bundler)
-npm run test:mutation        # 99 critical mutants must all be killed (~2.3 min)
-npm run benchmark:behavior   # 6 deterministic autonomy scenarios, no provider call
-npm run benchmark:todo-mirror # the todo mirror against a pre-v1.0.1 control, no provider call
-npm run smoke                # package export + command hook, no model call
-npm run smoke:packed-host    # install the packed tarball, exercise the host contract
-npm run smoke:packed-tools   # all 13 tools from an installed tarball
-npm run smoke:packed-manifest # both plugin targets discovered from the packed exports
-npm run smoke:git-install    # no install-time scripts; dist matches a fresh bundle
-npm run smoke:todo-mirror    # real host: the plan is redrawn over the model's own list
-npm run smoke:todo-safety    # real host: an empty todowrite never destroys rows
-npm run verify               # installed hook surface
-npm run check                # syntax check + tests
-npm run pack:check           # package contents
-npm run release:check        # the complete gate, in order (~3 min)
+bun run test                 # 786 unit tests
+bun run test:coverage        # tests with coverage
+bun run type:check           # compile installed-package consumers (NodeNext + Bundler)
+bun run test:mutation        # 147 critical mutants must all be killed
+bun run benchmark:behavior   # 6 deterministic autonomy scenarios, no provider call
+bun run benchmark:todo-mirror # the todo mirror against a pre-v1.0.1 control, no provider call
+bun run smoke                # package export + command hook, no model call
+bun run smoke:packed-host    # install the packed tarball, exercise the host contract
+bun run smoke:packed-tools   # all 13 tools from an installed tarball
+bun run smoke:packed-manifest # both plugin targets discovered from the packed exports
+bun run smoke:git-install    # no install-time scripts; dist matches a fresh bundle
+bun run smoke:todo-mirror    # real host: the plan is redrawn over the model's own list
+bun run smoke:todo-safety    # real host: an empty todowrite never destroys rows
+bun run verify               # installed hook surface
+bun run check                # syntax check + tests
+bun run pack:check           # package contents
+bun run release:check        # the complete gate, in order (~3 min)
 ```
 
-Most of the commands above need a file this package's published tarball does not ship — a script under `scripts/` (only `cli.mjs`, `install.mjs`, and `verify.mjs` are published) or the `test/` directory (not published at all) — so, aside from `npm run verify` described above, this whole section is meant to run from a clone of the repository, never from an installed package.
+Most of the commands above need a file this package's published tarball does not ship: a script under `scripts/` (only `cli.mjs`, `install.mjs`, and `verify.mjs` are published) or the `test/` directory (not published at all), so aside from `bun run verify` described above, this whole section is meant to run from a clone of the repository, never from an installed package.
 
-The two `smoke:todo-*` rungs and `smoke:multi-process` are the only ones that need the `opencode` binary on `PATH` and a freshly bundled `dist/` (`npm run bundle`) — the installer copies `dist/`, so a stale bundle smokes the old code. All three are deliberately **not** in `release:check`, because the binary is not a dev dependency; the todo rungs' scratch roots are overridable with `SMOKE_TODO_MIRROR_DIR` and `SMOKE_TODO_SAFETY_DIR`. `smoke:multi-process` runs two real `opencode serve` processes on one project and checks three things. Goals in distinct sessions run at the same time. A session left idle by one process is taken over by the other. A session with a running goal stays with its owner.
+The two `smoke:todo-*` rungs and `smoke:multi-process` are the only ones that need the `opencode` binary on `PATH` and a freshly bundled `dist/` (`bun run bundle`); the installer copies `dist/`, so a stale bundle smokes the old code. All three are deliberately **not** in `release:check`, because the binary is not a dev dependency; the todo rungs' scratch roots are overridable with `SMOKE_TODO_MIRROR_DIR` and `SMOKE_TODO_SAFETY_DIR`. `smoke:multi-process` runs two real `opencode serve` processes on one project and checks three things. Goals in distinct sessions run at the same time. A session left idle by one process is taken over by the other. A session with a running goal stays with its owner.
 
 Point OpenCode at your checkout for local testing with the package **directory**, not a file inside it. Keep test files outside OpenCode's auto-loaded plugin directory — it will try to load plugin-like files it finds there. See [`CONTRIBUTING.md`](../CONTRIBUTING.md) for the full contribution checklist, [`SECURITY.md`](../SECURITY.md) for vulnerability reporting, [`releasing.md`](releasing.md) for how a release is cut, and [`verification.md`](verification.md) for what each rung of the gate proves.
 

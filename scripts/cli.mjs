@@ -161,7 +161,7 @@ async function main(argv) {
     return 0
   }
   if (options.command === "verify") {
-    // Delegated so `npm run verify`, `npx <pkg> verify` and the packaging
+    // Delegated so `bun run verify`, `npx <pkg> verify` and the packaging
     // contracts all run the exact same file. It exits non-zero itself on a
     // failed check.
     await import("./verify.mjs")

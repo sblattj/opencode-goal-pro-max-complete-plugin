@@ -634,7 +634,7 @@ async function planCopy({ sourceDir, dataDir }) {
       if (REQUIRED_PLUGIN_FILES.includes(relative)) {
         throw new InstallError(`the package at ${sourceDir} is missing ${relative}`, {
           code: "broken-source",
-          hint: 'Run "npm run bundle" in a checkout, or install from a released tarball.',
+          hint: 'Run "bun run bundle" in a checkout, or install from a released tarball.',
         })
       }
       continue

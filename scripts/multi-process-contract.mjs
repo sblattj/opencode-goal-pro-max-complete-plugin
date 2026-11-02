@@ -31,7 +31,7 @@
 // `dist/`). Deliberately NOT part of `release:check`: the binary is not a dev
 // dependency, and the run takes a couple of minutes.
 //
-// Usage: npm run smoke:multi-process
+// Usage: bun run smoke:multi-process
 import { execFile } from "node:child_process"
 import { createHash } from "node:crypto"
 import { readdir, readFile } from "node:fs/promises"
@@ -242,7 +242,7 @@ async function main() {
   }
   const bundle = await readFile(path.join(repoRoot, "dist", "goal-plugin.js"), "utf8").catch(() => null)
   if (!bundle) {
-    console.error("FAIL  dist/goal-plugin.js is missing; run `npm run bundle` first")
+    console.error("FAIL  dist/goal-plugin.js is missing; run `bun run bundle` first")
     return 1
   }
   console.log(`multi-process lease contract — plugin ${version}, opencode ${hostVersion}, scratch ${scratch}`)

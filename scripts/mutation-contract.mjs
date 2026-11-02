@@ -1269,10 +1269,22 @@ try {
     writeFile(join(root, "package.json"), JSON.stringify({ private: true, type: "module" })),
   ])
 
+  // `process.execPath` is the Bun binary this script runs under, so `bun test`
+  // is the same runner the repository's own test script uses. Bun prints its
+  // "N pass" / "N fail" summary on stderr.
+  const runTestFile = (file) =>
+    spawnSync(process.execPath, ["test", `./${file}`], { cwd: root, encoding: "utf8" })
+
   const baselineTests = [...new Set(mutants.map(({ test }) => test))]
   for (const testFile of baselineTests) {
-    const result = spawnSync(process.execPath, ["--test", testFile], { cwd: root, encoding: "utf8" })
+    const result = runTestFile(testFile)
     assert.equal(result.status, 0, `mutation baseline failed for ${testFile}\n${result.stdout}\n${result.stderr}`)
+    // A runner that exits 0 without running tests must not pass as a baseline.
+    assert.match(
+      result.stderr,
+      /^\s*[1-9]\d* pass$/m,
+      `mutation baseline for ${testFile} reported no passing test\n${result.stdout}\n${result.stderr}`,
+    )
   }
 
   for (const mutant of mutants) {
@@ -1290,8 +1302,14 @@ try {
     )
     await writeFile(path, mutated)
 
-    const result = spawnSync(process.execPath, ["--test", mutant.test], { cwd: root, encoding: "utf8" })
+    const result = runTestFile(mutant.test)
     assert.notEqual(result.status, 0, `${mutant.name}: test suite survived the mutant`)
+    // Killed means a test assertion failed, not that the command line was bad.
+    assert.match(
+      result.stderr,
+      /^\s*[1-9]\d* fail$/m,
+      `${mutant.name}: non-zero exit without a failing test (usage error?)\n${result.stdout}\n${result.stderr}`,
+    )
     await writeFile(path, original)
     console.log(`killed mutant: ${mutant.name}`)
   }

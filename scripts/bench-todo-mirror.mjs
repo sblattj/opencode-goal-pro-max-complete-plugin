@@ -35,7 +35,7 @@
 //   wording — which design §5.5 reports precisely because no plugin can reach a
 //   transcript bubble, so the design does not claim to fix it.
 //
-// Usage: npm run benchmark:todo-mirror   (exit 0 = every target met)
+// Usage: bun run benchmark:todo-mirror   (exit 0 = every target met)
 
 import assert from "node:assert/strict"
 
@@ -86,35 +86,35 @@ const TURN_SCRIPT = [
     id: "a1",
     status: "done",
     claim: "the divergent list reproduces on a fresh session",
-    evidence: "npm run smoke:todo-mirror",
+    evidence: "bun run smoke:todo-mirror",
     verdict: "pass",
   },
   {
     id: "a2",
     status: "done",
     claim: "plan rows carry the action id and the mirrored status",
-    evidence: "npm test -- projectPlanToTodos",
+    evidence: "bun test test/*.test.js -t projectPlanToTodos",
     verdict: "pass",
   },
   {
     id: "a3",
     status: "done",
     claim: "an empty todowrite re-projects instead of clearing",
-    evidence: "npm run smoke:todo-safety",
+    evidence: "bun run smoke:todo-safety",
     verdict: "pass",
   },
   {
     id: "a4",
     status: "done",
     claim: "the payload reports the mirror state and row count",
-    evidence: "npm test -- buildSidebarMetadata",
+    evidence: "bun test test/*.test.js -t buildSidebarMetadata",
     verdict: "pass",
   },
   {
     id: "a5",
     status: "done",
     claim: "server and panel agree on the mirrored count",
-    evidence: "npm test -- v3 payload and the panel agree",
+    evidence: "bun test test/*.test.js -t v3 payload and the panel agree",
     verdict: "pass",
   },
 ]

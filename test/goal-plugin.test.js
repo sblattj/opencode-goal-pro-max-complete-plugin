@@ -3,7 +3,7 @@ import { execSync } from "node:child_process"
 import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises"
 import { homedir, tmpdir } from "node:os"
 import { dirname, join } from "node:path"
-import test from "node:test"
+import test, { describe } from "node:test"
 import { fileURLToPath } from "node:url"
 import pluginModule, { GoalPlugin, testInternals } from "../src/goal-plugin.js"
 import { acquirePersistenceLease } from "../src/persistence-lease.js"
@@ -3604,7 +3604,7 @@ test("time deferred behind a planning-only agent does not count against the dura
   assert.match(String(testInternals.stopReason({ ...goal, pausedAt: 0 })), /max duration reached/)
 })
 
-test("message aborts and provider errors end the turn, not the goal: the next idle continues", async (t) => {
+describe("message aborts and provider errors end the turn, not the goal: the next idle continues", () => {
   for (const scenario of [
     {
       name: "message.updated abort",
@@ -3633,7 +3633,7 @@ test("message aborts and provider errors end the turn, not the goal: the next id
       status: /provider reported an error: ProviderAuthError: token expired/i,
     },
   ]) {
-    await t.test(scenario.name, async () => {
+    test(scenario.name, async () => {
       const { aborts, calls, hooks } = await createHooks({ options: { minDelayMs: 1 } })
       await hooks["command.execute.before"](
         { command: "goal", sessionID: "session-1", arguments: "ship it" },
@@ -3661,12 +3661,12 @@ test("message aborts and provider errors end the turn, not the goal: the next id
   }
 })
 
-test("legacy and v2 permission rejection shapes both keep the goal active", async (t) => {
+describe("legacy and v2 permission rejection shapes both keep the goal active", () => {
   for (const properties of [
     { sessionID: "session-1", permissionID: "perm-1", response: "rejected" },
     { sessionID: "session-1", requestID: "perm-2", reply: "reject" },
   ]) {
-    await t.test(properties.response ? "legacy response" : "v2 reply", async () => {
+    test(properties.response ? "legacy response" : "v2 reply", async () => {
       const { calls, hooks } = await createHooks({ options: { minDelayMs: 1 } })
       await hooks["command.execute.before"](
         { command: "goal", sessionID: "session-1", arguments: "ship it" },
@@ -3735,7 +3735,36 @@ test("repeated provider errors back off with a capped schedule and never stop th
   t.after(() => {
     Date.now = originalDateNow
   })
-  t.mock.timers.enable({ apis: ["setTimeout"] })
+  // Hand-rolled fake setTimeout (Bun has no t.mock.timers). Same contract the
+  // Node mock gave this test: callbacks never fire on their own, and
+  // tick(ms) runs every pending callback that is due, in due order.
+  const originalSetTimeout = globalThis.setTimeout
+  const originalClearTimeout = globalThis.clearTimeout
+  const fakeTimers = new Map()
+  let fakeClock = 0
+  let fakeTimerSeq = 0
+  globalThis.setTimeout = (callback, delay = 0, ...args) => {
+    const handle = { id: (fakeTimerSeq += 1), unref() { return handle }, ref() { return handle }, hasRef: () => true }
+    fakeTimers.set(handle, { at: fakeClock + Math.max(1, Number(delay) || 0), seq: handle.id, callback, args })
+    return handle
+  }
+  globalThis.clearTimeout = (handle) => {
+    fakeTimers.delete(handle)
+  }
+  t.after(() => {
+    globalThis.setTimeout = originalSetTimeout
+    globalThis.clearTimeout = originalClearTimeout
+  })
+  const tickFakeTimers = (ms) => {
+    fakeClock += ms
+    const due = [...fakeTimers.entries()]
+      .filter(([, timer]) => timer.at <= fakeClock)
+      .sort((x, y) => x[1].at - y[1].at || x[1].seq - y[1].seq)
+    for (const [handle, timer] of due) {
+      if (!fakeTimers.delete(handle)) continue
+      timer.callback(...timer.args)
+    }
+  }
   let assistantOutput = 0
   const { calls, hooks } = await createHooks({
     options: { minDelayMs: 1, noToolCallTurnsBeforePause: 0, noProgressTurnsBeforePause: 100 },
@@ -3784,7 +3813,7 @@ test("repeated provider errors back off with a capped schedule and never stop th
 
   // The backoff timer re-delivers the idle when it expires.
   now += 5_000
-  t.mock.timers.tick(5_000)
+  tickFakeTimers(5_000)
   await settle()
   assert.equal(calls.length, 3)
 
