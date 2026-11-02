@@ -552,7 +552,7 @@ Objective-bearing commands preserve file attachments. OpenCode may expand those 
 |---|---|
 | Node.js | `engines.node` is `>=18`; CI runs the full suite on Node 18, 20, 22, and 24 |
 | OpenCode | `engines.opencode` is `>=1.17.15 <3`: both the 1.x and 2.x lines are supported as of v1.1.0, and the 2.x host carries documented caveats — see [`compatibility.md`](compatibility.md#opencode-2) |
-| Operating systems | Filesystem-sensitive lifecycle tests run on Linux, macOS, and Windows; the installed-package type, host, and tool contracts also run on Windows |
+| Operating systems | Linux and macOS. Filesystem-sensitive lifecycle tests run on both. Windows is not supported |
 | Package entrypoints | Installed-tarball contracts verify all three export paths (`.`, `./server`, `./tui`), the plugin-manifest targets OpenCode reads from `exports`, consumer TypeScript resolution, the enumerated hook surface, and all 13 tools |
 | Provider/backend quirks | Strict-template backends require the goal block to merge into the primary `system` message; covered by regression tests. See [`providers.md`](providers.md) |
 | Runtime dependencies | `zod` only, bundled into `dist/` |

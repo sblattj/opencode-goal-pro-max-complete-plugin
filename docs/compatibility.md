@@ -26,11 +26,9 @@ Installed-package contracts compile TypeScript consumers using both NodeNext
 and Bundler resolution and require a clean npm-tarball install to expose the
 default agent-tool surface without a separately installed OpenCode helper package.
 
-Filesystem-sensitive lifecycle tests run on Linux, macOS, and Windows. POSIX file
-mode and symbolic-link protections are applied where the operating system supports
-them; the plugin does not claim that Windows provides equivalent POSIX semantics.
-The Windows job also runs the installed-package type, host, and tool contracts
-so their portable npm launcher path is exercised in CI.
+Linux and macOS are supported, and filesystem-sensitive lifecycle tests run on both.
+Windows is not supported and is not tested in CI. POSIX file mode and symbolic-link
+protections are applied where the operating system supports them.
 
 When two processes open the same OpenCode session, only the lease owner may read
 or change that session's goal workflow. The contender keeps ordinary chat and

@@ -760,8 +760,7 @@ test("a filesystem refusal is a sentence, not a stack trace", async () => {
   }
 })
 
-test("a failed write does not leave its snapshot behind", async (t) => {
-  if (process.getuid?.() === 0) return t.skip("root ignores the read-only bit")
+test("a failed write does not leave its snapshot behind", { skip: process.getuid?.() === 0 && "root ignores the read-only bit" }, async () => {
   const f = await fixture("nostraybak")
   try {
     const file = await writeConfig(f.configDir, "opencode.json", '{\n  "plugin": []\n}\n')

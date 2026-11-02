@@ -1027,11 +1027,7 @@ test("persistence lease bounds oversized owner records before parsing", async ()
   }
 })
 
-test("persistence lease never follows a symlinked owner record", async (t) => {
-  if (process.platform === "win32") {
-    t.skip("symlink creation is not reliably available on Windows CI")
-    return
-  }
+test("persistence lease never follows a symlinked owner record", { skip: process.platform === "win32" && "symlink creation is not reliably available on Windows CI" }, async () => {
   const dir = await mkdtemp(join(tmpdir(), "goal-lease-owner-symlink-"))
   const state = join(dir, "state.json")
   const lock = `${state}.lock`
@@ -1062,11 +1058,7 @@ test("persistence lease never follows a symlinked owner record", async (t) => {
   }
 })
 
-test("persistence lease rejects a symlinked lock directory without traversing it", async (t) => {
-  if (process.platform === "win32") {
-    t.skip("symlink creation is not reliably available on Windows CI")
-    return
-  }
+test("persistence lease rejects a symlinked lock directory without traversing it", { skip: process.platform === "win32" && "symlink creation is not reliably available on Windows CI" }, async () => {
   const dir = await mkdtemp(join(tmpdir(), "goal-lease-lock-symlink-"))
   const state = join(dir, "state.json")
   const lock = `${state}.lock`
@@ -1092,11 +1084,7 @@ test("persistence lease rejects a symlinked lock directory without traversing it
   }
 })
 
-test("persistence lease rejects a symlinked claim directory without traversing it", async (t) => {
-  if (process.platform === "win32") {
-    t.skip("symlink creation is not reliably available on Windows CI")
-    return
-  }
+test("persistence lease rejects a symlinked claim directory without traversing it", { skip: process.platform === "win32" && "symlink creation is not reliably available on Windows CI" }, async () => {
   const dir = await mkdtemp(join(tmpdir(), "goal-lease-claims-symlink-"))
   const state = join(dir, "state.json")
   const lock = `${state}.lock`

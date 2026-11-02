@@ -29,8 +29,7 @@ async function stubbedPath() {
   return { bin, cleanup: () => rm(bin, { recursive: true, force: true }) }
 }
 
-test("install.sh passes a subcommand through and defaults to install", async (t) => {
-  if (process.platform === "win32") return t.skip("install.sh is a POSIX-sh bootstrap")
+test("install.sh passes a subcommand through and defaults to install", { skip: process.platform === "win32" && "install.sh is a POSIX-sh bootstrap" }, async () => {
   const { bin, cleanup } = await stubbedPath()
   try {
     const argvFor = async (args, env = {}) => {

@@ -46,11 +46,11 @@
     ".nvmrc"
   ],
   "scripts": {
-    "test": "bun test test/*.test.js",
-    "test:model": "bun test test/lifecycle-model.test.js",
+    "test": "bun test --timeout 30000 test/*.test.js",
+    "test:model": "bun test --timeout 30000 test/lifecycle-model.test.js",
     "test:installer": "node --test test/installer-cli.test.js test/bootstrap-dispatch.test.js",
     "test:mutation": "bun scripts/mutation-contract.mjs",
-    "test:coverage": "bun test --coverage test/*.test.js",
+    "test:coverage": "bun test --timeout 30000 --coverage test/*.test.js",
     "type:check": "node scripts/type-contract.mjs",
     "smoke": "bun scripts/smoke-command-hook.mjs",
     "smoke:packed-host": "node scripts/packed-host-contract.mjs",

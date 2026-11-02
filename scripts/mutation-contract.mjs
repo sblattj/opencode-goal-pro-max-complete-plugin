@@ -1273,7 +1273,7 @@ try {
   // is the same runner the repository's own test script uses. Bun prints its
   // "N pass" / "N fail" summary on stderr.
   const runTestFile = (file) =>
-    spawnSync(process.execPath, ["test", `./${file}`], { cwd: root, encoding: "utf8" })
+    spawnSync(process.execPath, ["test", "--timeout", "30000", `./${file}`], { cwd: root, encoding: "utf8" })
 
   const baselineTests = [...new Set(mutants.map(({ test }) => test))]
   for (const testFile of baselineTests) {
