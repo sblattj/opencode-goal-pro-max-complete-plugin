@@ -1,6 +1,6 @@
 {
   "name": "opencode-goal-pro-max-complete-plugin",
-  "version": "1.5.1",
+  "version": "1.5.2",
   "description": "Durable, guarded goal workflows for OpenCode.",
   "type": "module",
   "main": "./dist/goal-plugin.js",

@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.5.2 - 2026-11-02
 
 Contributor-facing only; the shipped `src/` and `dist/` are unchanged (`dist/goal-plugin.js` is byte-identical).
 
