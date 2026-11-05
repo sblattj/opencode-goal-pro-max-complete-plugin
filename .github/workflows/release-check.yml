@@ -1,9 +1,28 @@
 name: Release check
 
+# On every v* tag: run the full release gate, build the npm tarball, and
+# publish exactly that tarball to npm with provenance.
+#
+# Publishing uses npm trusted publishing (OIDC), so there is no npm token
+# secret. Prerequisites, all registry-side:
+#   - npm package settings -> Trusted Publisher: repo
+#     sblattj/opencode-goal-pro-max-complete-plugin, workflow release-check.yml.
+#     If this file is renamed, the publisher silently stops matching.
+#   - OIDC publishing needs npm >= 11.5.1 (installed below; node 22 ships 10).
+#   - Provenance needs a public repo.
+# The publish step is idempotent: a version already on npm is skipped, so a
+# re-run (or a dispatch for an old tag) stays green. An older version than npm
+# `latest` publishes under the `backfill` dist-tag so `latest` never moves back.
+# Re-run a tag by hand: gh workflow run release-check.yml -f tag=vX.Y.Z
+
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to verify and publish (for example v1.5.2)"
+        required: true
 
 permissions:
   contents: read
@@ -15,13 +34,16 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "22"
       - name: Verify tag and package versions match
-        if: startsWith(github.ref, 'refs/tags/')
-        run: node -e "const p=require('./package.json');const t=process.env.GITHUB_REF_NAME;if(t!=='v'+p.version)throw new Error('tag '+t+' does not match package '+p.version)"
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: node -e "const p=require('./package.json');const t=process.env.RELEASE_TAG;if(t!=='v'+p.version)throw new Error('tag '+t+' does not match package '+p.version)"
       - name: Set up Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
@@ -39,3 +61,43 @@ jobs:
           path: opencode-goal-pro-max-complete-plugin-*.tgz
           if-no-files-found: error
           retention-days: 30
+
+  publish:
+    needs: verify-artifact
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+          registry-url: https://registry.npmjs.org
+      - name: Install npm with OIDC trusted publishing support
+        run: npm install -g npm@latest && npm --version
+      - name: Download verified artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: npm-package-${{ inputs.tag || github.ref_name }}
+      - name: Publish to npm (idempotent)
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          NAME=opencode-goal-pro-max-complete-plugin
+          VERSION="${RELEASE_TAG#v}"
+          TARBALL="$NAME-$VERSION.tgz"
+          test -f "$TARBALL"
+          if [ "$(npm view "$NAME@$VERSION" version 2>/dev/null || true)" = "$VERSION" ]; then
+            echo "::notice::$NAME@$VERSION is already on npm; skipping publish"
+            exit 0
+          fi
+          LATEST="$(npm view "$NAME" dist-tags.latest 2>/dev/null || true)"
+          DIST_TAG=latest
+          if [ -n "$LATEST" ] && [ "$(printf '%s\n%s\n' "$LATEST" "$VERSION" | sort -V | tail -n1)" != "$VERSION" ]; then
+            DIST_TAG=backfill
+            echo "::notice::$VERSION is older than npm latest $LATEST; publishing under dist-tag '$DIST_TAG'"
+          fi
+          npm publish "./$TARBALL" --provenance --access public --tag "$DIST_TAG"
